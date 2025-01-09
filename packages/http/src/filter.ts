@@ -1,6 +1,6 @@
 import { ClassType } from '@deepkit/core';
 import { AppModule } from '@deepkit/app';
-import { RouteConfig, HttpRouter } from './router';
+import { RouteConfig, HttpRouter } from './router.js';
 
 export interface HttpRouteFilterRoute {
     path?: string;
@@ -140,8 +140,14 @@ export class HttpRouterFilterResolver {
                     }
                 }
 
-                for (const route of filter.routes) {
-                    if (!match(routeConfig, route)) continue outer;
+                if (filter.routes.length) {
+                    let found: boolean = false;
+                    for (const route of filter.routes) {
+                        if (match(routeConfig, route)) {
+                            found = true;
+                        }
+                    }
+                    if (!found) continue;
                 }
 
                 for (const route of filter.excludeRoutes) {

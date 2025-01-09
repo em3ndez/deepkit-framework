@@ -11,14 +11,14 @@
 import { InjectorContext } from '@deepkit/injector';
 import {
     rpcActionType,
-    RpcConnectionWriter,
     RpcControllerAccess,
     RpcKernel,
     RpcKernelBaseConnection,
     RpcKernelConnection,
     RpcMessage,
     RpcMessageBuilder,
-    RpcServerAction
+    RpcServerAction,
+    TransportConnection,
 } from '@deepkit/rpc';
 import { FrameCategory, Stopwatch } from '@deepkit/stopwatch';
 import { ClassType } from '@deepkit/core';
@@ -48,13 +48,16 @@ export class RpcServerActionWithStopwatch extends RpcServerAction {
         const body = message.parseBody<rpcActionType>();
         const frame = this.stopwatch ? this.stopwatch.start(body.method + '() [' + body.controller + ']', FrameCategory.rpc, true) : undefined;
         if (frame) {
-            const types = await this.loadTypes(body.controller, body.method);
-            const value: { args: any[] } = message.parseBody(types.actionCallSchema);
-            frame.data({ method: body.method, controller: body.controller, arguments: value.args });
+            try {
+                const types = await this.loadTypes(body.controller, body.method);
+                const value: { args: any[] } = message.parseBody(types.actionCallSchema);
+                frame.data({ method: body.method, controller: body.controller, arguments: value.args });
+            } catch {
+            }
         }
 
         try {
-            if (frame) return await frame.run({}, () => super.handleAction(message, response));
+            if (frame) return await frame.run(() => super.handleAction(message, response));
             return await super.handleAction(message, response);
         } finally {
             if (frame) frame.end();
@@ -63,7 +66,7 @@ export class RpcServerActionWithStopwatch extends RpcServerAction {
 }
 
 export class RpcKernelConnectionWithStopwatch extends RpcKernelConnection {
-    protected actionHandler = new RpcServerActionWithStopwatch(this.controllers, this.injector, this.security, this.sessionState);
+    protected actionHandler = new RpcServerActionWithStopwatch(this.cache, this, this.controllers, this.injector, this.security, this.sessionState, this.logger);
     stopwatch?: Stopwatch;
 
     setStopwatch(stopwatch: Stopwatch) {
@@ -86,8 +89,8 @@ export class RpcKernelWithStopwatch extends RpcKernel {
 
     stopwatch?: Stopwatch;
 
-    createConnection(writer: RpcConnectionWriter, injector?: InjectorContext): RpcKernelBaseConnection {
-        const connection = super.createConnection(writer, injector);
+    createConnection(transport: TransportConnection, injector?: InjectorContext): RpcKernelBaseConnection {
+        const connection = super.createConnection(transport, injector);
         if (this.stopwatch && connection instanceof RpcKernelConnectionWithStopwatch) {
             connection.setStopwatch(this.stopwatch);
         }

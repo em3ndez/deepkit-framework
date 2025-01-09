@@ -15,14 +15,17 @@
     "declaration": true,
     "composite": true,
     "jsx": "react-jsx",
-    "jsxImportSource": ".."
+    "jsxImportSource": "..",
+    "types": ["estree"]
   },
   "reflection": true,
   "include": [
     "src",
-    "tests",
     "index.ts",
     "jsx-runtime.ts"
+  ],
+  "exclude": [
+    "tests"
   ],
   "references": [
     {

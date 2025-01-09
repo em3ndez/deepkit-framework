@@ -205,4 +205,35 @@ export enum ReflectionOp {
     extends, //X extends Y in a conditional type, XY popped from the stack, pushes boolean on the stack
 
     widen, //widens the type on the stack, .e.g 'asd' => string, 34 => number, etc. this is necessary for infer runtime data, and widen if necessary (object member or non-contained literal)
+
+    static,
+    mappedType2, //same as mappedType2 but the given functionPointer returns a tuple [type, name]
+
+    functionReference, //Same as classReference but for functions
+
+    callSignature, //Same as function but for call signatures (in object literals)
+
+    /**
+     * Assign for Enum, Interface, Class, and TypeAlias declaration at the very end
+     * of the program the typeName. This is so that we have type names available even
+     * if the JS code is minified.
+     *
+     * his operator also assigns originTypes to the type, as it acts as the finalization
+     * step of a type.
+     */
+    typeName, //has one parameter, the index of the stack entry that contains the type name. Uses current head of the stack as type and assigns typeName to it.
+
+    /**
+     * If a class implement an interface or type,
+     *
+     * e.g. `class A implements B`, then B is on the stack and implements pops() it, and then assigns to A.implements = [B].
+     *
+     * This is only emitted when the class that is currently being described actually implements something.
+     *
+     * This OP has 1 argument and pops x types from the stack. X is the first argument.
+     * Expects a TypeClass on the stack.
+     */
+    implements, //pops one type from the stack and assigns it to the latest class on the stack as `implements` type.
+
+    nominal, //marks the last type on the stack as nominal. (used at the end of class/interface/type alias programs).
 }

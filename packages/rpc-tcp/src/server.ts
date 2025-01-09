@@ -1,104 +1,27 @@
 import { asyncOperation, ParsedHost, parseHost } from '@deepkit/core';
-import { RpcKernel } from '@deepkit/rpc';
-// @ts-ignore
-import * as turbo from 'turbo-net';
-import { existsSync, unlinkSync } from 'fs';
+import { RpcKernel, RpcMessageDefinition } from '@deepkit/rpc';
+import { existsSync, mkdirSync, unlinkSync } from 'fs';
 import { createServer, Server, Socket } from 'net';
-
-/**
- * Uses the `turbo-net` module to create a server.
- */
-export class RpcTcpServer {
-    protected turbo?: any;
-    protected host: ParsedHost;
-
-    public bufferSize: number = 25 * 1024; //25kb per connection;
-
-    constructor(
-        protected kernel: RpcKernel,
-        host: string
-    ) {
-        this.host = parseHost(host);
-        if (this.host.isUnixSocket && existsSync(this.host.unixSocket)) {
-            unlinkSync(this.host.unixSocket);
-        }
-    }
-
-    start() {
-        if (this.turbo) throw new Error('Server already started');
-
-        this.turbo = turbo.createServer((socket: any) => {
-            const bufferSize = this.bufferSize;
-            const buffer = Buffer.alloc(bufferSize);
-
-            function read() {
-                socket.read(buffer, onRead);
-            }
-
-            function onRead(err: any, buf: Uint8Array, bytes: number) {
-                if (err) {
-                    connection.close();
-                    return;
-                }
-                if (bytes) {
-                    connection.feed(buf, bytes);
-                    read();
-                }
-            }
-
-            const connection = this.kernel.createConnection({
-                write(b: Uint8Array) {
-                    socket.write(b);
-                },
-                bufferedAmount(): number {
-                    return socket.bufferedAmount || 0;
-                },
-                close() {
-                    socket.close();
-                },
-                clientAddress(): string {
-                    return socket.remoteAddress + ':' + socket.remotePort;
-                }
-            });
-
-            socket.on('close', () => {
-                connection.close();
-            });
-
-            socket.on('error', () => {
-                connection.close();
-            });
-
-            read();
-        });
-
-        if (this.host.isUnixSocket) {
-            throw new Error('Turbo doesnt support unix sockets. Use NetTcpRpcServer instead.');
-        } else {
-            this.turbo.listen(this.host.port || 8811, this.host.host, () => {
-            });
-        }
-    }
-
-    close() {
-        this.turbo?.close();
-    }
-}
+import type { ServerOptions as WebSocketServerOptions } from 'ws';
+import { WebSocketServer } from 'ws';
+import { IncomingMessage } from 'http';
+import { dirname } from 'path';
 
 /**
  * Uses the node `net` module to create a server. Supports unix sockets.
  */
-export class RpcNetTcpServer {
+export class RpcTcpServer {
     protected server?: Server;
     protected host: ParsedHost;
 
     constructor(
         protected kernel: RpcKernel,
-        host: string
+        host: string,
     ) {
         this.host = parseHost(host);
-        if (this.host.isUnixSocket && existsSync(this.host.unixSocket)) {
-            unlinkSync(this.host.unixSocket);
+        if (this.host.isUnixSocket) {
+            if (existsSync(this.host.unixSocket)) unlinkSync(this.host.unixSocket);
+            mkdirSync(dirname(this.host.unixSocket), { recursive: true });
         }
     }
 
@@ -116,8 +39,8 @@ export class RpcNetTcpServer {
 
             this.server.on('connection', (socket: Socket) => {
                 const connection = this.kernel?.createConnection({
-                    write(b: Uint8Array) {
-                        socket.write(b);
+                    write(b: RpcMessageDefinition) {
+                        connection!.sendBinary(b, (data) => socket.write(data));
                     },
                     clientAddress(): string {
                         return socket.remoteAddress || '';
@@ -127,7 +50,7 @@ export class RpcNetTcpServer {
                     },
                     bufferedAmount(): number {
                         return socket.writableLength || 0;
-                    }
+                    },
                 });
 
                 socket.on('data', (data: Uint8Array) => {
@@ -156,21 +79,18 @@ export class RpcNetTcpServer {
     }
 }
 
-import ws from 'ws';
-import type { ServerOptions as WebSocketServerOptions } from 'ws';
-import { IncomingMessage } from 'http';
-
 export class RpcWebSocketServer {
-    protected server?: ws.Server;
+    protected server?: WebSocketServer;
     protected host: ParsedHost;
 
     constructor(
         protected kernel: RpcKernel,
-        host: string
+        host: string,
     ) {
         this.host = parseHost(host);
         if (this.host.isUnixSocket && existsSync(this.host.unixSocket)) {
-            unlinkSync(this.host.unixSocket);
+            if (existsSync(this.host.unixSocket)) unlinkSync(this.host.unixSocket);
+            mkdirSync(dirname(this.host.unixSocket), { recursive: true });
         }
     }
 
@@ -180,12 +100,12 @@ export class RpcWebSocketServer {
 
     start(options: WebSocketServerOptions): void {
         const defaultOptions = { host: this.host.host, port: this.host.port };
-        this.server = new ws.Server({ ...defaultOptions, ...options });
+        this.server = new WebSocketServer({ ...defaultOptions, ...options });
 
         this.server.on('connection', (ws, req: IncomingMessage) => {
             const connection = this.kernel?.createConnection({
-                write(b) {
-                    ws.send(b);
+                writeBinary(message) {
+                    ws.send(message);
                 },
                 close() {
                     ws.close();
@@ -195,7 +115,7 @@ export class RpcWebSocketServer {
                 },
                 clientAddress(): string {
                     return req.socket.remoteAddress || '';
-                }
+                },
             });
 
             ws.on('message', async (message: Uint8Array) => {

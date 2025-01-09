@@ -1,11 +1,12 @@
 import { expect, test } from '@jest/globals';
-import { AsyncDirectClient, DirectClient } from '../src/client/client-direct';
-import { rpc } from '../src/decorators';
-import { RpcKernel, RpcKernelConnection } from '../src/server/kernel';
-import { RpcKernelSecurity, Session } from '../src/server/security';
-import { AuthenticationError } from '../src/model';
-import { MemoryLoggerTransport } from '../../logger';
+import { AsyncDirectClient, DirectClient } from '../src/client/client-direct.js';
+import { rpc } from '../src/decorators.js';
+import { RpcKernel, RpcKernelBaseConnection, RpcKernelConnection } from '../src/server/kernel.js';
+import { RpcControllerAccess, RpcKernelSecurity, Session } from '../src/server/security.js';
+import { AuthenticationError } from '../src/model.js';
 import { Logger } from '@deepkit/logger';
+import { MemoryLoggerTransport } from '@deepkit/logger';
+import { Inject } from '@deepkit/injector';
 
 test('authentication', async () => {
     class Controller {
@@ -16,6 +17,10 @@ test('authentication', async () => {
     }
 
     class MyKernelSecurity extends RpcKernelSecurity {
+        constructor(private scoped: Inject<string, 'scoped'>) {
+            super();
+            expect(scoped).toBe(true);
+        }
         async hasControllerAccess(session: Session) {
             return !session.isAnonymous();
         }
@@ -34,7 +39,7 @@ test('authentication', async () => {
         }
     }
 
-    const kernel = new RpcKernel(undefined, new MyKernelSecurity);
+    const kernel = new RpcKernel([{provide: RpcKernelSecurity, useClass: MyKernelSecurity, scope: 'rpc'}, {provide: 'scoped', useValue: true, scope: 'rpc'}]);
     kernel.registerController(Controller, 'test');
 
     {
@@ -82,7 +87,7 @@ test('authentication errors', async () => {
     }
 
     const memoryLogger = new MemoryLoggerTransport;
-    const kernel = new RpcKernel(undefined, new MyKernelSecurity, new Logger([memoryLogger]));
+    const kernel = new RpcKernel([{provide: RpcKernelSecurity, useClass: MyKernelSecurity, scope: 'rpc'}], new Logger([memoryLogger]));
     const client = new DirectClient(kernel);
 
     client.token.set('generic');
@@ -209,10 +214,59 @@ test('transformError', async () => {
         }
     }
 
-    const kernel = new RpcKernel(undefined, new MyKernelSecurity);
+    const kernel = new RpcKernel([{provide: RpcKernelSecurity, useClass: MyKernelSecurity, scope: 'rpc'}]);
     kernel.registerController(Controller, 'test');
 
     const client = new DirectClient(kernel);
     const controller = client.controller<Controller>('test');
     await expect(controller.test('asd')).rejects.toThrow('Unknown error occured');
+});
+
+test('connection is available during authentication', async () => {
+    let _connection: RpcKernelBaseConnection | undefined;
+
+    class TestRpcKernelSecurity extends RpcKernelSecurity {
+        async authenticate(token: any, connection: RpcKernelBaseConnection): Promise<Session> {
+            _connection = connection;
+            return new Session('', '');
+        }
+    }
+
+
+    const memoryLogger = new MemoryLoggerTransport;
+    const kernel = new RpcKernel([{provide: RpcKernelSecurity, useClass: TestRpcKernelSecurity, scope: 'rpc'}], new Logger([memoryLogger]));
+    const client = new DirectClient(kernel);
+
+    client.token.set('generic');
+
+    await client.connect();
+
+    expect(_connection).toBeInstanceOf(RpcKernelBaseConnection);
+});
+
+test('connection is available in controller access information', async () => {
+    let _controllerAccess: RpcControllerAccess | undefined;
+
+    class Controller {
+        @rpc.action()
+        test(): void {}
+    }
+
+    class TestRpcKernelSecurity extends RpcKernelSecurity {
+        async hasControllerAccess(session: Session, controllerAccess: RpcControllerAccess): Promise<boolean> {
+            _controllerAccess = controllerAccess;
+            return true;
+        }
+    }
+
+
+    const memoryLogger = new MemoryLoggerTransport;
+    const kernel = new RpcKernel([{provide: RpcKernelSecurity, useClass: TestRpcKernelSecurity, scope: 'rpc'}], new Logger([memoryLogger]));
+    kernel.registerController(Controller, 'test');
+    const client = new DirectClient(kernel);
+
+    const controller = client.controller<Controller>('test');
+    await controller.test();
+
+    expect(_controllerAccess?.connection).toBeInstanceOf(RpcKernelBaseConnection);
 });

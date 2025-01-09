@@ -8,7 +8,8 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { Component, TemplateRef, ViewChild } from '@angular/core';
+import { Component, OnDestroy, TemplateRef, ViewChild } from '@angular/core';
+import { WindowContentComponent } from './window-content.component';
 
 @Component({
     selector: 'dui-window-sidebar',
@@ -19,6 +20,14 @@ import { Component, TemplateRef, ViewChild } from '@angular/core';
     `,
     styleUrls: ['./window-sidebar.component.scss'],
 })
-export class WindowSidebarComponent {
+export class WindowSidebarComponent implements OnDestroy {
     @ViewChild('templateRef', { static: true }) public template!: TemplateRef<any>;
+
+    constructor(private content: WindowContentComponent) {
+        content.registerSidebar(this);
+    }
+
+    ngOnDestroy() {
+        this.content.unregisterSidebar(this);
+    }
 }

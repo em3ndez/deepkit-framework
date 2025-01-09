@@ -26,6 +26,9 @@
       "path": "packages/app/tsconfig.esm.json"
     },
     {
+      "path": "packages/create-app/tsconfig.esm.json"
+    },
+    {
       "path": "packages/event/tsconfig.esm.json"
     },
     {
@@ -48,6 +51,9 @@
     },
     {
       "path": "packages/framework/tsconfig.esm.json"
+    },
+    {
+      "path": "packages/framework-debug-api/tsconfig.esm.json"
     },
     {
       "path": "packages/mongo/tsconfig.esm.json"
@@ -77,7 +83,31 @@
       "path": "packages/broker/tsconfig.esm.json"
     },
     {
-      "path": "packages/angular-universal/tsconfig.esm.json"
+      "path": "packages/orm-browser/tsconfig.esm.json"
+    },
+    {
+      "path": "packages/orm-browser-api/tsconfig.esm.json"
+    },
+    {
+      "path": "packages/vite/tsconfig.esm.json"
+    },
+    {
+      "path": "packages/bun/tsconfig.esm.json"
+    },
+    {
+      "path": "packages/filesystem/tsconfig.esm.json"
+    },
+    {
+      "path": "packages/filesystem-aws-s3/tsconfig.esm.json"
+    },
+    {
+      "path": "packages/filesystem-ftp/tsconfig.esm.json"
+    },
+    {
+      "path": "packages/filesystem-sftp/tsconfig.esm.json"
+    },
+    {
+      "path": "packages/filesystem-google/tsconfig.esm.json"
     }
   ]
 }

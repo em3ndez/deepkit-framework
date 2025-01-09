@@ -11,6 +11,8 @@
 import style from 'ansi-styles';
 import format from 'format-util';
 import { arrayRemoveItem, ClassType } from '@deepkit/core';
+import { Inject, TransientInjectionTarget } from '@deepkit/injector';
+import { MemoryLoggerTransport } from './memory-logger.js';
 
 export enum LoggerLevel {
     none,
@@ -51,9 +53,11 @@ export class ConsoleTransport implements LoggerTransport {
 }
 
 export class JSONTransport implements LoggerTransport {
+    out: { write: (v: string) => any } = process.stdout;
+
     write(message: LogMessage) {
-        process.stdout.write(JSON.stringify({
-            message: message.rawMessage,
+        this.out.write(JSON.stringify({
+            message: message.message,
             level: message.level,
             date: message.date,
             scope: message.scope,
@@ -177,7 +181,7 @@ export interface LoggerInterface {
 
     error(...message: any[]): void;
 
-    warning(...message: any[]): void;
+    warn(...message: any[]): void;
 
     log(...message: any[]): void;
 
@@ -213,7 +217,9 @@ export class Logger implements LoggerInterface {
     }
 
     scoped(name: string): Logger {
-        return this.scopes[name] ||= new (this.constructor as any)(this.transporter, this.formatter, name);
+        const scopedLogger = (this.scopes[name] ||= new (this.constructor as any)(this.transporter, this.formatter, name));
+        scopedLogger.level = this.level;
+        return scopedLogger;
     }
 
     addTransport(transport: LoggerTransport) {
@@ -289,7 +295,7 @@ export class Logger implements LoggerInterface {
         this.send(message, LoggerLevel.error);
     }
 
-    warning(...message: any[]) {
+    warn(...message: any[]) {
         this.send(message, LoggerLevel.warning);
     }
 
@@ -305,3 +311,41 @@ export class Logger implements LoggerInterface {
         this.send(message, LoggerLevel.debug);
     }
 }
+
+/**
+ * Logger with pre-configured console transport.
+ */
+export class ConsoleLogger extends Logger {
+    constructor() {
+        super([new ConsoleTransport]);
+    }
+}
+
+/**
+ * Logger with pre-configured memory transport.
+ */
+export class MemoryLogger extends Logger {
+    public memory = new MemoryLoggerTransport();
+
+    constructor() {
+        super([]);
+        this.transporter.push(this.memory);
+    }
+
+    getOutput(): string {
+        return this.memory.messageStrings.join('\n');
+    }
+
+    clear() {
+        this.memory.messageStrings = [];
+        this.memory.messages = [];
+    }
+}
+
+export type ScopedLogger = Inject<LoggerInterface, 'scoped-logger'>;
+export const ScopedLogger = {
+    provide: 'scoped-logger',
+    transient: true,
+    useFactory: (target: TransientInjectionTarget, logger: Logger = new Logger()) =>
+        logger.scoped(target.token?.name ?? String(target.token)),
+} as const;

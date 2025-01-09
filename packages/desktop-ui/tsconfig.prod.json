@@ -1,9 +1,13 @@
 {
   "extends": "./tsconfig.lib.json",
   "compilerOptions": {
-    "declarationMap": false
+    "declarationMap": false,
   },
+  "include": [
+    "src/**/*.ts",
+    "src/*.ts",
+  ],
   "angularCompilerOptions": {
-    "enableIvy": false
+    "compilationMode": "partial"
   }
 }

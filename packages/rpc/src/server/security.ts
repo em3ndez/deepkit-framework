@@ -9,6 +9,7 @@
  */
 
 import { ClassType } from '@deepkit/core';
+import { RpcKernelBaseConnection } from './kernel.js';
 
 export class Session {
     constructor(
@@ -27,6 +28,7 @@ export interface RpcControllerAccess {
     controllerClassType: ClassType;
     actionName: string;
     actionGroups: string[];
+    connection: RpcKernelBaseConnection;
     actionData: { [name: string]: any };
 }
 
@@ -36,14 +38,14 @@ export class RpcKernelSecurity {
     }
 
     async isAllowedToRegisterAsPeer(session: Session, peerId: string): Promise<boolean> {
-        return true;
+        return false;
     }
 
     async isAllowedToSendToPeer(session: Session, peerId: string): Promise<boolean> {
-        return true;
+        return false;
     }
 
-    async authenticate(token: any): Promise<Session> {
+    async authenticate(token: any, connection: RpcKernelBaseConnection): Promise<Session> {
         throw new Error('Authentication not implemented');
     }
 

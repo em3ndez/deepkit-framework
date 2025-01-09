@@ -12,7 +12,7 @@ import { ClassType } from '@deepkit/core';
 import { Database, DatabaseRegistry } from '@deepkit/orm';
 import glob from 'fast-glob';
 import { basename, join } from 'path';
-import { Migration } from './migration';
+import { Migration } from './migration.js';
 
 export class MigrationProvider {
     protected databaseMap = new Map<string, Database<any>>();
@@ -57,8 +57,10 @@ export class MigrationProvider {
         const files = await glob('**/*.ts', { cwd: migrationDir });
         require('ts-node').register({
             compilerOptions: {
-                experimentalDecorators: true
-            }
+                experimentalDecorators: true,
+                module: 'undefined' !== typeof require ? 'CommonJS' : 'ESNext',
+            },
+            transpileOnly: true,
         });
 
         for (const file of files) {

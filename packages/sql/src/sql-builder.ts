@@ -8,13 +8,15 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { SQLQueryModel } from './sql-adapter';
-import { DefaultPlatform, SqlPlaceholderStrategy } from './platform/default-platform';
+import { SQLQueryModel } from './sql-adapter.js';
+import { DefaultPlatform, SqlPlaceholderStrategy } from './platform/default-platform.js';
 import { getPrimaryKeyHashGenerator, ReflectionClass, ReflectionProperty } from '@deepkit/type';
-import { DatabaseJoinModel, DatabaseQueryModel } from '@deepkit/orm';
-import { getSqlFilter } from './filter';
+import { DatabaseJoinModel, DatabaseQueryModel, OrmEntity } from '@deepkit/orm';
+import { getSqlFilter } from './filter.js';
+import { getPreparedEntity, PreparedAdapter } from './prepare.js';
 
-type ConvertDataToDict = (row: any) => { hash: string, item: { [name: string]: any } } | undefined;
+type ConvertedData = { hash: string, item: { [name: string]: any }, joined: { [name: string]: any }[] };
+type ConvertDataToDict = (row: any) => ConvertedData | undefined;
 
 export class Sql {
     constructor(
@@ -36,14 +38,16 @@ export class Sql {
 
 export class SqlBuilder {
     protected sqlSelect: string[] = [];
-    protected joins: { join: DatabaseJoinModel<any, any>, forJoinIndex: number, startIndex: number, converter: ConvertDataToDict }[] = [];
+    protected joins: { join: DatabaseJoinModel<any>, forJoinIndex: number, startIndex: number, converter: ConvertDataToDict }[] = [];
 
     protected placeholderStrategy: SqlPlaceholderStrategy;
 
     public rootConverter?: ConvertDataToDict;
+    protected platform: DefaultPlatform;
 
-    constructor(protected platform: DefaultPlatform, public params: string[] = []) {
-        this.placeholderStrategy = new platform.placeholderStrategy();
+    constructor(protected adapter: PreparedAdapter, public params: string[] = []) {
+        this.platform = adapter.platform;
+        this.placeholderStrategy = new this.platform.placeholderStrategy();
         this.placeholderStrategy.offset = this.params.length;
     }
 
@@ -56,7 +60,7 @@ export class SqlBuilder {
 
         if (model.filter) {
             const filter = getSqlFilter(schema, model.filter, model.parameters, this.platform.serializer);
-            const builder = this.platform.createSqlFilterBuilder(schema, tableName);
+            const builder = this.platform.createSqlFilterBuilder(this.adapter, schema, tableName);
             builder.placeholderStrategy = placeholderStrategy;
             whereClause = builder.convert(filter);
             whereParams = builder.params;
@@ -83,7 +87,7 @@ export class SqlBuilder {
         if (!model.having) return;
 
         const filter = getSqlFilter(schema, model.having, model.parameters, this.platform.serializer);
-        const builder = this.platform.createSqlFilterBuilder(schema, tableName);
+        const builder = this.platform.createSqlFilterBuilder(this.adapter, schema, tableName);
         builder.placeholderStrategy.offset = sql.params.length;
         const whereClause = builder.convert(filter);
 
@@ -97,11 +101,12 @@ export class SqlBuilder {
     protected selectColumns(schema: ReflectionClass<any>, model: SQLQueryModel<any>) {
         const tableName = this.platform.getTableIdentifier(schema);
         const properties = model.select.size ? [...model.select.values()].map(name => schema.getProperty(name)) : schema.getProperties();
+        const prepared = getPreparedEntity(this.adapter, schema);
 
         if (model.aggregate.size || model.groupBy.size || model.sqlSelect) {
-            //we select only whats aggregated
+            //we select only what is aggregated
             for (const name of model.groupBy.values()) {
-                this.sqlSelect.push(tableName + '.' + this.platform.quoteIdentifier(name));
+                this.sqlSelect.push(tableName + '.' + prepared.fieldMap[name]?.columnNameEscaped || this.platform.quoteIdentifier(name));
             }
             for (const [as, a] of model.aggregate.entries()) {
                 if (a.property.isBackReference()) continue;
@@ -117,29 +122,32 @@ export class SqlBuilder {
         } else {
             for (const property of properties) {
                 if (property.isBackReference()) continue;
+                if (property.isDatabaseSkipped(model.adapterName)) continue;
+                if (model.isLazyLoaded(property.name)) continue;
 
-                this.sqlSelect.push(tableName + '.' + this.platform.quoteIdentifier(property.name));
+                this.sqlSelect.push(tableName + '.' + prepared.fieldMap[property.name].columnNameEscaped);
             }
         }
     }
 
     protected selectColumnsWithJoins(schema: ReflectionClass<any>, model: SQLQueryModel<any>, refName: string = '') {
         const result: { startIndex: number, fields: ReflectionProperty[] } = { startIndex: this.sqlSelect.length, fields: [] };
-
         const properties = model.select.size ? [...model.select.values()].map(name => schema.getProperty(name)) : schema.getProperties();
-        const tableName = this.platform.getTableIdentifier(schema);
         if (model.select.size && !model.select.has(schema.getPrimary().name)) properties.unshift(schema.getPrimary());
+        const prepared = getPreparedEntity(this.adapter, schema);
 
         for (const property of properties) {
             if (property.isBackReference()) continue;
+            if (model.isLazyLoaded(property.name)) continue;
+            if (property.isDatabaseSkipped(model.adapterName)) continue;
 
             result.fields.push(property);
             const as = this.platform.quoteIdentifier(this.sqlSelect.length + '');
 
             if (refName) {
-                this.sqlSelect.push(this.platform.quoteIdentifier(refName) + '.' + this.platform.quoteIdentifier(property.name) + ' AS ' + as);
+                this.sqlSelect.push(this.platform.quoteIdentifier(refName) + '.' + prepared.fieldMap[property.name].columnNameEscaped + ' AS ' + as);
             } else {
-                this.sqlSelect.push(tableName + '.' + this.platform.quoteIdentifier(property.name) + ' AS ' + as);
+                this.sqlSelect.push(prepared.tableNameEscaped + '.' + prepared.fieldMap[property.name].columnNameEscaped + ' AS ' + as);
             }
         }
 
@@ -168,22 +176,27 @@ export class SqlBuilder {
 
     public convertRows(schema: ReflectionClass<any>, model: SQLQueryModel<any>, rows: any[]): any[] {
         if (!this.rootConverter) throw new Error('No root converter set');
-        if (!this.joins.length) return rows.map(v => this.rootConverter!(v));
+        if (!this.joins.length) return rows.map(v => this.rootConverter!(v)?.item);
 
         const result: any[] = [];
-
-        const itemsStack: ({ hash: string, item: any } | undefined)[] = [];
-        itemsStack.push(undefined); //root
+        const entities: {
+            map: { [hash: string]: ConvertedData },
+            current?: ConvertedData
+        }[] = [
+            { map: {}, current: undefined }
+        ];
         for (const join of this.joins) {
-            itemsStack.push(undefined);
+            entities.push({ map: {}, current: undefined });
         }
 
         for (const row of rows) {
-            const converted = this.rootConverter(row);
-            if (!converted) continue;
-            if (!itemsStack[0] || itemsStack[0].hash !== converted.hash) {
-                if (itemsStack[0]) result.push(itemsStack[0].item);
-                itemsStack[0] = converted;
+            const convertedRoot = this.rootConverter(row);
+            if (!convertedRoot) continue;
+            if (!entities[0].map[convertedRoot.hash]) {
+                entities[0].current = entities[0].map[convertedRoot.hash] = convertedRoot;
+                result.push(convertedRoot.item);
+            } else {
+                entities[0].current = entities[0].map[convertedRoot.hash];
             }
 
             for (let joinId = 0; joinId < this.joins.length; joinId++) {
@@ -192,28 +205,29 @@ export class SqlBuilder {
 
                 const converted = join.converter(row);
                 if (!converted) continue;
-                const forItem = itemsStack[join.forJoinIndex + 1]!.item;
+                const entity = entities[joinId + 1];
 
-                if (!itemsStack[joinId + 1] || itemsStack[joinId + 1]!.hash !== converted.hash) {
-                    itemsStack[joinId + 1] = converted;
+                if (!entity.map[converted.hash]) {
+                    entity.current = entity.map[converted.hash] = converted;
+                } else {
+                    entity.current = entity.map[converted.hash];
                 }
 
-                if (join.join.propertySchema.isArray()) {
-                    if (!forItem[join.join.as]) forItem[join.join.as] = [];
-                    if (converted) {
-                        //todo: set lastHash stack, so second level joins work as well
-                        // we need to refactor lashHash to a stack first.
-                        // const pkHasher = getPrimaryKeyHashGenerator(join.join.query.classSchema, this.platform.serializer);
-                        // const pkHash = pkHasher(item);
-                        forItem[join.join.as].push(converted.item);
+                const forEntity = entities[join.forJoinIndex + 1];
+                if (!forEntity.current) continue;
+                const joined = forEntity.current.joined[joinId];
+
+                //check if the item has already been added to the forEntity
+                if (!joined[converted.hash]) {
+                    joined[converted.hash] = converted.item;
+                    if (join.join.propertySchema.isArray()) {
+                        (forEntity.current.item[join.join.as] ||= []).push(converted.item);
+                    } else {
+                        forEntity.current.item[join.join.as] = converted.item;
                     }
-                } else {
-                    forItem[join.join.as] = converted.item;
                 }
             }
         }
-
-        if (itemsStack[0]) result.push(itemsStack[0].item);
 
         return result;
     }
@@ -233,6 +247,7 @@ export class SqlBuilder {
             lines.push(`'${field.name}': row[${startIndex++}]`);
         }
         const pkHasher = getPrimaryKeyHashGenerator(schema, this.platform.serializer);
+        const joinedArray = `[${this.joins.map(v => `{}`).join(', ')}]`;
 
         const code = `
             return function(row) {
@@ -240,7 +255,8 @@ export class SqlBuilder {
 
                 return {
                     hash: pkHasher({${JSON.stringify(schema.getPrimary().name)}: row[${primaryKeyIndex}]}),
-                    item: {${lines.join(',\n')}}
+                    item: {${lines.join(',\n')}},
+                    joined: ${joinedArray}
                 };
             }
         `;
@@ -248,10 +264,13 @@ export class SqlBuilder {
         return new Function('pkHasher', code)(pkHasher) as ConvertDataToDict;
     }
 
-    protected appendJoinSQL<T>(sql: Sql, model: SQLQueryModel<T>, parentName: string, prefix: string = ''): void {
+    protected appendJoinSQL<T extends OrmEntity>(sql: Sql, model: SQLQueryModel<T>, parentName: string, prefix: string = ''): void {
         if (!model.joins.length) return;
 
         for (const join of model.joins) {
+            const originPrepared = getPreparedEntity(this.adapter, join.classSchema);
+            const joinPrepared = getPreparedEntity(this.adapter, join.query.classSchema);
+
             const tableName = this.platform.getTableIdentifier(join.query.classSchema);
             const joinName = this.platform.quoteIdentifier(prefix + '__' + join.propertySchema.name);
 
@@ -277,15 +296,19 @@ export class SqlBuilder {
 
                 const pivotName = this.platform.quoteIdentifier(prefix + '__p_' + join.propertySchema.name);
 
+                const pivotLeftPrepared = getPreparedEntity(this.adapter, pivotToRight.reflectionClass);
+
                 //first pivot table
                 sql.append(`${join.type.toUpperCase()} JOIN ${pivotTableName} AS ${pivotName} ON (`);
-                sql.append(`${pivotName}.${this.platform.quoteIdentifier(pivotToLeft.name)} = ${parentName}.${this.platform.quoteIdentifier(join.classSchema.getPrimary().name)}`);
+                sql.append(`${pivotName}.${pivotLeftPrepared.fieldMap[pivotToLeft.name].columnNameEscaped} = ${parentName}.${originPrepared.fieldMap[originPrepared.primaryKey.name].columnNameEscaped}`);
 
                 sql.append(`)`);
 
+                const pivotRightPrepared = getPreparedEntity(this.adapter, pivotToRight.reflectionClass);
+
                 //then right table
                 sql.append(`${join.type.toUpperCase()} JOIN ${tableName} AS ${joinName} ON (`);
-                sql.append(`${pivotName}.${this.platform.quoteIdentifier(pivotToRight.name)} = ${joinName}.${this.platform.quoteIdentifier(join.query.classSchema.getPrimary().name)}`);
+                sql.append(`${pivotName}.${pivotRightPrepared.fieldMap[pivotToRight.name].columnNameEscaped} = ${joinName}.${joinPrepared.fieldMap[joinPrepared.primaryKey.name].columnNameEscaped}`);
                 this.appendWhereSQL(sql, join.query.classSchema, join.query.model, joinName, 'AND');
                 sql.append(`)`);
 
@@ -301,9 +324,11 @@ export class SqlBuilder {
                     join.classSchema.getClassType(),
                     join.propertySchema,
                 );
-                sql.append(`${parentName}.${this.platform.quoteIdentifier(join.classSchema.getPrimary().name)} = ${joinName}.${this.platform.quoteIdentifier(backReference.name)}`);
+                const backPrepared = getPreparedEntity(this.adapter, backReference.reflectionClass);
+
+                sql.append(`${parentName}.${originPrepared.fieldMap[originPrepared.primaryKey.name].columnNameEscaped} = ${joinName}.${backPrepared.fieldMap[backReference.name].columnNameEscaped}`);
             } else {
-                sql.append(`${parentName}.${this.platform.quoteIdentifier(join.propertySchema.name)} = ${joinName}.${this.platform.quoteIdentifier(join.foreignPrimaryKey.name)}`);
+                sql.append(`${parentName}.${originPrepared.fieldMap[join.propertySchema.name].columnNameEscaped} = ${joinName}.${joinPrepared.fieldMap[joinPrepared.primaryKey.name].columnNameEscaped}`);
             }
             this.appendWhereSQL(sql, join.query.classSchema, join.query.model, joinName, 'AND');
 
@@ -313,29 +338,54 @@ export class SqlBuilder {
         }
     }
 
-    public build<T>(schema: ReflectionClass<any>, model: SQLQueryModel<T>, head: string): Sql {
+    protected applyOrder(order: string[], schema: ReflectionClass<any>, model: SQLQueryModel<any>, tableName: string = '') {
+        if (model.sort) {
+            const prepared = getPreparedEntity(this.adapter, schema);
+            for (const [name, sort] of Object.entries(model.sort)) {
+                order.push(`${tableName}.${prepared.fieldMap[name]?.columnNameEscaped || this.platform.quoteIdentifier(name)} ${sort}`);
+            }
+        }
+    }
+
+    /**
+     * If a join is included that is an array, we have to move LIMIT/ORDER BY into a sub-select,
+     * so that these one-to-many/many-to-many joins are correctly loaded even if there is LIMIT 1.
+     */
+    protected hasToManyJoins(): boolean {
+        for (const join of this.joins) {
+            if (join.join.populate && join.join.propertySchema.isArray()) return true;
+        }
+        return false;
+    }
+
+    public build<T extends OrmEntity>(schema: ReflectionClass<any>, model: SQLQueryModel<T>, head: string): Sql {
         const tableName = this.platform.getTableIdentifier(schema);
 
         const sql = new Sql(`${head} FROM`, this.params);
 
         const withRange = model.limit !== undefined || model.skip !== undefined;
-        if (withRange && model.hasJoins()) {
+        const needsSubSelect = withRange && this.hasToManyJoins();
+        if (needsSubSelect) {
             //wrap FROM table => FROM (SELECT * FROM table LIMIT x OFFSET x)
-
             sql.append(`(SELECT * FROM ${tableName}`);
+            this.appendWhereSQL(sql, schema, model);
+            const order: string[] = [];
+            this.applyOrder(order, schema, model, tableName);
+            if (order.length) sql.append(' ORDER BY ' + (order.join(', ')));
             this.platform.applyLimitAndOffset(sql, model.limit, model.skip);
             sql.append(`) as ${tableName}`);
+            this.appendJoinSQL(sql, model, tableName);
         } else {
             sql.append(tableName);
+            this.appendJoinSQL(sql, model, tableName);
+            this.appendWhereSQL(sql, schema, model);
         }
-
-        this.appendJoinSQL(sql, model, tableName);
-        this.appendWhereSQL(sql, schema, model);
 
         if (model.groupBy.size) {
             const groupBy: string[] = [];
+            const prepared = getPreparedEntity(this.adapter, schema);
             for (const g of model.groupBy.values()) {
-                groupBy.push(`${tableName}.${this.platform.quoteIdentifier(g)}`);
+                groupBy.push(`${tableName}.${prepared.fieldMap[g]?.columnNameEscaped || this.platform.quoteIdentifier(g)}`);
             }
 
             sql.append('GROUP BY ' + groupBy.join(', '));
@@ -344,26 +394,35 @@ export class SqlBuilder {
         this.appendHavingSQL(sql, schema, model, tableName);
 
         const order: string[] = [];
-        if (model.sort) {
-            for (const [name, sort] of Object.entries(model.sort)) {
-                order.push(`${tableName}.${this.platform.quoteIdentifier(name)} ${sort}`);
-            }
-            if (order.length) sql.append(' ORDER BY ' + (order.join(', ')));
+        if (!needsSubSelect) {
+            //ORDER BY are handled as normal
+            this.applyOrder(order, schema, model, tableName);
         }
 
-        if (withRange && !model.hasJoins()) {
+        for (const join of this.joins) {
+            if (!join.join.query.model.sort) continue;
+            const prepared = getPreparedEntity(this.adapter, join.join.query.classSchema);
+            for (const [name, sort] of Object.entries(join.join.query.model.sort)) {
+                order.push(`${join.join.as}.${prepared.fieldMap[name]?.columnNameEscaped || this.platform.quoteIdentifier(name)} ${sort}`);
+            }
+        }
+        if (order.length) sql.append(' ORDER BY ' + (order.join(', ')));
+
+        if (withRange && !this.hasToManyJoins()) {
             this.platform.applyLimitAndOffset(sql, model.limit, model.skip);
         }
 
         return sql;
     }
 
-    public update<T>(schema: ReflectionClass<any>, model: SQLQueryModel<T>, set: string[]): Sql {
-        const tableName = this.platform.getTableIdentifier(schema);
+    public update<T extends OrmEntity>(schema: ReflectionClass<any>, model: SQLQueryModel<T>, set: string[]): Sql {
+        const prepared = getPreparedEntity(this.adapter, schema);
         const primaryKey = schema.getPrimary();
-        const select = this.select(schema, model, { select: [`${tableName}.${primaryKey.name}`] });
+        const select = this.select(schema, model, { select: [`${prepared.tableNameEscaped}.${prepared.fieldMap[primaryKey.name].columnNameEscaped}`] });
 
-        return new Sql(`UPDATE ${tableName} SET ${set.join(', ')} WHERE ${this.platform.quoteIdentifier(primaryKey.name)} IN (SELECT * FROM (${select.sql}) as __)`, select.params);
+        return new Sql(`UPDATE ${prepared.tableNameEscaped}
+                        SET ${set.join(', ')}
+                        WHERE ${prepared.fieldMap[primaryKey.name].columnNameEscaped} IN (SELECT * FROM (${select.sql}) as __)`, select.params);
     }
 
     public select(
@@ -382,6 +441,25 @@ export class SqlBuilder {
             }
         }
 
-        return this.build(schema, model, 'SELECT ' + (manualSelect || this.sqlSelect).join(', '));
+        const sql = this.build(schema, model, 'SELECT ' + (manualSelect || this.sqlSelect).join(', '));
+
+        if (this.platform.supportsSelectFor()) {
+            switch (model.for) {
+                case 'update': {
+                    sql.append(' FOR UPDATE');
+                    break;
+                }
+                case 'share': {
+                    sql.append(' FOR SHARE');
+                    break;
+                }
+            }
+        }
+
+        return sql;
     }
+}
+
+export class SqlReference {
+    constructor(public readonly field: string) {}
 }

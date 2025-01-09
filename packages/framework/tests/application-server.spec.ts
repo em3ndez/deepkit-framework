@@ -1,14 +1,14 @@
 import { rpc } from '@deepkit/rpc';
-import { afterEach, describe, expect, jest, test } from '@jest/globals';
+import { afterEach, describe, expect, it, jest, test } from '@jest/globals';
 import { InjectorContext } from '@deepkit/injector';
-import { createTestingApp } from '../src/testing';
-import { ApplicationServer } from '../src/application-server';
-import { Logger, MemoryLoggerTransport } from '@deepkit/logger';
-import { FrameworkModule } from '../src/module';
-import { RpcServer, RpcServerInterface, WebWorker } from '../src/worker';
-import { HttpRequest } from '@deepkit/http';
-import { BrokerModule } from '../src/broker/broker.module';
+import { createTestingApp } from '../src/testing.js';
+import { ApplicationServer } from '../src/application-server.js';
+import { ConsoleTransport, Logger, MemoryLoggerTransport } from '@deepkit/logger';
+import { FrameworkModule } from '../src/module.js';
+import { RpcServer, RpcServerInterface, WebWorker } from '../src/worker.js';
+import { http, HttpRequest } from '@deepkit/http';
 import { App } from '@deepkit/app';
+import { sleep } from '@deepkit/core';
 
 jest.mock('ws', () => {
     const on = jest.fn();
@@ -76,15 +76,14 @@ describe('application-server', () => {
             }
         }
 
-        const app = new App({
+        const app = createTestingApp({
             controllers: [MyController],
             imports: [
-                new FrameworkModule()
-                    .setup((module) => {
-                        module.getImportedModuleByClass(BrokerModule).configure({ startOnBootstrap: false });
-                    })
+                new FrameworkModule({
+                    broker: { startOnBootstrap: false }
+                })
             ]
-        });
+        }).app;
         const applicationServer = app.get(ApplicationServer);
         const injectorContext = app.get(InjectorContext);
         const controller = injectorContext.createChildScope('rpc').get(MyController);
@@ -132,6 +131,49 @@ describe('application-server', () => {
             await testing.stopServer();
         });
 
+        test('graceful shutdown succeeds', async () => {
+            class MyController {
+                @http.GET()
+                async get() {
+                    await sleep(0.2);
+                    return 'wait-for-me';
+                }
+            }
+
+            const testing = createTestingApp({
+                controllers: [MyController],
+                imports: [new FrameworkModule({ publicDir: 'public', gracefulShutdownTimeout: 1 })]
+            });
+
+            await testing.startServer();
+            const request1 = testing.request(HttpRequest.GET('/'));
+            await testing.stopServer(true);
+            expect(testing.getLogger().messages.some(v => v.message.includes('Waiting 1s for all 1'))).toBe(true);
+            expect(testing.getLogger().messages.some(v => v.message.includes('Timeout of 1s exceeded'))).toBe(false);
+            expect((await request1).json).toBe('wait-for-me');
+        });
+
+        test('graceful shutdown fails', async () => {
+            class MyController {
+                @http.GET()
+                async get() {
+                    await sleep(1.2);
+                    return 'wait-for-me';
+                }
+            }
+
+            const testing = createTestingApp({
+                controllers: [MyController],
+                imports: [new FrameworkModule({ publicDir: 'public', gracefulShutdownTimeout: 1 })]
+            });
+
+            await testing.startServer();
+            const request1 = testing.request(HttpRequest.GET('/'));
+            await testing.stopServer(true);
+            expect(testing.getLogger().messages.some(v => v.message.includes('Waiting 1s for all 1'))).toBe(true);
+            expect(testing.getLogger().messages.some(v => v.message.includes('Timeout of 1s exceeded'))).toBe(true);
+        });
+
         test('not needed without controllers or publicDir', async () => {
             const testing = createTestingApp({
                 controllers: [],
@@ -153,8 +195,8 @@ describe('application-server', () => {
 
             const rpcServerMock: RpcServerInterface = {
                 start: jest.fn((
-                    options,
-                    createRpcConnection
+                    options: any,
+                    createRpcConnection: any
                 ) => wsServerMock.on('connection', (ws: any, req: HttpRequest) => {
                     createRpcConnection({
                         write: jest.fn(),
@@ -177,7 +219,9 @@ describe('application-server', () => {
                         useValue: rpcServerMock,
                     }
                 ],
-                imports: [new FrameworkModule()]
+                imports: [new FrameworkModule({
+                    broker: { startOnBootstrap: false }
+                })]
             });
             const applicationServer = app.get(ApplicationServer);
             await applicationServer.start();
@@ -197,7 +241,9 @@ describe('application-server', () => {
 
             const app = new App({
                 controllers: [MyController],
-                imports: [new FrameworkModule()]
+                imports: [new FrameworkModule({
+                    broker: { startOnBootstrap: false }
+                })]
             });
             const applicationServer = app.get(ApplicationServer);
             await applicationServer.start();
@@ -208,5 +254,15 @@ describe('application-server', () => {
             await applicationServer.close();
         });
     });
+});
 
+describe('createTestingApp', () => {
+    it('should setup the logger correctly', async () => {
+        const loggerRemoveTransportSpy = jest.spyOn(Logger.prototype, 'removeTransport');
+        const loggerAddTransportSpy = jest.spyOn(Logger.prototype, 'addTransport');
+        const facade = createTestingApp({});
+        await facade.startServer();
+        expect(loggerAddTransportSpy).toHaveBeenCalledWith(expect.any(MemoryLoggerTransport));
+        expect(loggerRemoveTransportSpy).toHaveBeenCalledWith(expect.any(ConsoleTransport));
+    });
 });

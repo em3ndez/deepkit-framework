@@ -8,9 +8,6 @@
       "path": "packages/core-rxjs/tsconfig.json"
     },
     {
-      "path": "packages/crypto/tsconfig.json"
-    },
-    {
       "path": "packages/api-console-api/tsconfig.json"
     },
     {
@@ -18,6 +15,9 @@
     },
     {
       "path": "packages/app/tsconfig.json"
+    },
+    {
+      "path": "packages/create-app/tsconfig.json"
     },
     {
       "path": "packages/event/tsconfig.json"
@@ -74,9 +74,6 @@
       "path": "packages/rpc/tsconfig.json"
     },
     {
-      "path": "packages/rpc/tsconfig.test.json"
-    },
-    {
       "path": "packages/rpc-tcp/tsconfig.json"
     },
     {
@@ -95,10 +92,28 @@
       "path": "packages/orm-integration/tsconfig.json"
     },
     {
-      "path": "packages/angular-universal/tsconfig.json"
+      "path": "packages/broker/tsconfig.json"
     },
     {
-      "path": "packages/broker/tsconfig.json"
+      "path": "packages/vite/tsconfig.json"
+    },
+    {
+      "path": "packages/bun/tsconfig.json"
+    },
+    {
+      "path": "packages/filesystem/tsconfig.json"
+    },
+    {
+      "path": "packages/filesystem-aws-s3/tsconfig.json"
+    },
+    {
+      "path": "packages/filesystem-ftp/tsconfig.json"
+    },
+    {
+      "path": "packages/filesystem-sftp/tsconfig.json"
+    },
+    {
+      "path": "packages/filesystem-google/tsconfig.json"
     }
   ]
 }

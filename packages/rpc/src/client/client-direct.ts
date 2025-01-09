@@ -8,9 +8,10 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { RpcKernel } from '../server/kernel';
-import { ClientTransportAdapter, RpcClient, TransportConnectionHooks } from './client';
+import { RpcKernel } from '../server/kernel.js';
+import { ClientTransportAdapter, RpcClient } from './client.js';
 import { InjectorContext } from '@deepkit/injector';
+import { TransportClientConnection } from '../transport.js';
 
 export class DirectClient extends RpcClient {
     constructor(rpcKernel: RpcKernel, injector?: InjectorContext) {
@@ -22,10 +23,12 @@ export class RpcDirectClientAdapter implements ClientTransportAdapter {
     constructor(public rpcKernel: RpcKernel, protected injector?: InjectorContext) {
     }
 
-    public async connect(connection: TransportConnectionHooks) {
+    public async connect(connection: TransportClientConnection) {
         const kernelConnection = this.rpcKernel.createConnection({
-            write: (buffer) => connection.onData(buffer),
-            close: () => {connection.onClose(); },
+            writeBinary: (buffer) => connection.readBinary(buffer),
+            close: () => {
+                connection.onClose('closed');
+            },
         }, this.injector);
 
         connection.onConnected({
@@ -38,9 +41,9 @@ export class RpcDirectClientAdapter implements ClientTransportAdapter {
             close() {
                 kernelConnection.close();
             },
-            send(buffer) {
+            writeBinary(buffer) {
                 kernelConnection.feed(buffer);
-            }
+            },
         });
     }
 }
@@ -59,14 +62,16 @@ export class RpcAsyncDirectClientAdapter implements ClientTransportAdapter {
     constructor(public rpcKernel: RpcKernel, protected injector?: InjectorContext) {
     }
 
-    public async connect(connection: TransportConnectionHooks) {
+    public async connect(connection: TransportClientConnection) {
         const kernelConnection = this.rpcKernel.createConnection({
-            write: (buffer) => {
+            writeBinary: (buffer) => {
                 setTimeout(() => {
-                    connection.onData(buffer)
+                    connection.readBinary(buffer);
                 });
             },
-            close: () => {connection.onClose(); },
+            close: () => {
+                connection.onClose('closed');
+            },
         }, this.injector);
 
         connection.onConnected({
@@ -79,11 +84,11 @@ export class RpcAsyncDirectClientAdapter implements ClientTransportAdapter {
             close() {
                 kernelConnection.close();
             },
-            send(buffer) {
+            writeBinary(buffer) {
                 setTimeout(() => {
                     kernelConnection.feed(buffer);
                 });
-            }
+            },
         });
     }
 }

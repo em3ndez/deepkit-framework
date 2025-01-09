@@ -1,6 +1,7 @@
 {
   "compileOnSave": false,
   "compilerOptions": {
+    "baseUrl": "./",
     "outDir": "./dist/out-tsc",
     "forceConsistentCasingInFileNames": true,
     "allowSyntheticDefaultImports": true,
@@ -10,16 +11,26 @@
     "declaration": false,
     "downlevelIteration": true,
     "experimentalDecorators": true,
-    "emitDecoratorMetadata": true,
     "moduleResolution": "node",
     "importHelpers": true,
-    "target": "es2018",
-    "module": "es2020",
+    "target": "ES2022",
+    "module": "ES2022",
+    "useDefineForClassFields": false,
     "lib": [
-      "es2018",
+      "ES2022",
       "dom"
+    ],
+    "types": [
+      "dagre",
+      "file-saver",
+      "jasmine",
+      "marked"
     ]
   },
+  "reflection": [
+    "./src/app/state.ts",
+    "../../node_modules/@deepkit/api-console-gui/src/app/store.ts"
+  ],
   "angularCompilerOptions": {
     "enableI18nLegacyMessageIdFormat": false,
     "strictInjectionParameters": true,
@@ -35,9 +46,6 @@
     },
     {
       "path": "../core-rxjs/tsconfig.json"
-    },
-    {
-      "path": "../crypto/tsconfig.json"
     },
     {
       "path": "../api-console-api/tsconfig.json"

@@ -1,9 +1,10 @@
-import { DatabaseFactory } from './test';
-import { cast, PrimaryKey } from '@deepkit/type';
+import { DatabaseFactory } from './test.js';
+import { cast, entity, PrimaryKey } from '@deepkit/type';
 import { expect } from '@jest/globals';
 
 export const aggregateTest = {
     async basics(databaseFactory: DatabaseFactory) {
+        @entity.name('aggregate_product')
         class Product {
             id!: number & PrimaryKey;
             category!: string;

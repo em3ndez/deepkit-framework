@@ -1,11 +1,11 @@
 import { expect, test } from '@jest/globals';
 import { atomicChange, deserialize, PrimaryKey, Reference, ReflectionClass, serializer } from '@deepkit/type';
-import { Formatter } from '../src/formatter';
-import { DatabaseQueryModel } from '../src/query';
-import { DatabaseSession } from '../src/database-session';
-import { MemoryDatabaseAdapter } from '../src/memory-db';
-import { getClassState, getInstanceStateFromItem } from '../src/identity-map';
-import { buildChangesFromInstance } from '../src/utils';
+import { Formatter } from '../src/formatter.js';
+import { DatabaseQueryModel } from '../src/query.js';
+import { DatabaseSession } from '../src/database-session.js';
+import { MemoryDatabaseAdapter } from '../src/memory-db.js';
+import { getClassState, getInstanceStateFromItem } from '../src/identity-map.js';
+import { buildChangesFromInstance } from '../src/utils.js';
 
 test('change-detection', () => {
     class Image {
@@ -87,7 +87,7 @@ test('change-detection', () => {
 
 test('change-detection string', () => {
     class s {
-        username!: string;
+        username!: string & PrimaryKey;
     }
 
     const item = deserialize<s>({ username: 'Peter' });
@@ -100,7 +100,7 @@ test('change-detection string', () => {
 
 test('change-detection number', () => {
     class s {
-        position!: number;
+        position!: number & PrimaryKey;
     }
 
     {
@@ -123,7 +123,7 @@ test('change-detection number', () => {
 
 test('change-detection array', () => {
     class s {
-        id!: number;
+        id!: number & PrimaryKey;
         tags?: string[];
     }
 
@@ -150,7 +150,7 @@ test('change-detection array', () => {
 
 test('change-detection object', () => {
     class s {
-        id!: number;
+        id!: number & PrimaryKey;
         tags?: { [name: string]: boolean };
     }
 
@@ -178,7 +178,7 @@ test('change-detection object', () => {
 
 test('change-detection union', () => {
     class s {
-        id!: number;
+        id!: number & PrimaryKey;
         tags?: { type: 'a', name: string } | { type: 'b', size: number };
     }
 
@@ -203,7 +203,7 @@ test('change-detection enum', () => {
     }
 
     class s {
-        id!: number;
+        id!: number & PrimaryKey;
         enum?: MyEnum;
     }
 
@@ -222,8 +222,8 @@ test('change-detection enum', () => {
 
 test('change-detection arrayBuffer', () => {
     class s {
-        id!: number;
-        buffer!: ArrayBuffer
+        id!: number & PrimaryKey;
+        buffer!: ArrayBuffer;
     }
 
     {
@@ -241,8 +241,8 @@ test('change-detection arrayBuffer', () => {
 
 test('change-detection typedArray', () => {
     class s {
-        id!: number;
-        buffer!: Uint16Array
+        id!: number & PrimaryKey;
+        buffer!: Uint16Array;
     }
 
     {
@@ -261,8 +261,8 @@ test('change-detection typedArray', () => {
 
 test('change-detection array in array', () => {
     class s {
-        id!: number;
-        tags!: string[][]
+        id!: number & PrimaryKey;
+        tags!: string[][];
     }
 
     {
@@ -289,8 +289,8 @@ test('change-detection array in array', () => {
 
 test('change-detection array in object', () => {
     class s {
-        id!: number;
-        tags!: Record<string, string[]>
+        id!: number & PrimaryKey;
+        tags!: Record<string, string[]>;
     }
 
     {
@@ -314,8 +314,8 @@ test('change-detection array in object', () => {
 
 test('change-detection object in object', () => {
     class s {
-        id!: number;
-        tags!: Record<string, Record<string, boolean>>
+        id!: number & PrimaryKey;
+        tags!: Record<string, Record<string, boolean>>;
     }
 
     {
@@ -345,8 +345,8 @@ test('change-detection object in object', () => {
 
 test('change-detection class', () => {
     class s {
-        id!: number;
-        config!: {a?: string, b?: string}
+        id!: number & PrimaryKey;
+        config!: { a?: string, b?: string };
     }
 
     {
@@ -370,8 +370,8 @@ test('change-detection class', () => {
 
 test('change-detection class in array', () => {
     class s {
-        id!: number;
-        config!: {name: string, value: string}[]
+        id!: number & PrimaryKey;
+        config!: { name: string, value: string }[];
     }
 
     {

@@ -9,12 +9,13 @@
  */
 
 import { createHash, createHmac, pbkdf2Sync, randomBytes, timingSafeEqual } from 'crypto';
-import { MongoAuth } from './auth';
-import { MongoClientConfig } from '../../config';
-import { BaseResponse, Command } from '../command';
-import { MongoError } from '../../error';
+import { MongoAuth } from './auth.js';
+import { MongoClientConfig } from '../../config.js';
+import { BaseResponse, Command } from '../command.js';
+import { MongoError } from '../../error.js';
 // @ts-ignore
 import saslprep from 'saslprep';
+import { base64ToUint8Array } from '@deepkit/core';
 
 interface SaslStartCommand {
     saslStart: 1;
@@ -27,7 +28,7 @@ interface SaslStartCommand {
     };
 }
 
-interface SaslStartResponse {
+interface SaslStartResponse extends BaseResponse {
     conversationId: number;
     payload: Uint8Array;
     done: boolean;
@@ -66,7 +67,7 @@ function passwordDigest(u: string, p: string) {
     return md5.digest('hex');
 }
 
-function HI(data: string, salt: Buffer, iterations: number, cryptoAlgorithm: string) {
+function HI(data: string, salt: Uint8Array, iterations: number, cryptoAlgorithm: string) {
     if (cryptoAlgorithm !== 'sha1' && cryptoAlgorithm !== 'sha256') {
         throw new MongoError(`Invalid crypto algorithm ${cryptoAlgorithm}`);
     }
@@ -96,7 +97,7 @@ export abstract class ScramAuth implements MongoAuth {
         this.cryptoMethod = this.mechanism === 'SCRAM-SHA-1' ? 'sha1' : 'sha256';
     }
 
-    async auth(command: Command, config: MongoClientConfig): Promise<void> {
+    async auth(command: Command<unknown>, config: MongoClientConfig): Promise<void> {
         const username = cleanUsername(config.authUser || '');
         const password = config.authPassword || '';
 
@@ -116,7 +117,7 @@ export abstract class ScramAuth implements MongoAuth {
         const withoutProof = `c=biws,r=${payloadStart.r}`;
         const saltedPassword = HI(
             processedPassword,
-            Buffer.from(payloadStart.s, 'base64'),
+            base64ToUint8Array(payloadStart.s),
             payloadStart.i,
             this.cryptoMethod
         );

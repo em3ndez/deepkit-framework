@@ -9,7 +9,13 @@
  */
 
 import {
+    asAliasName,
     DefaultPlatform,
+    getDeepTypeCaster,
+    getPreparedEntity,
+    prepareBatchUpdate,
+    PreparedEntity,
+    splitDotPath,
     SqlBuilder,
     SQLConnection,
     SQLConnectionPool,
@@ -19,24 +25,61 @@ import {
     SQLPersistence,
     SQLQueryModel,
     SQLQueryResolver,
-    SQLStatement
+    SQLStatement,
 } from '@deepkit/sql';
-import { DatabaseLogger, DatabasePersistenceChangeSet, DatabaseSession, DatabaseTransaction, DeleteResult, OrmEntity, PatchResult, UniqueConstraintFailure } from '@deepkit/orm';
-import { PostgresPlatform } from './postgres-platform';
+import {
+    DatabaseDeleteError,
+    DatabaseError,
+    DatabaseLogger,
+    DatabasePatchError,
+    DatabasePersistenceChangeSet,
+    DatabaseSession,
+    DatabaseTransaction,
+    DatabaseUpdateError,
+    DeleteResult,
+    ensureDatabaseError,
+    OrmEntity,
+    PatchResult,
+    primaryKeyObjectConverter,
+    UniqueConstraintFailure,
+} from '@deepkit/orm';
+import { PostgresPlatform } from './postgres-platform.js';
 import type { Pool, PoolClient, PoolConfig } from 'pg';
 import pg from 'pg';
 import { AbstractClassType, asyncOperation, ClassType, empty } from '@deepkit/core';
 import { FrameCategory, Stopwatch } from '@deepkit/stopwatch';
-import { Changes, getPartialSerializeFunction, getSerializeFunction, ReflectionClass, ReflectionKind, ReflectionProperty, resolvePath, resolveReceiveType } from '@deepkit/type';
-import { ReceiveType } from '@deepkit/type';
+import {
+    Changes,
+    getPatchSerializeFunction,
+    getSerializeFunction,
+    ReceiveType,
+    ReflectionClass,
+    ReflectionKind,
+    ReflectionProperty,
+    resolvePath,
+} from '@deepkit/type';
+import { parseConnectionString } from './config.js';
 
-function handleError(error: Error | string): void {
-    const message = 'string' === typeof error ? error : error.message;
-    if (message.includes('violates unique constraint')) {
-        //todo: extract table name, column name, and find ClassSchema
-        throw new UniqueConstraintFailure();
+/**
+ * Converts a specific database error to a more specific error, if possible.
+ */
+function handleSpecificError(session: DatabaseSession, error: DatabaseError): Error {
+    let cause: any = error;
+    while (cause) {
+        if (cause instanceof Error) {
+            if (cause.message.includes('duplicate key value')
+                && 'table' in cause && 'string' === typeof cause.table
+                && 'detail' in cause && 'string' === typeof cause.detail
+            ) {
+                return new UniqueConstraintFailure(`${cause.message}: ${cause.detail}`, { cause: error });
+            }
+            cause = cause.cause;
+        }
     }
+
+    return error;
 }
+
 
 export class PostgresStatement extends SQLStatement {
     protected released = false;
@@ -48,7 +91,8 @@ export class PostgresStatement extends SQLStatement {
     async get(params: any[] = []) {
         const frame = this.stopwatch ? this.stopwatch.start('Query', FrameCategory.databaseQuery) : undefined;
         try {
-            if (frame) frame.data({sql: this.sql, sqlParams: params});
+            if (frame) frame.data({ sql: this.sql, sqlParams: params });
+            this.logger.logQuery(this.sql, params);
             //postgres driver does not maintain error.stack when they throw errors, so
             //we have to manually convert it using asyncOperation.
             const res = await asyncOperation<any>((resolve, reject) => {
@@ -56,7 +100,7 @@ export class PostgresStatement extends SQLStatement {
             });
             return res.rows[0];
         } catch (error: any) {
-            handleError(error);
+            error = ensureDatabaseError(error);
             this.logger.failedQuery(error, this.sql, params);
             throw error;
         } finally {
@@ -67,7 +111,8 @@ export class PostgresStatement extends SQLStatement {
     async all(params: any[] = []) {
         const frame = this.stopwatch ? this.stopwatch.start('Query', FrameCategory.databaseQuery) : undefined;
         try {
-            if (frame) frame.data({sql: this.sql, sqlParams: params});
+            if (frame) frame.data({ sql: this.sql, sqlParams: params });
+            this.logger.logQuery(this.sql, params);
             //postgres driver does not maintain error.stack when they throw errors, so
             //we have to manually convert it using asyncOperation.
             const res = await asyncOperation<any>((resolve, reject) => {
@@ -75,7 +120,7 @@ export class PostgresStatement extends SQLStatement {
             });
             return res.rows;
         } catch (error: any) {
-            handleError(error);
+            error = ensureDatabaseError(error);
             this.logger.failedQuery(error, this.sql, params);
             throw error;
         } finally {
@@ -108,7 +153,7 @@ export class PostgresConnection extends SQLConnection {
     async run(sql: string, params: any[] = []) {
         const frame = this.stopwatch ? this.stopwatch.start('Query', FrameCategory.databaseQuery) : undefined;
         try {
-            if (frame) frame.data({sql, sqlParams: params});
+            if (frame) frame.data({ sql, sqlParams: params });
             //postgres driver does not maintain error.stack when they throw errors, so
             //we have to manually convert it using asyncOperation.
             const res = await asyncOperation<any>((resolve, reject) => {
@@ -118,7 +163,7 @@ export class PostgresConnection extends SQLConnection {
             this.lastReturningRows = res.rows;
             this.changes = res.rowCount;
         } catch (error: any) {
-            handleError(error);
+            error = ensureDatabaseError(error);
             this.logger.failedQuery(error, sql, params);
             throw error;
         } finally {
@@ -232,146 +277,107 @@ export class PostgresPersistence extends SQLPersistence {
         super(platform, connectionPool, session);
     }
 
-    async batchUpdate<T extends OrmEntity>(classSchema: ReflectionClass<T>, changeSets: DatabasePersistenceChangeSet<T>[]): Promise<void> {
-        const partialSerialize = getPartialSerializeFunction(classSchema.type, this.platform.serializer.serializeRegistry);
-        const tableName = this.platform.getTableIdentifier(classSchema);
-        const pkName = classSchema.getPrimary().name;
-        const pkField = this.platform.quoteIdentifier(pkName);
+    override handleSpecificError(error: Error): Error {
+        return handleSpecificError(this.session, error);
+    }
 
-        const values: { [name: string]: any[] } = {};
-        const setNames: string[] = [];
-        const aggregateSelects: { [name: string]: { id: any, sql: string }[] } = {};
-        const requiredFields: { [name: string]: 1 } = {};
+    async batchUpdate<T extends OrmEntity>(entity: PreparedEntity, changeSets: DatabasePersistenceChangeSet<T>[]): Promise<void> {
+        const prepared = prepareBatchUpdate(this.platform, entity, changeSets);
+        if (!prepared) return;
 
-        const assignReturning: { [name: string]: { item: any, names: string[] } } = {};
-        const setReturning: { [name: string]: 1 } = {};
-
-        for (const changeSet of changeSets) {
-            const where: string[] = [];
-
-            const pk = partialSerialize(changeSet.primaryKey);
-            for (const i in pk) {
-                if (!pk.hasOwnProperty(i)) continue;
-                where.push(`${this.platform.quoteIdentifier(i)} = ${this.platform.quoteValue(pk[i])}`);
-                requiredFields[i] = 1;
-            }
-
-            if (!values[pkName]) values[pkName] = [];
-            values[pkName].push(this.platform.quoteValue(changeSet.primaryKey[pkName]));
-
-            const fieldAddedToValues: { [name: string]: 1 } = {};
-            const id = changeSet.primaryKey[pkName];
-
-            if (changeSet.changes.$set) {
-                const value = partialSerialize(changeSet.changes.$set);
-                for (const i in value) {
-                    if (!value.hasOwnProperty(i)) continue;
-                    if (!values[i]) {
-                        values[i] = [];
-                        setNames.push(`${this.platform.quoteIdentifier(i)} = _b.${this.platform.quoteIdentifier(i)}`);
-                    }
-                    requiredFields[i] = 1;
-                    fieldAddedToValues[i] = 1;
-                    let v = value[i];
-
-                    //special postgres check to avoid an error like:
-                    /// column "deletedAt" is of type timestamp without time zone but expression is of type text
-                    if (v === undefined || v === null) {
-                        values[i].push('null' + this.platform.typeCast(classSchema, i));
-                    } else {
-                        values[i].push(this.platform.quoteValue(v));
-                    }
-                }
-            }
-
-            if (changeSet.changes.$inc) {
-                for (const i in changeSet.changes.$inc) {
-                    if (!changeSet.changes.$inc.hasOwnProperty(i)) continue;
-                    const value = changeSet.changes.$inc[i];
-                    if (!aggregateSelects[i]) aggregateSelects[i] = [];
-
-                    if (!values[i]) {
-                        values[i] = [];
-                        setNames.push(`${this.platform.quoteIdentifier(i)} = _b.${this.platform.quoteIdentifier(i)}`);
-                    }
-
-                    if (!assignReturning[id]) {
-                        assignReturning[id] = { item: changeSet.item, names: [] };
-                    }
-
-                    assignReturning[id].names.push(i);
-                    setReturning[i] = 1;
-
-                    aggregateSelects[i].push({
-                        id: changeSet.primaryKey[pkName],
-                        sql: `_origin.${this.platform.quoteIdentifier(i)} + ${this.platform.quoteValue(value)}`
-                    });
-                    requiredFields[i] = 1;
-                    if (!fieldAddedToValues[i]) {
-                        fieldAddedToValues[i] = 1;
-                        values[i].push(this.platform.quoteValue(typeSafeDefaultValue(classSchema.getProperty(i))));
-                    }
-                }
-            }
-        }
-
+        const placeholderStrategy = new this.platform.placeholderStrategy();
+        const params: any[] = [];
         const selects: string[] = [];
         const valuesValues: string[] = [];
+        const valuesSetValues: string[] = [];
         const valuesNames: string[] = [];
-        for (const i in values) {
-            valuesNames.push(i);
+        const valuesSetNames: string[] = [];
+        for (const fieldName of prepared.changedFields) {
+            valuesNames.push(fieldName);
+            valuesSetNames.push('_changed_' + fieldName);
         }
 
-        for (let i = 0; i < values[pkName].length; i++) {
-            valuesValues.push('(' + valuesNames.map(name => values[name][i]).join(',') + ')');
+        for (let i = 0; i < changeSets.length; i++) {
+            params.push(prepared.primaryKeys[i]);
+            let pkValue = entity.primaryKey.sqlTypeCast(placeholderStrategy.getPlaceholder());
+
+            valuesValues.push('(' + pkValue + ',' + prepared.changedProperties.map(property => {
+                params.push(prepared.values[property.name][i]);
+                return property.sqlTypeCast(placeholderStrategy.getPlaceholder());
+            }).join(',') + ')');
         }
 
-        for (const i in requiredFields) {
-            if (aggregateSelects[i]) {
+        for (let i = 0; i < changeSets.length; i++) {
+            params.push(prepared.primaryKeys[i]);
+            let valuesSetValueSql = entity.primaryKey.sqlTypeCast(placeholderStrategy.getPlaceholder());
+            for (const fieldName of prepared.changedFields) {
+                valuesSetValueSql += ', ' + prepared.valuesSet[fieldName][i];
+            }
+            valuesSetValues.push('(' + valuesSetValueSql + ')');
+        }
+
+        for (const i of prepared.changedFields) {
+            const col = entity.fieldMap[i].columnNameEscaped;
+            const colChanged = '_changed_' + i;
+            if (prepared.aggregateSelects[i]) {
                 const select: string[] = [];
                 select.push('CASE');
-                for (const item of aggregateSelects[i]) {
-                    select.push(`WHEN _.${pkField} = ${item.id} THEN ${item.sql}`);
+                for (const item of prepared.aggregateSelects[i]) {
+                    select.push(`WHEN _.${prepared.originPkField} = ${item.id} THEN ${item.sql}`);
                 }
-                select.push(`ELSE _.${this.platform.quoteIdentifier(i)} END as ${this.platform.quoteIdentifier(i)}`);
+
+                select.push(`ELSE (CASE WHEN ${colChanged} = 0 THEN _origin.${col} ELSE _.${col} END) END as ${col}`);
                 selects.push(select.join(' '));
             } else {
-                selects.push('_.' + this.platform.quoteIdentifier(i));
+                //if(check, true, false) => COALESCE(NULLIF(check, true), false)
+                selects.push(`(CASE WHEN ${colChanged} = 0 THEN _origin.${col} ELSE _.${col} END) as ${col}`);
             }
         }
 
         const returningSelect: string[] = [];
-        returningSelect.push(tableName + '.' + pkField);
-        if (!empty(setReturning)) {
-            for (const i in setReturning) {
-                returningSelect.push(tableName + '.' + this.platform.quoteIdentifier(i));
+        returningSelect.push(prepared.tableName + '.' + prepared.pkField);
+        if (!empty(prepared.setReturning)) {
+            for (const i in prepared.setReturning) {
+                returningSelect.push(prepared.tableName + '.' + this.platform.quoteIdentifier(i));
             }
         }
 
-        const escapedValuesNames = valuesNames.map(v => this.platform.quoteIdentifier(v));
+        const escapedValuesNames = valuesNames.map(v => entity.fieldMap[v].columnNameEscaped);
 
         const sql = `
-              WITH _b(${escapedValuesNames.join(', ')}) AS (
-                SELECT ${selects.join(', ')} FROM
-                    (VALUES ${valuesValues.join(', ')}) as _(${escapedValuesNames.join(', ')})
-                    INNER JOIN ${tableName} as _origin ON (_origin.${pkField} = _.${pkField})
+              WITH _b(${prepared.originPkField}, ${escapedValuesNames.join(', ')}) AS (
+                SELECT _.${prepared.originPkField}, ${selects.join(', ')} FROM
+                    (VALUES ${valuesValues.join(', ')}) as _(${prepared.originPkField}, ${escapedValuesNames.join(', ')})
+                    INNER JOIN (VALUES ${valuesSetValues.join(', ')}) as _set(${prepared.pkField}, ${valuesSetNames.join(', ')}) ON (_.${prepared.originPkField} = _set.${prepared.pkField})
+                    INNER JOIN ${prepared.tableName} as _origin ON (_origin.${prepared.pkField} = _.${prepared.originPkField})
               )
-              UPDATE ${tableName}
-              SET ${setNames.join(', ')}
+              UPDATE ${prepared.tableName}
+              SET ${prepared.setNames.join(', ')}
               FROM _b
-              WHERE ${tableName}.${pkField} = _b.${pkField}
+              WHERE ${prepared.tableName}.${prepared.pkField} = _b.${prepared.originPkField}
               RETURNING ${returningSelect.join(', ')};
         `;
 
-        const connection = await this.getConnection(); //will automatically be released in SQLPersistence
-        const result = await connection.execAndReturnAll(sql);
-        for (const returning of result) {
-            const r = assignReturning[returning[pkName]];
-            if (!r) continue;
+        try {
+            const connection = await this.getConnection(); //will automatically be released in SQLPersistence
+            const result = await connection.execAndReturnAll(sql, params);
+            for (const returning of result) {
+                const r = prepared.assignReturning[returning[prepared.pkName]];
+                if (!r) continue;
 
-            for (const name of r.names) {
-                r.item[name] = returning[name];
+                for (const name of r.names) {
+                    r.item[name] = returning[name];
+                }
             }
+        } catch (error: any) {
+            const reflection = ReflectionClass.from(entity.type);
+            error = new DatabaseUpdateError(
+                reflection,
+                changeSets,
+                `Could not update ${reflection.getClassName()} in database`,
+                { cause: error },
+            );
+            throw this.handleSpecificError(error);
         }
     }
 
@@ -403,27 +409,15 @@ export class PostgresPersistence extends SQLPersistence {
 
         return `INSERT INTO ${this.platform.getTableIdentifier(classSchema)} (${fields.join(', ')}) VALUES (${values.join('), (')}) ${returning}`;
     }
-
-    protected placeholderPosition: number = 1;
-
-    protected resetPlaceholderSymbol() {
-        this.placeholderPosition = 1;
-    }
-
-    protected getPlaceholderSymbol() {
-        return '$' + this.placeholderPosition++;
-    }
-
 }
 
 export class PostgresSQLQueryResolver<T extends OrmEntity> extends SQLQueryResolver<T> {
-
     async delete(model: SQLQueryModel<T>, deleteResult: DeleteResult<T>): Promise<void> {
         const primaryKey = this.classSchema.getPrimary();
         const pkField = this.platform.quoteIdentifier(primaryKey.name);
-        const primaryKeyConverted = getSerializeFunction(primaryKey.property, this.platform.serializer.deserializeRegistry);
+        const primaryKeyConverted = primaryKeyObjectConverter(this.classSchema, this.platform.serializer.deserializeRegistry);
 
-        const sqlBuilder = new SqlBuilder(this.platform);
+        const sqlBuilder = new SqlBuilder(this.adapter);
         const tableName = this.platform.getTableIdentifier(this.classSchema);
         const select = sqlBuilder.select(this.classSchema, model, { select: [`${tableName}.${pkField}`] });
 
@@ -442,23 +436,32 @@ export class PostgresSQLQueryResolver<T extends OrmEntity> extends SQLQueryResol
             for (const row of rows) {
                 deleteResult.primaryKeys.push(primaryKeyConverted(row[primaryKey.name]));
             }
+        } catch (error: any) {
+            error = new DatabaseDeleteError(this.classSchema, 'Could not delete in database', { cause: error });
+            error.query = model;
+            throw this.handleSpecificError(error);
         } finally {
             connection.release();
         }
     }
 
+    override handleSpecificError(error: Error): Error {
+        return handleSpecificError(this.session, error);
+    }
+
     async patch(model: SQLQueryModel<T>, changes: Changes<T>, patchResult: PatchResult<T>): Promise<void> {
         const select: string[] = [];
         const selectParams: any[] = [];
-        const tableName = this.platform.getTableIdentifier(this.classSchema);
+        const entity = getPreparedEntity(this.session.adapter as SQLDatabaseAdapter, this.classSchema);
+        const tableName = entity.tableNameEscaped;
         const primaryKey = this.classSchema.getPrimary();
-        const primaryKeyConverted = getSerializeFunction(primaryKey.property, this.platform.serializer.deserializeRegistry);
+        const primaryKeyConverted = primaryKeyObjectConverter(this.classSchema, this.platform.serializer.deserializeRegistry);
 
         const fieldsSet: { [name: string]: 1 } = {};
         const aggregateFields: { [name: string]: { converted: (v: any) => any } } = {};
 
-        const partialSerialize = getPartialSerializeFunction(this.classSchema.type, this.platform.serializer.serializeRegistry);
-        const $set = changes.$set ? partialSerialize(changes.$set) : undefined;
+        const patchSerialize = getPatchSerializeFunction(this.classSchema.type, this.platform.serializer.serializeRegistry);
+        const $set = changes.$set ? patchSerialize(changes.$set, undefined) : undefined;
         const set: string[] = [];
 
         if ($set) for (const i in $set) {
@@ -467,8 +470,7 @@ export class PostgresSQLQueryResolver<T extends OrmEntity> extends SQLQueryResol
                 set.push(`${this.platform.quoteIdentifier(i)} = NULL`);
             } else {
                 fieldsSet[i] = 1;
-
-                select.push(`$${selectParams.length + 1}${this.platform.typeCast(this.classSchema, i)} as ${this.platform.quoteIdentifier(i)}`);
+                select.push(`$${selectParams.length + 1} as ${this.platform.quoteIdentifier(asAliasName(i))}`);
                 selectParams.push($set[i]);
             }
         }
@@ -488,11 +490,20 @@ export class PostgresSQLQueryResolver<T extends OrmEntity> extends SQLQueryResol
             if (!changes.$inc.hasOwnProperty(i)) continue;
             fieldsSet[i] = 1;
             aggregateFields[i] = { converted: getSerializeFunction(resolvePath(i, this.classSchema.type), this.platform.serializer.serializeRegistry) };
-            select.push(`(${this.platform.quoteIdentifier(i)} + ${this.platform.quoteValue(changes.$inc[i])}) as ${this.platform.quoteIdentifier(i)}`);
+            const sqlTypeCast = getDeepTypeCaster(entity, i);
+            select.push(`(${sqlTypeCast('(' + this.platform.getColumnAccessor('', i) + ')')} + ${this.platform.quoteValue(changes.$inc[i])}) as ${this.platform.quoteIdentifier(asAliasName(i))}`);
         }
 
         for (const i in fieldsSet) {
-            set.push(`${this.platform.quoteIdentifier(i)} = _b.${this.platform.quoteIdentifier(i)}`);
+            if (i.includes('.')) {
+                let [firstPart, secondPart] = splitDotPath(i);
+                const path = '{' + secondPart.replace(/\./g, ',').replace(/[\]\[]/g, '') + '}';
+                set.push(`${this.platform.quoteIdentifier(firstPart)} = jsonb_set(${this.platform.quoteIdentifier(firstPart)}, '${path}', to_jsonb(_b.${this.platform.quoteIdentifier(asAliasName(i))}))`);
+            } else {
+                const property = entity.fieldMap[i];
+                const ref = '_b.' + this.platform.quoteIdentifier(asAliasName(i));
+                set.push(`${this.platform.quoteIdentifier(i)} = ${property.sqlTypeCast(ref)}`);
+            }
         }
         let bPrimaryKey = primaryKey.name;
         //we need a different name because primaryKeys could be updated as well
@@ -508,22 +519,21 @@ export class PostgresSQLQueryResolver<T extends OrmEntity> extends SQLQueryResol
 
         if (!empty(aggregateFields)) {
             for (const i in aggregateFields) {
-                returningSelect.push(tableName + '.' + this.platform.quoteIdentifier(i));
+                returningSelect.push(this.platform.getColumnAccessor(tableName, i));
             }
         }
 
-        const sqlBuilder = new SqlBuilder(this.platform, selectParams);
+        const sqlBuilder = new SqlBuilder(this.adapter, selectParams);
         const selectSQL = sqlBuilder.select(this.classSchema, model, { select });
 
         const sql = `
             WITH _b AS (${selectSQL.sql})
             UPDATE
                 ${tableName}
-            SET
-                ${set.join(', ')}
+            SET ${set.join(', ')}
             FROM _b
             WHERE ${tableName}.${this.platform.quoteIdentifier(primaryKey.name)} = _b.${this.platform.quoteIdentifier(bPrimaryKey)}
-            RETURNING ${returningSelect.join(', ')}
+                RETURNING ${returningSelect.join(', ')}
         `;
 
         const connection = await this.connectionPool.getConnection(this.session.logger, this.session.assignedTransaction, this.session.stopwatch);
@@ -541,30 +551,40 @@ export class PostgresSQLQueryResolver<T extends OrmEntity> extends SQLQueryResol
                     patchResult.returning[i].push(aggregateFields[i].converted(returning[i]));
                 }
             }
+        } catch (error: any) {
+            error = new DatabasePatchError(this.classSchema, model, changes, `Could not patch ${this.classSchema.getClassName()} in database`, { cause: error });
+            throw this.handleSpecificError(error);
         } finally {
             connection.release();
         }
     }
 }
 
-export class PostgresSQLDatabaseQuery<T> extends SQLDatabaseQuery<T> {
+export class PostgresSQLDatabaseQuery<T extends OrmEntity> extends SQLDatabaseQuery<T> {
 }
 
 export class PostgresSQLDatabaseQueryFactory extends SQLDatabaseQueryFactory {
     createQuery<T extends OrmEntity>(type?: ReceiveType<T> | ClassType<T> | AbstractClassType<T> | ReflectionClass<T>): PostgresSQLDatabaseQuery<T> {
         return new PostgresSQLDatabaseQuery<T>(ReflectionClass.from(type), this.databaseSession,
-            new PostgresSQLQueryResolver<T>(this.connectionPool, this.platform, ReflectionClass.from(type), this.databaseSession)
+            new PostgresSQLQueryResolver<T>(this.connectionPool, this.platform, ReflectionClass.from(type), this.databaseSession.adapter, this.databaseSession),
         );
     }
 }
 
 export class PostgresDatabaseAdapter extends SQLDatabaseAdapter {
-    protected pool = new pg.Pool(this.options);
-    public connectionPool = new PostgresConnectionPool(this.pool);
+    protected options: PoolConfig;
+    protected pool: pg.Pool;
+    public connectionPool : PostgresConnectionPool;
     public platform = new PostgresPlatform();
+    closed = false;
 
-    constructor(protected options: PoolConfig) {
+    constructor(options: PoolConfig | string, additional: Partial<PoolConfig> = {}) {
         super();
+        const defaults: PoolConfig = {};
+        options = 'string' === typeof options ? parseConnectionString(options) : options;
+        this.options = Object.assign(defaults, options, additional);
+        this.pool = new pg.Pool(this.options);
+        this.connectionPool = new PostgresConnectionPool(this.pool);
 
         pg.types.setTypeParser(1700, parseFloat);
         pg.types.setTypeParser(20, parseInt);
@@ -592,6 +612,8 @@ export class PostgresDatabaseAdapter extends SQLDatabaseAdapter {
     }
 
     disconnect(force?: boolean): void {
+        if (this.closed) return;
+        this.closed = true;
         this.pool.end().catch(console.error);
     }
 }

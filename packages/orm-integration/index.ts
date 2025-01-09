@@ -1,69 +1,76 @@
-import { bookstoreTests } from './src/bookstore';
+import { bookstoreTests } from './src/bookstore.js';
 import { test } from '@jest/globals';
-import { variousTests } from './src/various';
-import { companyTests } from './src/company';
-import { usersTests } from './src/users';
-import { activeRecordTests } from './src/active-record';
-import { softDeleteTests } from './src/soft-delete';
-import { aggregateTest } from './src/aggregate';
-import { DatabaseFactory } from './src/test';
+import { variousTests } from './src/various.js';
+import { companyTests } from './src/company.js';
+import { usersTests } from './src/users.js';
+import { activeRecordTests } from './src/active-record.js';
+import { softDeletePluginTests } from './src/soft-delete-plugin.js';
+import { aggregateTest } from './src/aggregate.js';
+import { DatabaseFactory, executeTest } from './src/test.js';
+import { logPluginTests } from './src/log-plugin.js';
 
-export * from './src/bookstore';
-export * from './src/active-record';
-export * from './src/soft-delete';
-export * from './src/aggregate';
-export * from './src/users';
+export * from './src/bookstore.js';
+export * from './src/active-record.js';
+export * from './src/soft-delete-plugin.js';
+export * from './src/aggregate.js';
+export * from './src/users.js';
 
-export * from './src/various';
-export * from './src/test';
-export * from './src/active-record/book-tag';
-export * from './src/active-record/book';
-export * from './src/active-record/tag';
-export * from './src/bookstore/group';
-export * from './src/bookstore/user';
-export * from './src/bookstore/user-credentials';
-export * from './src/company';
+export * from './src/various.js';
+export * from './src/test.js';
+export * from './src/active-record/book-tag.js';
+export * from './src/active-record/book.js';
+export * from './src/active-record/tag.js';
+export * from './src/bookstore/group.js';
+export * from './src/bookstore/user.js';
+export * from './src/bookstore/user-credentials.js';
+export * from './src/company.js';
 
 export function runIntegrationTests(databaseFactory: DatabaseFactory) {
     for (const i in bookstoreTests) {
         test('bookstore:' + i, async () => {
-            await bookstoreTests[i](databaseFactory);
+            await executeTest(bookstoreTests[i], databaseFactory);
         });
     }
 
     for (const i in variousTests) {
         test('various:' + i, async () => {
-            await variousTests[i](databaseFactory);
+            await executeTest(variousTests[i], databaseFactory);
         });
     }
 
     for (const i in companyTests) {
         test('company:' + i, async () => {
-            await companyTests[i](databaseFactory);
+            await executeTest(companyTests[i], databaseFactory);
         });
     }
 
     for (const i in usersTests) {
         test('users:' + i, async () => {
-            await usersTests[i](databaseFactory);
+            await executeTest(usersTests[i], databaseFactory);
         });
     }
 
     for (const i in activeRecordTests) {
         test('activeRecord:' + i, async () => {
-            await activeRecordTests[i](databaseFactory);
+            await executeTest(activeRecordTests[i], databaseFactory);
         });
     }
 
-    for (const i in softDeleteTests) {
+    for (const i in softDeletePluginTests) {
         test('softDelete:' + i, async () => {
-            await softDeleteTests[i](databaseFactory);
+            await executeTest(softDeletePluginTests[i], databaseFactory);
+        });
+    }
+
+    for (const i in logPluginTests) {
+        test('log:' + i, async () => {
+            await executeTest(logPluginTests[i], databaseFactory);
         });
     }
 
     for (const i in aggregateTest) {
         test('aggregate:' + i, async () => {
-            await aggregateTest[i](databaseFactory);
+            await executeTest(aggregateTest[i], databaseFactory);
         });
     }
 }

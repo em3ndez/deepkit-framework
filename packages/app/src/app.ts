@@ -8,18 +8,15 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { ClassType, ExtractClassType, getCurrentFileName, isFunction, isObject, setPathValue } from '@deepkit/core';
-import { ConfigLoader, ServiceContainer } from './service-container';
-import { InjectorContext, ResolveToken } from '@deepkit/injector';
-import { AppModule, RootModuleDefinition } from './module';
-import { Command, Config, Options } from '@oclif/config';
-import { basename, dirname, relative } from 'path';
-import { Main } from '@oclif/command';
-import { ExitError } from '@oclif/errors';
-import { buildOclifCommand } from './command';
-import { EnvConfiguration } from './configuration';
-import { ReflectionClass, ReflectionKind } from '@deepkit/type';
-import { EventDispatcher, EventListener, EventListenerCallback, EventOfEventToken, EventToken } from '@deepkit/event';
+import { ClassType, ExtractClassType, isFunction, isObject, pathBasename, setPathValue } from '@deepkit/core';
+import { ConfigLoader, ServiceContainer } from './service-container.js';
+import { ConfigureProviderOptions, InjectorContext, ResolveToken, Token } from '@deepkit/injector';
+import { AppModule, RootModuleDefinition } from './module.js';
+import { EnvConfiguration } from './configuration.js';
+import { DataEventToken, EventDispatcher, EventListener, EventListenerCallback, EventOfEventToken, EventToken } from '@deepkit/event';
+import { ReceiveType, ReflectionClass, ReflectionKind } from '@deepkit/type';
+import { Logger } from '@deepkit/logger';
+import { executeCommand, getArgsFromEnvironment, getBinFromEnvironment } from './command.js';
 
 export function setPartialConfig(target: { [name: string]: any }, partial: { [name: string]: any }, incomingPath: string = '') {
     for (const i in partial) {
@@ -62,7 +59,7 @@ function parseEnv(
     incomingDotPath: string,
     incomingEnvPath: string,
     namingStrategy: EnvNamingStrategy,
-    envContainer: { [name: string]: any }
+    envContainer: { [name: string]: any },
 ) {
     for (const property of schema.getProperties()) {
         const name = convertNameStrategy(namingStrategy, property.name);
@@ -75,7 +72,7 @@ function parseEnv(
                 (incomingDotPath ? incomingDotPath + '.' : '') + property.name,
                 (incomingEnvPath ? incomingEnvPath + '_' : '') + name,
                 namingStrategy,
-                envContainer
+                envContainer,
             );
         } else {
             const dotPath = (incomingDotPath ? incomingDotPath + '.' : '') + property.name;
@@ -116,7 +113,7 @@ interface EnvConfigOptions {
 const defaultEnvConfigOptions: Required<EnvConfigOptions> = {
     prefix: 'APP_',
     envFilePath: ['.env'],
-    namingStrategy: 'upper'
+    namingStrategy: 'upper',
 };
 
 class EnvConfigLoader {
@@ -127,7 +124,7 @@ class EnvConfigLoader {
     constructor(options?: EnvConfigOptions) {
         const normalizedOptions = {
             ...defaultEnvConfigOptions,
-            ...options
+            ...options,
         };
 
         const { prefix, envFilePath, namingStrategy } = normalizedOptions;
@@ -152,6 +149,53 @@ class EnvConfigLoader {
 export class RootAppModule<T extends RootModuleDefinition> extends AppModule<T> {
 }
 
+export interface AppEvent {
+    /**
+     * The command that is about to be executed.
+     */
+    command: string;
+
+    parameters: { [name: string]: any };
+
+    /**
+     * Scoped 'cli' injector context.
+     */
+    injector: InjectorContext;
+}
+
+export interface AppExecutedEvent extends AppEvent {
+    exitCode: number;
+}
+
+
+export interface AppErrorEvent extends AppEvent {
+    error: Error;
+}
+
+/**
+ * When a CLI command is about to be executed, this event is emitted.
+ *
+ * This is different to @deepkit/framework's onBootstrap event, which is only executed
+ * when the server:start is execute. This event is executed for every CLI command (including server:start).
+ */
+export const onAppExecute = new DataEventToken<AppEvent>('app.execute');
+
+/**
+ * When a CLI command is successfully executed, this event is emitted.
+ */
+export const onAppExecuted = new DataEventToken<AppExecutedEvent>('app.executed');
+
+/**
+ * When a CLI command failed to execute, this event is emitted.
+ */
+export const onAppError = new DataEventToken<AppErrorEvent>('app.error');
+
+/**
+ * When the application is about to shut down, this event is emitted.
+ * This is always executed, even when an error occurred. So it's a good place to clean up.
+ */
+export const onAppShutdown = new DataEventToken<AppEvent>('app.shutdown');
+
 /**
  * This is the smallest available application abstraction in Deepkit.
  *
@@ -171,7 +215,7 @@ export class App<T extends RootModuleDefinition> {
     constructor(
         appModuleOptions: T,
         serviceContainer?: ServiceContainer,
-        appModule?: AppModule<any>
+        appModule?: AppModule<any>,
     ) {
         this.appModule = appModule || new RootAppModule(appModuleOptions) as any;
         this.serviceContainer = serviceContainer || new ServiceContainer(this.appModule);
@@ -182,10 +226,31 @@ export class App<T extends RootModuleDefinition> {
     }
 
     /**
-     * Allows to change the module after the configuration has been loaded, right before the application bootstraps.
+     * Allows to change the module after the configuration has been loaded, right before the service container is built.
+     *
+     * This enables you to change the module or its imports depending on the configuration the last time before their services are built.
+     *
+     * At this point no services can be requested as the service container was not built.
      */
     setup(...args: Parameters<this['appModule']['setup']>): this {
-        this.serviceContainer.appModule = (this.serviceContainer.appModule.setup as any)(...args as any[]);
+        this.appModule = (this.appModule.setup as any)(...args as any[]);
+        return this;
+    }
+
+    /**
+     * Allows to call services before the application bootstraps.
+     *
+     * This enables you to configure modules and request their services.
+     */
+    use(setup: (...args: any[]) => void): this {
+        this.appModule.use(setup);
+        return this;
+    }
+
+    command(name: string | ((...args: any[]) => any), callback?: (...args: any[]) => any): this {
+        callback = isFunction(name) ? name : callback!;
+        name = isFunction(name) ? '' : name;
+        this.appModule.addCommand(name, callback);
         return this;
     }
 
@@ -205,7 +270,7 @@ export class App<T extends RootModuleDefinition> {
         return this;
     }
 
-    public async dispatch<T extends EventToken<any>>(eventToken: T, event: EventOfEventToken<T>, injector?: InjectorContext): Promise<void> {
+    public async dispatch<T extends EventToken<any>>(eventToken: T, event?: EventOfEventToken<T>, injector?: InjectorContext): Promise<void> {
         return await this.get(EventDispatcher).dispatch(eventToken, event, injector);
     }
 
@@ -255,17 +320,17 @@ export class App<T extends RootModuleDefinition> {
                 } catch (error) {
                     throw new Error(`Invalid JSON in env variable ${variableName}. Parse error: ${error}`);
                 }
-            }
+            },
         });
         return this;
     }
 
-    async run(argv?: any[]) {
-        const exitCode = await this.execute(argv ?? process.argv.slice(2), argv ? [] : process.argv.slice(0, 2));
+    async run(argv?: any[], bin?: string[]) {
+        const exitCode = await this.execute(argv, bin);
         if (exitCode > 0) process.exit(exitCode);
     }
 
-    get<T>(token: T, moduleOrClass?: AppModule<any> | ClassType<AppModule<any>>): ResolveToken<T> {
+    get<T>(token?: ReceiveType<T> | Token<T>, moduleOrClass?: AppModule<any> | ClassType<AppModule<any>>): ResolveToken<T> {
         return this.serviceContainer.getInjector(moduleOrClass || this.appModule).get(token) as ResolveToken<T>;
     }
 
@@ -273,81 +338,39 @@ export class App<T extends RootModuleDefinition> {
         return this.serviceContainer.getInjectorContext();
     }
 
-    public async execute(argv: string[], binPaths: string[] = []): Promise<number> {
-        let result: any;
+    /**
+     * @see InjectorModule.configureProvider
+     */
+    configureProvider<T>(configure: (instance: T, ...args: any[]) => any, options: Partial<ConfigureProviderOptions> = {}, type?: ReceiveType<T>): this {
+        this.appModule.configureProvider<T>(configure, options, type);
+        return this;
+    }
 
-        class MyConfig extends Config {
-            commandsMap: { [name: string]: Command.Plugin } = {};
+    public async execute(argv?: string[], bin?: string[] | string): Promise<number> {
+        const eventDispatcher = this.get(EventDispatcher);
+        const logger = this.get(Logger);
 
-            constructor(options: Options) {
-                super(options);
-                this.root = options.root;
-                this.userAgent = 'Node';
-                this.name = 'app';
-
-                if (binPaths.length === 2) {
-                    const bin = basename(binPaths[0]);
-                    if (bin === 'ts-node-script') {
-                        this.bin = `${relative(process.cwd(), binPaths[1]) || '.'}`;
-                    } else {
-                        this.bin = `${bin} ${relative(process.cwd(), binPaths[1]) || '.'}`;
-                    }
-                } else {
-                    this.bin = `node`;
-                }
-
-                this.version = '0.0.1';
-                this.pjson = {
-                    name: this.name,
-                    version: this.version,
-                    oclif: {
-                        update: {
-                            s3: {} as any,
-                            node: {}
-                        }
-                    }
-                };
-            }
-
-            runHook<T>(event: string, opts: T): Promise<void> {
-                if (event === 'postrun') {
-                    result = (opts as any).result;
-                }
-                return super.runHook(event, opts);
-            }
-
-            findCommand(id: string, opts?: {
-                must: boolean;
-            }) {
-                return this.commandsMap[id]!;
-            }
-
-            get commandIDs() {
-                return Object.keys(this.commandsMap);
-            }
-
-            get commands() {
-                return Object.values(this.commandsMap);
-            }
+        if ('undefined' !== typeof process) {
+            process.on('unhandledRejection', error => {
+                // Will print "unhandledRejection err is not defined"
+                logger.error('unhandledRejection', error);
+            });
         }
 
-        try {
-            const config = new MyConfig({ root: dirname(getCurrentFileName()) });
-            const scopedInjectorContext = this.getInjectorContext().createChildScope('cli');
+        const scopedInjectorContext = this.getInjectorContext().createChildScope('cli');
 
-            for (const [name, info] of this.serviceContainer.cliControllerRegistry.controllers.entries()) {
-                config.commandsMap[name] = buildOclifCommand(name, scopedInjectorContext, info.controller, info.module);
-            }
-
-            await Main.run(argv, config);
-        } catch (e) {
-            if (e instanceof ExitError) {
-                return e.oclif.exit;
-            } else {
-                console.log(e);
-            }
-            return 12;
+        if ('string' !== typeof bin) {
+            bin = bin || getBinFromEnvironment();
+            let binary = pathBasename(bin[0]);
+            let file = pathBasename(bin[1]);
+            bin = `${binary} ${file}`;
         }
-        return result;
+
+        return await executeCommand(
+            bin, argv || getArgsFromEnvironment(),
+            eventDispatcher, logger,
+            scopedInjectorContext,
+            this.serviceContainer.cliControllerRegistry.controllers,
+        );
     }
 }

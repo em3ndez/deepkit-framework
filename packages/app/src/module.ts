@@ -8,11 +8,12 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { InjectorModule, ProviderWithScope, Token } from '@deepkit/injector';
+import { InjectorModule, ProviderWithScope, Token, NormalizedProvider } from '@deepkit/injector';
 import { AbstractClassType, ClassType, CustomError, ExtractClassType, isClass } from '@deepkit/core';
-import { EventListener } from '@deepkit/event';
+import { EventListener, EventToken } from '@deepkit/event';
 import { WorkflowDefinition } from '@deepkit/workflow';
-import { getPartialSerializeFunction, reflect, serializer, Type, TypeClass } from '@deepkit/type';
+import { getPartialSerializeFunction, reflect, ReflectionFunction, ReflectionMethod, serializer, Type, TypeClass } from '@deepkit/type';
+import { ControllerConfig } from './service-container.js';
 
 export type DefaultObject<T> = T extends undefined ? {} : T;
 
@@ -22,13 +23,32 @@ export interface MiddlewareConfig {
 
 export type MiddlewareFactory = () => MiddlewareConfig;
 
-export type ExportType = AbstractClassType | string | AppModule<any> | Type;
+export type ExportType = AbstractClassType | string | AppModule<any> | Type | NormalizedProvider;
+
+/**
+ * @reflection never
+ */
+export interface AddedListener {
+    eventToken: EventToken;
+    reflection: ReflectionMethod | ReflectionFunction;
+    module?: InjectorModule;
+    classType?: ClassType;
+    methodName?: string;
+    order: number;
+}
+
+export function stringifyListener(listener: AddedListener): string {
+    if (listener.classType) {
+        return listener.classType.name + '.' + listener.methodName;
+    }
+    return listener.reflection.name || 'anonymous function';
+}
 
 export interface ModuleDefinition {
     /**
      * Providers.
      */
-    providers?: ProviderWithScope[];
+    providers?: (ProviderWithScope | ProviderWithScope[])[];
 
     /**
      * Export providers (its token `provide` value) or modules you imported first.
@@ -121,16 +141,36 @@ export interface CreateModuleDefinition extends ModuleDefinition {
      *     imports = [new AnotherModule];
      * }
      * ```
+     *
+     * or
+     *
+     * ```typescript
+     * class MyModule extends createModule({}) {
+     *     process() {
+     *         this.addModuleImport(new AnotherModule);
+     *     }
+     * }
+     * ```
+     *
+     * or switch to functional modules
+     *
+     * ```typescript
+     * function myModule(module: AppModule) {
+     *     module.addModuleImport(new AnotherModule);
+     * }
+     * ```
      */
     imports?: undefined;
 }
 
+export type FunctionalModule = (module: AppModule<any>) => void;
+export type FunctionalModuleFactory = (...args: any[]) => (module: AppModule<any>) => void;
 
 export interface RootModuleDefinition extends ModuleDefinition {
     /**
      * Import another module.
      */
-    imports?: AppModule<any>[];
+    imports?: (AppModule<any> | FunctionalModule)[];
 }
 
 export class ConfigurationInvalidError extends CustomError {
@@ -138,6 +178,9 @@ export class ConfigurationInvalidError extends CustomError {
 
 let moduleId = 0;
 
+/**
+ * @reflection never
+ */
 type PartialDeep<T> = T extends string | number | bigint | boolean | null | undefined | symbol | Date
     ? T | undefined
     // Arrays, Sets and Maps and their readonly counterparts have their items made
@@ -192,24 +235,46 @@ export function createModule<T extends CreateModuleDefinition>(options: T, name:
 
 export type ListenerType = EventListener<any> | ClassType;
 
-export class AppModule<T extends RootModuleDefinition, C extends ExtractClassType<T['config']> = any> extends InjectorModule<C, AppModule<any>> {
+/**
+ * The AppModule is the base class for all modules.
+ *
+ * You can use `createModule` to create a new module class or extend from `AppModule` manually.
+ *
+ * @example
+ * ```typescript
+ *
+ * class MyModule extends AppModule {
+ *   providers = [MyService];
+ *   exports = [MyService];
+ *
+ *   constructor(config: MyConfig) {
+ *      super();
+ *      this.setConfigDefinition(MyConfig);
+ *      this.configure(config);
+ *      this.name = 'myModule';
+ *   }
+ * }
+ */
+export class AppModule<T extends RootModuleDefinition = {}, C extends ExtractClassType<T['config']> = any> extends InjectorModule<C, AppModule<any>> {
     public setupConfigs: ((module: AppModule<any>, config: any) => void)[] = [];
 
     public imports: AppModule<any>[] = [];
     public controllers: ClassType[] = [];
+    public commands: { name?: string, callback: Function }[] = [];
     public workflows: WorkflowDefinition<any>[] = [];
     public listeners: ListenerType[] = [];
     public middlewares: MiddlewareFactory[] = [];
+    public uses: ((...args: any[]) => void)[] = [];
 
     constructor(
-        public options: T,
+        public options: T = {} as T,
         public name: string = '',
         public setups: ((module: AppModule<any>, config: any) => void)[] = [],
         public id: number = moduleId++,
     ) {
         super();
-        if (this.options.imports) for (const m of this.options.imports) this.addImport(m);
-        if (this.options.providers) this.providers.push(...this.options.providers);
+        if (this.options.imports) for (const m of this.options.imports) this.addModuleImport(m);
+        if (this.options.providers) this.providers.push(...this.options.providers.flat());
         if (this.options.exports) this.exports.push(...this.options.exports);
         if (this.options.controllers) this.controllers.push(...this.options.controllers);
         if (this.options.workflows) this.workflows.push(...this.options.workflows);
@@ -230,6 +295,16 @@ export class AppModule<T extends RootModuleDefinition, C extends ExtractClassTyp
         }
     }
 
+    protected addModuleImport(m: AppModule<any> | FunctionalModule) {
+        if (m instanceof AppModule) {
+            this.addImport(m);
+        } else {
+            const module = new AppModule({});
+            m(module);
+            this.addImport(module);
+        }
+    }
+
     /**
      * When all configuration loaders have been loaded, this method is called.
      * It allows to further manipulate the module state depending on the final config.
@@ -239,16 +314,23 @@ export class AppModule<T extends RootModuleDefinition, C extends ExtractClassTyp
     }
 
     /**
-     * A hook point to the service container. Allows to react on a registered provider in some module.
+     * A hook that allows to react on a registered provider in some module.
      */
     processProvider(module: AppModule<any>, token: Token, provider: ProviderWithScope) {
 
     }
 
     /**
-     * A hook point to the service container. Allows to react on a registered controller in some module.
+     * A hook that allows to react on a registered controller in some module.
      */
-    processController(module: AppModule<any>, controller: ClassType) {
+    processController(module: AppModule<any>, config: ControllerConfig) {
+
+    }
+
+    /**
+     * A hook that allows to react on a registered event listeners in some module.
+     */
+    processListener(module: AppModule<any>, listener: AddedListener) {
 
     }
 
@@ -287,6 +369,16 @@ export class AppModule<T extends RootModuleDefinition, C extends ExtractClassTyp
         return this.controllers;
     }
 
+    getCommands(): { name?: string, callback: Function }[] {
+        return this.commands;
+    }
+
+    addCommand(name: string | undefined, callback: (...args: []) => any): this {
+        this.assertInjectorNotBuilt();
+        this.commands.push({ name, callback });
+        return this;
+    }
+
     addController(...controller: ClassType[]): this {
         this.assertInjectorNotBuilt();
         this.controllers.push(...controller);
@@ -320,10 +412,24 @@ export class AppModule<T extends RootModuleDefinition, C extends ExtractClassTyp
     }
 
     /**
-     * Allows to change the module after the configuration has been loaded, right before the application bootstraps.
+     * Allows to change the module after the configuration has been loaded, right before the service container is built.
+     *
+     * This enables you to change the module or its imports depending on the configuration the last time before their services are built.
+     *
+     * At this point no services can be requested as the service container was not built.
      */
     setup(callback: (module: AppModule<T>, config: C) => void): this {
         this.setups.push(callback);
+        return this;
+    }
+
+    /**
+     * Allows to call services before the application bootstraps.
+     *
+     * This enables you to configure modules and request their services.
+     */
+    use(callback: (...args: any[]) => void): this {
+        this.uses.push(callback);
         return this;
     }
 

@@ -8,7 +8,7 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { BaseResponse, Command } from './command';
+import { BaseResponse, Command } from './command.js';
 import { ReflectionClass } from '@deepkit/type';
 
 interface RequestSchema {
@@ -16,7 +16,7 @@ interface RequestSchema {
     $db: string;
 }
 
-export class CreateCollectionCommand<T extends ReflectionClass<any>> extends Command {
+export class CreateCollectionCommand<T extends ReflectionClass<any>> extends Command<BaseResponse> {
     constructor(
         public schema: T,
     ) {
@@ -25,7 +25,7 @@ export class CreateCollectionCommand<T extends ReflectionClass<any>> extends Com
 
     async execute(config, host, transaction): Promise<BaseResponse> {
         const cmd: any = {
-            create: this.schema.collectionName || this.schema.name || 'unknown',
+            create: this.schema.getCollectionName() || 'unknown',
             $db: this.schema.databaseSchemaName || config.defaultDb || 'admin',
         };
 
@@ -35,6 +35,6 @@ export class CreateCollectionCommand<T extends ReflectionClass<any>> extends Com
     }
 
     needsWritableHost(): boolean {
-        return false;
+        return true;
     }
 }

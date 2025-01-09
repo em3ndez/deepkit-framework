@@ -1,31 +1,9 @@
-import { BaseBroker } from '../broker/broker';
-import { eventDispatcher } from '@deepkit/event';
-import { onServerMainBootstrap, onServerMainShutdown } from '../application-server';
-import { RpcNetTcpClientAdapter, RpcNetTcpServer } from '@deepkit/rpc-tcp';
-import { BrokerKernel } from '@deepkit/broker';
-import { FrameworkConfig } from '../module.config';
+import { BrokerBus, BrokerDeepkitAdapter } from '@deepkit/broker';
+import { FrameworkConfig } from '../module.config.js';
+import { getBrokerServers } from '../broker.js';
 
-export class DebugBroker extends BaseBroker {
-    constructor(brokerHost: FrameworkConfig['debugBrokerHost']) {
-        super(new RpcNetTcpClientAdapter(brokerHost));
-    }
-}
-
-export class DebugBrokerListener {
-    protected kernel: BrokerKernel = new BrokerKernel;
-    protected server = new RpcNetTcpServer(this.kernel, this.brokerHost);
-
-    constructor(protected brokerHost: FrameworkConfig['debugBrokerHost'], protected broker: DebugBroker) {
-    }
-
-    @eventDispatcher.listen(onServerMainBootstrap)
-    async onMainBootstrap() {
-        await this.server.start();
-    }
-
-    @eventDispatcher.listen(onServerMainShutdown)
-    async onMainShutdown() {
-        await this.server.close();
-        await this.broker.disconnect();
+export class DebugBrokerBus extends BrokerBus {
+    constructor(config: FrameworkConfig) {
+        super(new BrokerDeepkitAdapter({ servers: getBrokerServers(config.broker) }));
     }
 }

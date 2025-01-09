@@ -8,15 +8,14 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { Command } from './command';
-import { ReflectionClass } from '@deepkit/type';
+import { Command } from './command.js';
 
 interface DropDatabase {
     dropDatabase: 1;
     $db: string;
 }
 
-export class DropDatabaseCommand<T extends ReflectionClass<any>> extends Command {
+export class DropDatabaseCommand<T> extends Command<void> {
     constructor(protected dbName: any) {
         super();
     }

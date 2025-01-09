@@ -1,22 +1,31 @@
+/* To learn more about this file see: https://angular.io/config/tsconfig. */
 {
   "compileOnSave": false,
   "compilerOptions": {
+    "baseUrl": "./",
     "outDir": "./dist/out-tsc",
     "forceConsistentCasingInFileNames": true,
-    "allowSyntheticDefaultImports": true,
     "strict": true,
     "noFallthroughCasesInSwitch": true,
+    "allowSyntheticDefaultImports": true,
     "sourceMap": true,
     "declaration": false,
     "downlevelIteration": true,
     "experimentalDecorators": true,
     "moduleResolution": "node",
     "importHelpers": true,
-    "target": "es2018",
-    "module": "es2020",
+    "target": "ES2022",
+    "module": "ES2022",
+    "useDefineForClassFields": false,
     "lib": [
-      "es2018",
+      "ES2022",
       "dom"
+    ],
+    "types": [
+      "dagre",
+      "file-saver",
+      "jasmine",
+      "node"
     ]
   },
   "angularCompilerOptions": {
@@ -34,9 +43,6 @@
     },
     {
       "path": "../core-rxjs/tsconfig.json"
-    },
-    {
-      "path": "../crypto/tsconfig.json"
     },
     {
       "path": "../injector/tsconfig.json"

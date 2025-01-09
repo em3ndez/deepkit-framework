@@ -1,12 +1,13 @@
 {
   "name": "@deepkit/rpc",
-  "version": "1.0.1-alpha.71",
+  "version": "1.0.1-alpha.155",
   "type": "commonjs",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
   "types": "./dist/cjs/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/cjs/index.d.ts",
       "require": "./dist/cjs/index.js",
       "default": "./dist/esm/index.js"
     }
@@ -24,7 +25,6 @@
     "@deepkit/bson": "^1.0.1-alpha.13",
     "@deepkit/core": "^1.0.1-alpha.13",
     "@deepkit/core-rxjs": "^1.0.1-alpha.13",
-    "@deepkit/crypto": "^1.0.1-alpha.13",
     "@deepkit/injector": "^1.0.1-alpha.13",
     "@deepkit/logger": "^1.0.1-alpha.13",
     "@deepkit/type": "^1.0.1-alpha.13",
@@ -34,29 +34,32 @@
     "dot-prop": "^5.1.1"
   },
   "devDependencies": {
-    "@deepkit/bson": "^1.0.1-alpha.71",
-    "@deepkit/core": "^1.0.1-alpha.65",
-    "@deepkit/core-rxjs": "^1.0.1-alpha.65",
-    "@deepkit/crypto": "^1.0.1-alpha.65",
-    "@deepkit/injector": "^1.0.1-alpha.71",
-    "@deepkit/logger": "^1.0.1-alpha.65",
-    "@deepkit/type": "^1.0.1-alpha.71",
+    "@deepkit/bson": "^1.0.1-alpha.155",
+    "@deepkit/core": "^1.0.1-alpha.154",
+    "@deepkit/core-rxjs": "^1.0.1-alpha.154",
+    "@deepkit/injector": "^1.0.1-alpha.155",
+    "@deepkit/logger": "^1.0.1-alpha.155",
+    "@deepkit/type": "^1.0.1-alpha.155",
     "@types/dot-prop": "^5.0.1",
     "@types/fs-extra": "^9.0.1",
-    "@types/node": "14.14.28",
-    "rxjs": "~6.6.0"
+    "@types/node": "20.6.0",
+    "rxjs": "*"
   },
   "jest": {
+    "testEnvironment": "node",
     "transform": {
-      "^.+\\.(ts|tsx)$": "ts-jest"
+      "^.+\\.(ts|tsx)$": [
+        "ts-jest",
+        {
+          "tsconfig": "<rootDir>/tsconfig.spec.json"
+        }
+      ]
     },
     "testMatch": [
       "**/tests/**/*.spec.ts"
     ],
-    "globals": {
-      "ts-jest": {
-        "tsconfig": "<rootDir>/tsconfig.test.json"
-      }
+    "moduleNameMapper": {
+      "(.+)\\.js": "$1"
     }
   },
   "gitHead": "56081823b559bb68b77a8781957af5d9c2e019a7"

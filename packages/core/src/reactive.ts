@@ -8,6 +8,34 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
+declare var requestAnimationFrame: any;
+declare var cancelAnimationFrame: any;
+
+export const nextTick = typeof requestAnimationFrame !== 'undefined'
+    ? (cb: () => void) => requestAnimationFrame(cb) : (cb: () => void) => setTimeout(cb);
+
+export const clearTick = typeof requestAnimationFrame !== 'undefined'
+    ? (id: any) => cancelAnimationFrame(id) : (id: any) => clearTick(id);
+
+/**
+ * Wraps a function and calls it only `cps` times per frame.
+ *
+ * This is handy to throttle all kind of rapid calls, like mouse move events or other kind of events.
+ *
+ * @example
+ * ```typescript
+ * function expensiveFunction() {
+ *     //...
+ * }
+ *
+ * const throttled = throttleTime(expensiveFunction, 5); //5 calls per second max
+ *
+ * throttled();
+ * throttled();
+ * throttled();
+ * //throttled will here only be called once
+ * ```
+ */
 export function throttleTime(call: Function, cps = 5): (...args: any[]) => void {
     let last = Date.now();
     let dirty = false;
@@ -26,7 +54,7 @@ export function throttleTime(call: Function, cps = 5): (...args: any[]) => void 
         }
 
         if (dirty) {
-            requestAnimationFrame(tick);
+            nextTick(tick);
         }
     }
 

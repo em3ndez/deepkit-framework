@@ -8,18 +8,32 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { DatabaseAdapter, DatabaseAdapterQueryFactory, DatabaseEntityRegistry, DatabaseSession, OrmEntity } from '@deepkit/orm';
-import { AbstractClassType, ClassType } from '@deepkit/core';
-import { MongoDatabaseQuery } from './query';
-import { MongoPersistence } from './persistence';
-import { MongoClient } from './client/client';
-import { DeleteCommand } from './client/command/delete';
-import { MongoQueryResolver } from './query.resolver';
-import { MongoDatabaseTransaction } from './client/connection';
-import { CreateIndex, CreateIndexesCommand } from './client/command/createIndexes';
-import { DropIndexesCommand } from './client/command/dropIndexes';
-import { CreateCollectionCommand } from './client/command/createCollection';
-import { entity, ReceiveType, ReflectionClass } from '@deepkit/type';
+import {
+    DatabaseAdapter,
+    DatabaseAdapterQueryFactory,
+    DatabaseEntityRegistry,
+    DatabaseErrorEvent,
+    DatabaseSession,
+    FindQuery,
+    ItemNotFound,
+    MigrateOptions,
+    onDatabaseError,
+    OrmEntity,
+    RawFactory,
+} from '@deepkit/orm';
+import { AbstractClassType, ClassType, isArray } from '@deepkit/core';
+import { MongoDatabaseQuery } from './query.js';
+import { MongoPersistence } from './persistence.js';
+import { MongoClient } from './client/client.js';
+import { DeleteCommand } from './client/command/delete.js';
+import { MongoQueryResolver } from './query.resolver.js';
+import { MongoDatabaseTransaction } from './client/connection.js';
+import { CreateIndex, CreateIndexesCommand } from './client/command/createIndexes.js';
+import { DropIndexesCommand } from './client/command/dropIndexes.js';
+import { CreateCollectionCommand } from './client/command/createCollection.js';
+import { entity, ReceiveType, ReflectionClass, resolveReceiveType } from '@deepkit/type';
+import { Command } from './client/command/command.js';
+import { AggregateCommand } from './client/command/aggregate.js';
 
 export class MongoDatabaseQueryFactory extends DatabaseAdapterQueryFactory {
     constructor(
@@ -35,13 +49,74 @@ export class MongoDatabaseQueryFactory extends DatabaseAdapterQueryFactory {
     }
 }
 
+class MongoRawCommandQuery<T> implements FindQuery<T> {
+    constructor(
+        protected session: DatabaseSession<MongoDatabaseAdapter>,
+        protected client: MongoClient,
+        protected command: Command<any>,
+    ) {
+    }
+
+    async find(): Promise<T[]> {
+        try {
+            const res = await this.client.execute(this.command);
+            return res as any;
+        } catch (error: any) {
+            await this.session.eventDispatcher.dispatch(onDatabaseError, new DatabaseErrorEvent(error, this.session));
+            throw error;
+        }
+    }
+
+    async findOneOrUndefined(): Promise<T> {
+        try {
+            const res = await this.client.execute(this.command);
+            if (isArray(res)) return res[0];
+            return res;
+        } catch (error: any) {
+            await this.session.eventDispatcher.dispatch(onDatabaseError, new DatabaseErrorEvent(error, this.session));
+            throw error;
+        }
+    }
+
+    async findOne(): Promise<T> {
+        try {
+            const item = await this.findOneOrUndefined();
+            if (!item) throw new ItemNotFound('Could not find item');
+            return item;
+        } catch (error: any) {
+            await this.session.eventDispatcher.dispatch(onDatabaseError, new DatabaseErrorEvent(error, this.session));
+            throw error;
+        }
+    }
+}
+
+export class MongoRawFactory implements RawFactory<[Command<any>]> {
+    constructor(
+        protected session: DatabaseSession<MongoDatabaseAdapter>,
+        protected client: MongoClient,
+    ) {
+    }
+
+    create<Entity = any, ResultSchema = Entity>(
+        commandOrPipeline: Command<ResultSchema> | any[],
+        type?: ReceiveType<Entity>,
+        resultType?: ReceiveType<ResultSchema>,
+    ): MongoRawCommandQuery<ResultSchema> {
+        type = resolveReceiveType(type);
+        const resultSchema = resultType ? resolveReceiveType(resultType) : undefined;
+
+        const command = isArray(commandOrPipeline) ? new AggregateCommand(ReflectionClass.from(type), commandOrPipeline, resultSchema) : commandOrPipeline;
+        return new MongoRawCommandQuery<ResultSchema>(this.session, this.client, command as Command<any>);
+    }
+}
+
 export class MongoDatabaseAdapter extends DatabaseAdapter {
     public readonly client: MongoClient;
 
     protected ormSequences: ReflectionClass<any>;
 
     constructor(
-        connectionString: string
+        connectionString: string,
     ) {
         super();
         this.client = new MongoClient(connectionString);
@@ -53,6 +128,10 @@ export class MongoDatabaseAdapter extends DatabaseAdapter {
         }
 
         this.ormSequences = ReflectionClass.from(OrmSequence);
+    }
+
+    rawFactory(session: DatabaseSession<this>): MongoRawFactory {
+        return new MongoRawFactory(session, this.client);
     }
 
     getName(): string {
@@ -91,25 +170,26 @@ export class MongoDatabaseAdapter extends DatabaseAdapter {
         await this.client.execute(new DeleteCommand(this.ormSequences));
     }
 
-    async migrate(entityRegistry: DatabaseEntityRegistry) {
+    async migrate(options: MigrateOptions, entityRegistry: DatabaseEntityRegistry) {
+        await this.client.connect(); //manually connect to catch connection errors
         let withOrmSequences = true;
-        for (const schema of entityRegistry.entities) {
-            await this.migrateClassSchema(schema);
+        for (const schema of entityRegistry.forMigration()) {
+            await this.migrateClassSchema(options, schema);
             for (const property of schema.getProperties()) {
                 if (property.isAutoIncrement()) withOrmSequences = true;
             }
         }
 
         if (withOrmSequences) {
-            await this.migrateClassSchema(this.ormSequences);
+            await this.migrateClassSchema(options, this.ormSequences);
         }
     };
 
-    async migrateClassSchema(schema: ReflectionClass<any>) {
+    async migrateClassSchema(options: MigrateOptions, schema: ReflectionClass<any>) {
         try {
             await this.client.execute(new CreateCollectionCommand(schema));
         } catch (error) {
-            //its fine to fail
+            //it's fine to fail
         }
 
         for (const index of schema.indexes) {
@@ -124,11 +204,14 @@ export class MongoDatabaseAdapter extends DatabaseAdapter {
 
             const indexName = index.options.name || index.names.join('_');
             const createIndex: CreateIndex = {
-                name: index.options.name || index.names.join('_'),
+                name: indexName,
                 key: fields,
                 unique: !!index.options.unique,
                 sparse: !!index.options.sparse,
             };
+            if (index.options.expireAfterSeconds) {
+                createIndex.expireAfterSeconds = Number(index.options.expireAfterSeconds);
+            }
 
             try {
                 await this.client.execute(new CreateIndexesCommand(schema, [createIndex]));

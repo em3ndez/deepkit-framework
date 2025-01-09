@@ -14,12 +14,15 @@
     "baseUrl": ".",
     "outDir": "./dist/cjs",
     "declaration": true,
-    "composite": true
+    "composite": true,
+    "types": []
   },
   "include": [
     "src",
-    "tests",
     "index.ts"
+  ],
+  "exclude": [
+    "tests"
   ],
   "references": []
 }

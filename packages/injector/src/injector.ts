@@ -8,13 +8,11 @@ import {
     Tag,
     TagProvider,
     TagRegistry,
-    Token
+    Token,
 } from './provider.js';
-import { AbstractClassType, ClassType, CompilerContext, CustomError, getClassName, isArray, isClass, isFunction, isPrototypeOfBase } from '@deepkit/core';
-import { findModuleForConfig, getScope, InjectorModule, PreparedProvider } from './module.js';
+import { AbstractClassType, ClassType, CompilerContext, CustomError, getClassName, getPathValue, isArray, isClass, isFunction, isPrototypeOfBase } from '@deepkit/core';
+import { ConfigurationProviderRegistry, ConfigureProviderEntry, findModuleForConfig, getScope, InjectorModule, PreparedProvider } from './module.js';
 import {
-    hasTypeInformation,
-    isExtendable,
     isOptional,
     isType,
     isWithAnnotations,
@@ -26,7 +24,7 @@ import {
     ReflectionKind,
     resolveReceiveType,
     stringifyType,
-    Type
+    Type,
 } from '@deepkit/type';
 
 export class InjectorError extends CustomError {
@@ -42,24 +40,26 @@ export class ServiceNotFoundError extends InjectorError {
 export class DependenciesUnmetError extends InjectorError {
 }
 
-export class InjectorReference {
-    constructor(public readonly to: any, public module?: InjectorModule) {
-    }
-}
-
-export function injectorReference<T>(classTypeOrToken: T, module?: InjectorModule): any {
-    return new InjectorReference(classTypeOrToken, module);
-}
-
 export function tokenLabel(token: Token): string {
     if (token === null) return 'null';
     if (token === undefined) return 'undefined';
     if (token instanceof TagProvider) return 'Tag(' + getClassName(token.provider.provide) + ')';
+    if (typeof token === 'symbol') return token.toString();
     if (isClass(token)) return getClassName(token);
     if (isType(token)) return stringifyType(token).replace(/\n/gm, '');
     if (isFunction(token.toString)) return token.name;
 
     return token + '';
+}
+
+function functionParameterNotFound(ofName: string, name: string, position: number, token: any) {
+    const argsCheck: string[] = [];
+    for (let i = 0; i < position; i++) argsCheck.push('✓');
+    argsCheck.push('?');
+
+    throw new DependenciesUnmetError(
+        `Unknown function argument '${name}: ${tokenLabel(token)}' of ${ofName}(${argsCheck.join(', ')}). Make sure '${tokenLabel(token)}' is provided.`,
+    );
 }
 
 function constructorParameterNotFound(ofName: string, name: string, position: number, token: any) {
@@ -68,13 +68,13 @@ function constructorParameterNotFound(ofName: string, name: string, position: nu
     argsCheck.push('?');
 
     throw new DependenciesUnmetError(
-        `Unknown constructor argument '${name}: ${tokenLabel(token)}' of ${ofName}(${argsCheck.join(', ')}). Make sure '${tokenLabel(token)}' is provided.`
+        `Unknown constructor argument '${name}: ${tokenLabel(token)}' of ${ofName}(${argsCheck.join(', ')}). Make sure '${tokenLabel(token)}' is provided.`,
     );
 }
 
 function serviceNotfoundError(token: any, moduleName: string) {
     throw new ServiceNotFoundError(
-        `Service '${tokenLabel(token)}' in ${moduleName} not found. Make sure it is provided.`
+        `Service '${tokenLabel(token)}' in ${moduleName} not found. Make sure it is provided.`,
     );
 }
 
@@ -85,74 +85,41 @@ function factoryDependencyNotFound(ofName: string, name: string, position: numbe
 
     for (const reset of CircularDetectorResets) reset();
     throw new DependenciesUnmetError(
-        `Unknown factory dependency argument '${tokenLabel(token)}' of ${ofName}(${argsCheck.join(', ')}). Make sure '${tokenLabel(token)}' is provided.`
+        `Unknown factory dependency argument '${tokenLabel(token)}' of ${ofName}(${argsCheck.join(', ')}). Make sure '${tokenLabel(token)}' is provided.`,
     );
 }
 
 function propertyParameterNotFound(ofName: string, name: string, position: number, token: any) {
     for (const reset of CircularDetectorResets) reset();
     throw new DependenciesUnmetError(
-        `Unknown property parameter ${name} of ${ofName}. Make sure '${tokenLabel(token)}' is provided.`
+        `Unknown property parameter ${name} of ${ofName}. Make sure '${tokenLabel(token)}' is provided.`,
     );
 }
 
+function transientInjectionTargetUnavailable(ofName: string, name: string, position: number, token: any) {
+    throw new DependenciesUnmetError(
+        `${TransientInjectionTarget.name} is not available for ${name} of ${ofName}. ${TransientInjectionTarget.name} is only available when injecting into other providers`,
+    );
+}
 
-let CircularDetector: any[] = [];
-let CircularDetectorResets: (() => void)[] = [];
+type Destination = { token: Token; };
+
+function createTransientInjectionTarget(destination: Destination | undefined) {
+    if (!destination) {
+        return undefined;
+    }
+
+    return new TransientInjectionTarget(destination.token);
+}
+
+const CircularDetector: any[] = [];
+const CircularDetectorResets: (() => void)[] = [];
 
 function throwCircularDependency() {
     const path = CircularDetector.map(tokenLabel).join(' -> ');
     CircularDetector.length = 0;
     for (const reset of CircularDetectorResets) reset();
     throw new CircularDependencyError(`Circular dependency found ${path}`);
-}
-
-export type SetupProviderCalls = {
-        type: 'call', methodName: string | symbol | number, args: any[], order: number
-    }
-    | { type: 'property', property: string | symbol | number, value: any, order: number }
-    | { type: 'stop', order: number }
-    ;
-
-function matchType(left: Type, right: Type): boolean {
-    if (left.kind === ReflectionKind.class) {
-        if (right.kind === ReflectionKind.class) return left.classType === right.classType;
-    }
-
-    return isExtendable(left, right);
-}
-
-export class SetupProviderRegistry {
-    public calls: { type: Type, call: SetupProviderCalls }[] = [];
-
-    public add(type: Type, call: SetupProviderCalls) {
-        this.calls.push({ type, call });
-    }
-
-    mergeInto(registry: SetupProviderRegistry): void {
-        for (const { type, call } of this.calls) {
-            registry.add(type, call);
-        }
-    }
-
-    public get(token: Token): SetupProviderCalls[] {
-        const calls: SetupProviderCalls[] = [];
-        for (const call of this.calls) {
-            if (call.type === token) {
-                calls.push(call.call);
-            } else {
-                if (isClass(token)) {
-                    const type = hasTypeInformation(token) ? reflect(token) : undefined;
-                    if (type && matchType(type, call.type)) {
-                        calls.push(call.call);
-                    }
-                } else if (matchType(token, call.type)) {
-                    calls.push(call.call);
-                }
-            }
-        }
-        return calls;
-    }
 }
 
 interface Scope {
@@ -169,6 +136,28 @@ export function resolveToken(provider: ProviderWithScope): Token {
     return provider.provide;
 }
 
+export type ContainerToken = Exclude<Token, Type | TagProvider<any>>;
+
+/**
+ * Returns a value that can be compared with `===` to check if two tokens are actually equal even though
+ * they are the result of different type expressions.
+ *
+ * This is used in the big switch-case statement in the generated code to match DI tokens.
+ */
+export function getContainerToken(type: Token): ContainerToken {
+    if (isClass(type)) return type;
+    if (type instanceof TagProvider) return getContainerToken(type.provider);
+
+    if (isType(type)) {
+        if (type.id) return type.id;
+        if (type.kind === ReflectionKind.literal) return type.literal;
+        if (type.kind === ReflectionKind.class) return type.classType;
+        if (type.kind === ReflectionKind.function && type.function) return type.function;
+    }
+
+    return type;
+}
+
 export interface InjectorInterface {
     get<T>(token: T, scope?: Scope): ResolveToken<T>;
 }
@@ -176,16 +165,45 @@ export interface InjectorInterface {
 /**
  * Returns the injector token type if the given type was decorated with `Inject<T>`.
  */
-function getInjectOptions(type: Type): Type | undefined {
-    const annotations = metaAnnotation.getAnnotations(type);
-    for (const annotation of annotations) {
-        if (annotation.name === 'inject') {
-            const t = annotation.options[0] as Type;
-            return t.kind !== ReflectionKind.never ? t : type;
+export function getInjectOptions(type: Type): Type | undefined {
+    const annotations = metaAnnotation.getForName(type, 'inject');
+    if (!annotations) return;
+    const t = annotations[0];
+    return t && t.kind !== ReflectionKind.never ? t : type;
+}
+
+function getPickArguments(type: Type): Type[] | undefined {
+    if (type.typeName === 'Pick' && type.typeArguments && type.typeArguments.length === 2) {
+        return type.typeArguments;
+    }
+    if (!type.originTypes) return;
+
+    for (const origin of type.originTypes) {
+        if (origin.typeName === 'Pick' && origin.typeArguments && origin.typeArguments.length === 2) {
+            return origin.typeArguments;
         }
     }
+
     return;
 }
+
+/**
+ * Class describing where a transient provider will be injected.
+ *
+ * @reflection never
+ */
+export class TransientInjectionTarget {
+    constructor(
+        public readonly token: Token,
+    ) {
+    }
+}
+
+/**
+ * A factory function for some class.
+ * All properties that are not provided will be resolved using the injector that was used to create the factory.
+ */
+export type PartialFactory<C> = (args: Partial<{ [K in keyof C]: C[K] }>) => C;
 
 /**
  * This is the actual dependency injection container.
@@ -194,7 +212,7 @@ function getInjectOptions(type: Type): Type | undefined {
  * @reflection never
  */
 export class Injector implements InjectorInterface {
-    private resolver?: (token: any, scope?: Scope) => any;
+    private resolver?: (token: any, scope?: Scope, destination?: Destination) => any;
     private setter?: (token: any, value: any, scope?: Scope) => any;
     private instantiations?: (token: any, scope?: string) => number;
 
@@ -220,12 +238,20 @@ export class Injector implements InjectorInterface {
         return new Injector(module, new BuildContext);
     }
 
-    get<T>(token: T, scope?: Scope): ResolveToken<T> {
+    get<T>(token?: ReceiveType<T> | Token<T>, scope?: Scope): ResolveToken<T> {
         if (!this.resolver) throw new Error('Injector was not built');
-        return this.resolver(token, scope);
+        if ('string' === typeof token || 'number' === typeof token || 'bigint' === typeof token ||
+            'boolean' === typeof token || 'symbol' === typeof token || isFunction(token) || isClass(token) || token instanceof RegExp) {
+            return this.resolver(getContainerToken(token), scope) as ResolveToken<T>;
+        } else if (isType(token)) {
+            return this.createResolver(isType(token) ? token as Type : resolveReceiveType(token), scope)(scope);
+        } else if (isArray(token)) {
+            return this.createResolver(resolveReceiveType(token), scope)(scope);
+        }
+        throw new Error(`Invalid get<T> argument given ${token}`);
     }
 
-    set<T>(token: T, value: any, scope?: Scope): void {
+    set(token: ContainerToken, value: any, scope?: Scope): void {
         if (!this.setter) throw new Error('Injector was not built');
         this.setter(token, value, scope);
     }
@@ -245,6 +271,12 @@ export class Injector implements InjectorInterface {
         resolverCompiler.context.set('CircularDetectorResets', CircularDetectorResets);
         resolverCompiler.context.set('throwCircularDependency', throwCircularDependency);
         resolverCompiler.context.set('tokenNotfoundError', serviceNotfoundError);
+        resolverCompiler.context.set('constructorParameterNotFound', constructorParameterNotFound);
+        resolverCompiler.context.set('functionParameterNotFound', functionParameterNotFound);
+        resolverCompiler.context.set('propertyParameterNotFound', propertyParameterNotFound);
+        resolverCompiler.context.set('factoryDependencyNotFound', factoryDependencyNotFound);
+        resolverCompiler.context.set('transientInjectionTargetUnavailable', transientInjectionTargetUnavailable);
+        resolverCompiler.context.set('createTransientInjectionTarget', createTransientInjectionTarget);
         resolverCompiler.context.set('injector', this);
 
         const lines: string[] = [];
@@ -276,7 +308,9 @@ export class Injector implements InjectorInterface {
                 const scopeObjectCheck = scope ? ` && scope && scope.name === ${JSON.stringify(scope)}` : '';
                 const scopeCheck = scope ? ` && scope === ${JSON.stringify(scope)}` : '';
 
-                setterLines.push(`case token === ${setterCompiler.reserveVariable('token', prepared.token)}${scopeObjectCheck}: {
+                const diToken = getContainerToken(prepared.token);
+
+                setterLines.push(`case token === ${setterCompiler.reserveVariable('token', diToken)}${scopeObjectCheck}: {
                     if (${accessor} === undefined) {
                         injector.instantiated.${name} = injector.instantiated.${name} ? injector.instantiated.${name} + 1 : 1;
                     }
@@ -284,17 +318,18 @@ export class Injector implements InjectorInterface {
                     break;
                 }`);
 
+
                 if (prepared.resolveFrom) {
-                    //its a redirect
+                    //it's a redirect
                     lines.push(`
-                    case token === ${resolverCompiler.reserveConst(prepared.token, 'token')}${scopeObjectCheck}: {
-                        return ${resolverCompiler.reserveConst(prepared.resolveFrom, 'resolveFrom')}.injector.resolver(${resolverCompiler.reserveConst(prepared.token, 'token')}, scope);
+                    case token === ${resolverCompiler.reserveConst(diToken, 'token')}${scopeObjectCheck}: {
+                        return ${resolverCompiler.reserveConst(prepared.resolveFrom, 'resolveFrom')}.injector.resolver(${resolverCompiler.reserveConst(diToken, 'token')}, scope, destination);
                     }
                     `);
 
                     instantiationLines.push(`
-                    case token === ${instantiationCompiler.reserveConst(prepared.token, 'token')}${scopeCheck}: {
-                        return ${instantiationCompiler.reserveConst(prepared.resolveFrom, 'resolveFrom')}.injector.instantiations(${instantiationCompiler.reserveConst(prepared.token, 'token')}, scope);
+                    case token === ${instantiationCompiler.reserveConst(diToken, 'token')}${scopeCheck}: {
+                        return ${instantiationCompiler.reserveConst(prepared.resolveFrom, 'resolveFrom')}.injector.instantiations(${instantiationCompiler.reserveConst(diToken, 'token')}, scope);
                     }
                     `);
                 } else {
@@ -302,7 +337,7 @@ export class Injector implements InjectorInterface {
                     lines.push(this.buildProvider(buildContext, resolverCompiler, name, accessor, scope, prepared.token, provider, prepared.modules));
 
                     instantiationLines.push(`
-                    case token === ${instantiationCompiler.reserveConst(prepared.token, 'token')}${scopeCheck}: {
+                    case token === ${instantiationCompiler.reserveConst(diToken, 'token')}${scopeCheck}: {
                         return injector.instantiated.${name} || 0;
                     }
                     `);
@@ -333,7 +368,7 @@ export class Injector implements InjectorInterface {
                 ${resets.join('\n')};
             });
 
-            return function(token, scope) {
+            return function(token, scope, destination) {
                 switch (true) {
                     ${lines.join('\n')}
                 }
@@ -355,7 +390,7 @@ export class Injector implements InjectorInterface {
     ) {
         let transient = false;
         let factory: { code: string, dependencies: number } = { code: '', dependencies: 0 };
-        const tokenVar = compiler.reserveConst(token);
+        const tokenVar = compiler.reserveConst(getContainerToken(token));
 
         if (isValueProvider(provider)) {
             transient = provider.transient === true;
@@ -374,11 +409,12 @@ export class Injector implements InjectorInterface {
             factory = this.createFactory(provider, accessor, compiler, useClass, resolveDependenciesFrom);
         } else if (isExistingProvider(provider)) {
             transient = provider.transient === true;
-            factory.code = `${accessor} = injector.resolver(${compiler.reserveConst(provider.useExisting)}, scope)`;
+            factory.code = `${accessor} = injector.resolver(${compiler.reserveConst(getContainerToken(provider.useExisting))}, scope, destination)`;
         } else if (isFactoryProvider(provider)) {
             transient = provider.transient === true;
             const args: string[] = [];
             const reflection = ReflectionFunction.from(provider.useFactory);
+            const ofName = reflection.name === 'anonymous' ? 'useFactory' : reflection.name;
 
             for (const parameter of reflection.getParameters()) {
                 factory.dependencies++;
@@ -386,8 +422,8 @@ export class Injector implements InjectorInterface {
                 args.push(this.createFactoryProperty({
                     name: parameter.name,
                     type: tokenType || parameter.getType() as Type,
-                    optional: !parameter.isValueRequired()
-                }, provider, compiler, resolveDependenciesFrom, reflection.name || 'useFactory', args.length, 'factoryDependencyNotFound'));
+                    optional: !parameter.isValueRequired(),
+                }, provider, compiler, resolveDependenciesFrom, ofName, args.length, 'factoryDependencyNotFound'));
             }
 
             factory.code = `${accessor} = ${compiler.reserveVariable('factory', provider.useFactory)}(${args.join(', ')});`;
@@ -397,41 +433,38 @@ export class Injector implements InjectorInterface {
 
         const configureProvider: string[] = [];
 
-        const configuredProviderCalls = resolveDependenciesFrom[0].setupProviderRegistry?.get(token);
-        configuredProviderCalls.push(...buildContext.globalSetupProviderRegistry.get(token));
+        const configurations: ConfigureProviderEntry[] = [];
+        for (const module of resolveDependenciesFrom) {
+            configurations.push(...module.configurationProviderRegistry.get(token));
+        }
+        configurations.push(...buildContext.globalConfigurationProviderRegistry.get(token));
 
-        if (configuredProviderCalls) {
-            configuredProviderCalls.sort((a, b) => {
-                return a.order - b.order;
+        if (configurations?.length) {
+            configurations.sort((a, b) => {
+                return a.options.order - b.options.order;
             });
 
-            for (const call of configuredProviderCalls) {
-                if (call.type === 'stop') break;
-                if (call.type === 'call') {
-                    const args: string[] = [];
-                    const methodName = 'symbol' === typeof call.methodName ? '[' + compiler.reserveVariable('arg', call.methodName) + ']' : call.methodName;
-                    for (const arg of call.args) {
-                        if (arg instanceof InjectorReference) {
-                            const injector = arg.module ? compiler.reserveConst(arg.module) + '.injector' : 'injector';
-                            args.push(`${injector}.resolver(${compiler.reserveConst(arg.to)}, scope)`);
-                        } else {
-                            args.push(`${compiler.reserveVariable('arg', arg)}`);
-                        }
-                    }
+            for (const configure of configurations) {
+                const args: string[] = [accessor];
+                const reflection = ReflectionFunction.from(configure.call);
+                const ofName = reflection.name === 'anonymous' ? 'configureProvider' : reflection.name;
 
-                    configureProvider.push(`${accessor}.${methodName}(${args.join(', ')});`);
+                for (const parameter of reflection.getParameters().slice(1)) {
+                    const tokenType = getInjectOptions(parameter.getType() as Type);
+                    args.push(this.createFactoryProperty({
+                        name: parameter.name,
+                        type: tokenType || parameter.getType() as Type,
+                        optional: !parameter.isValueRequired(),
+                    }, provider, compiler, resolveDependenciesFrom, ofName, args.length, 'functionParameterNotFound'));
                 }
-                if (call.type === 'property') {
-                    const property = 'symbol' === typeof call.property ? '[' + compiler.reserveVariable('property', call.property) + ']' : call.property;
-                    let value: string = '';
-                    if (call.value instanceof InjectorReference) {
-                        const injector = call.value.module ? compiler.reserveConst(call.value.module) + '.injector' : 'injector';
-                        value = `${injector}.resolver(${compiler.reserveConst(call.value.to)}, scope)`;
-                    } else {
-                        value = compiler.reserveVariable('value', call.value);
-                    }
-                    configureProvider.push(`${accessor}.${property} = ${value};`);
+
+                const call = `${compiler.reserveVariable('configure', configure.call)}(${args.join(', ')});`;
+                if (configure.options.replace) {
+                    configureProvider.push(`${accessor} = ${call}`);
+                } else {
+                    configureProvider.push(call);
                 }
+
             }
         } else {
             configureProvider.push('//no custom provider setup');
@@ -444,10 +477,6 @@ export class Injector implements InjectorInterface {
         const creatingVar = `creating_${name}`;
         const circularDependencyCheckStart = factory.dependencies ? `if (${creatingVar}) throwCircularDependency();${creatingVar} = true;` : '';
         const circularDependencyCheckEnd = factory.dependencies ? `${creatingVar} = false;` : '';
-
-        if (tokenLabel(token) === 'DebugBroker') {
-            debugger;
-        }
 
         return `
             //${tokenLabel(token)}, from ${resolveDependenciesFrom.map(getClassName).join(', ')}
@@ -470,7 +499,7 @@ export class Injector implements InjectorInterface {
         resolvedName: string,
         compiler: CompilerContext,
         classType: ClassType,
-        resolveDependenciesFrom: InjectorModule[]
+        resolveDependenciesFrom: InjectorModule[],
     ): { code: string, dependencies: number } {
         if (!classType) throw new Error('Can not create factory for undefined ClassType');
         const reflectionClass = ReflectionClass.from(classType);
@@ -488,7 +517,7 @@ export class Injector implements InjectorInterface {
                 args.push(this.createFactoryProperty({
                     name: parameter.name,
                     type: tokenType || parameter.getType() as Type,
-                    optional: !parameter.isValueRequired()
+                    optional: !parameter.isValueRequired(),
                 }, provider, compiler, resolveDependenciesFrom, getClassName(classType), args.length, 'constructorParameterNotFound'));
             }
         }
@@ -502,7 +531,7 @@ export class Injector implements InjectorInterface {
                 const resolveProperty = this.createFactoryProperty({
                     name: property.name,
                     type: tokenType,
-                    optional: !property.isValueRequired()
+                    optional: !property.isValueRequired(),
                 }, provider, compiler, resolveDependenciesFrom, getClassName(classType), -1, 'propertyParameterNotFound');
                 propertyAssignment.push(`${resolvedName}.${String(property.getName())} = ${resolveProperty};`);
             } catch (error: any) {
@@ -512,7 +541,7 @@ export class Injector implements InjectorInterface {
 
         return {
             code: `${resolvedName} = new ${classTypeVar}(${args.join(',')});\n${propertyAssignment.join('\n')}`,
-            dependencies
+            dependencies,
         };
     }
 
@@ -523,14 +552,25 @@ export class Injector implements InjectorInterface {
         resolveDependenciesFrom: InjectorModule[],
         ofName: string,
         argPosition: number,
-        notFoundFunction: string
+        notFoundFunction: string,
     ): string {
         let of = `${ofName}.${options.name}`;
+        const destinationVar = compiler.reserveConst({ token: fromProvider.provide });
 
         if (options.type.kind === ReflectionKind.class) {
-            const module = findModuleForConfig(options.type.classType, resolveDependenciesFrom);
-            if (module) {
-                return compiler.reserveVariable('fullConfig', module.getConfig());
+            const found = findModuleForConfig(options.type.classType, resolveDependenciesFrom);
+            if (found) {
+                return compiler.reserveVariable('fullConfig', getPathValue(found.module.getConfig(), found.path));
+            }
+        }
+
+        if (options.type.kind === ReflectionKind.class && options.type.classType === TransientInjectionTarget) {
+            if (fromProvider.transient === true) {
+                const tokenVar = compiler.reserveVariable('token', options.type.classType);
+                const orThrow = options.optional ? '' : `?? transientInjectionTargetUnavailable(${JSON.stringify(ofName)}, ${JSON.stringify(options.name)}, ${argPosition}, ${tokenVar})`;
+                return `createTransientInjectionTarget(destination) ${orThrow}`;
+            } else {
+                throw new Error(`Cannot inject ${TransientInjectionTarget.name} into ${JSON.stringify(ofName)}.${JSON.stringify(options.name)}, as ${JSON.stringify(ofName)} is not transient`);
             }
         }
 
@@ -538,8 +578,12 @@ export class Injector implements InjectorInterface {
             return compiler.reserveVariable('tagRegistry', this.buildContext.tagRegistry);
         }
 
-        if (options.type.kind === ReflectionKind.class && resolveDependenciesFrom[0] instanceof options.type.classType) {
-            return compiler.reserveConst(resolveDependenciesFrom[0], 'module');
+        if (options.type.kind === ReflectionKind.class) {
+            for (const module of resolveDependenciesFrom) {
+                if (module instanceof options.type.classType) {
+                    return compiler.reserveConst(module, 'module');
+                }
+            }
         }
 
         if (options.type.kind === ReflectionKind.class && isPrototypeOfBase(options.type.classType, Tag)) {
@@ -548,18 +592,26 @@ export class Injector implements InjectorInterface {
             const entries = this.buildContext.tagRegistry.resolve(options.type.classType);
             const args: string[] = [];
             for (const entry of entries) {
-                args.push(`${compiler.reserveConst(entry.module)}.injector.resolver(${compiler.reserveConst(entry.tagProvider.provider.provide)}, scope)`);
+                args.push(`${compiler.reserveConst(entry.module)}.injector.resolver(${compiler.reserveConst(getContainerToken(entry.tagProvider.provider.provide))}, scope, ${destinationVar})`);
             }
             return `new ${tokenVar}(${resolvedVar} || (${resolvedVar} = [${args.join(', ')}]))`;
         }
 
+        if (options.type.kind === ReflectionKind.function && options.type.typeName === 'PartialFactory') {
+            const type = options.type.typeArguments?.[0];
+            const factory = partialFactory(type, this);
+            const factoryVar = compiler.reserveConst(factory, 'factory');
+            return `${factoryVar}(scope)`;
+        }
+
         if (options.type.kind === ReflectionKind.objectLiteral) {
-            if (options.type.typeName === 'Pick' && options.type.typeArguments && options.type.typeArguments.length === 2) {
-                if (options.type.typeArguments[0].kind === ReflectionKind.class) {
-                    const module = findModuleForConfig(options.type.typeArguments[0].classType, resolveDependenciesFrom);
-                    if (module) {
-                        const fullConfig = compiler.reserveVariable('fullConfig', module.getConfig());
-                        let index = options.type.typeArguments[1];
+            const pickArguments = getPickArguments(options.type);
+            if (pickArguments) {
+                if (pickArguments[0].kind === ReflectionKind.class) {
+                    const found = findModuleForConfig(pickArguments[0].classType, resolveDependenciesFrom);
+                    if (found) {
+                        const fullConfig = compiler.reserveVariable('fullConfig', getPathValue(found.module.getConfig(), found.path));
+                        let index = pickArguments[1];
                         if (index.kind === ReflectionKind.literal) {
                             index = { kind: ReflectionKind.union, types: [index] };
                         }
@@ -585,13 +637,19 @@ export class Injector implements InjectorInterface {
             const accesses: string[] = [];
 
             while (current && current.indexAccessOrigin) {
+                let found: { module: InjectorModule, path: string } | undefined = undefined;
                 if (current.indexAccessOrigin.container.kind === ReflectionKind.class) {
-                    module = findModuleForConfig(current.indexAccessOrigin.container.classType, resolveDependenciesFrom);
+                    found = findModuleForConfig(current.indexAccessOrigin.container.classType, resolveDependenciesFrom);
                 }
                 if (current.indexAccessOrigin.index.kind === ReflectionKind.literal) {
                     accesses.unshift(`[${JSON.stringify(current.indexAccessOrigin.index.literal)}]`);
                 }
                 current = current.indexAccessOrigin.container;
+                if (found) {
+                    module = found.module;
+                    if (found.path) accesses.unshift(`[${JSON.stringify(found.path)}]`);
+                    break;
+                }
             }
             if (module) {
                 const fullConfig = compiler.reserveVariable('fullConfig', module.getConfig());
@@ -599,25 +657,22 @@ export class Injector implements InjectorInterface {
             }
         }
 
-        let findToken: Token = options.type;
-        if (isType(findToken)) {
-            if (findToken.kind === ReflectionKind.class) {
-                findToken = findToken.classType;
-            } else if (findToken.kind === ReflectionKind.literal) {
-                findToken = findToken.literal;
-            }
-        }
-
         let foundPreparedProvider: PreparedProvider | undefined = undefined;
         for (const module of resolveDependenciesFrom) {
-            foundPreparedProvider = module.getPreparedProvider(findToken);
+            foundPreparedProvider = module.getPreparedProvider(options.type, foundPreparedProvider);
+        }
+
+        if (resolveDependenciesFrom[0] !== this.module) {
+            //the provider was exported from another module, so we need to check if there is a more specific candidate
+            foundPreparedProvider = this.module.getPreparedProvider(options.type, foundPreparedProvider);
         }
 
         if (!foundPreparedProvider) {
-            //try if parents have anything
-            const foundInModule = this.module.resolveToken(findToken);
-            if (foundInModule) {
-                foundPreparedProvider = foundInModule.getPreparedProvider(findToken);
+            //go up parent hierarchy
+            let current: InjectorModule | undefined = this.module;
+            while (current && !foundPreparedProvider) {
+                foundPreparedProvider = current.getPreparedProvider(options.type, foundPreparedProvider);
+                current = current.parent;
             }
         }
 
@@ -635,23 +690,20 @@ export class Injector implements InjectorInterface {
             const type = stringifyType(options.type, { showFullDefinition: false }).replace(/\n/g, '').replace(/\s\s+/g, ' ').replace(' & InjectMeta', '');
             if (options.optional) return 'undefined';
             throw new DependenciesUnmetError(
-                `Undefined dependency "${options.name}: ${type}" of ${of}. Type has no provider in ${fromScope ? 'scope ' + fromScope : 'no scope'}.`
+                `Undefined dependency "${options.name}: ${type}" of ${of}. Type has no provider${fromScope ? ' in scope ' + fromScope : ''}.`,
             );
-
-            // throw new DependenciesUnmetError(
-            //     `Unknown dependency '${options.name}: ${stringifyType(options.type, { showFullDefinition: false })}' of ${of}.`
-            // );
         }
 
-        const tokenVar = compiler.reserveVariable('token', foundPreparedProvider.token);
+        const tokenVar = compiler.reserveVariable('token', getContainerToken(foundPreparedProvider.token));
         const allPossibleScopes = foundPreparedProvider.providers.map(getScope);
         const unscoped = allPossibleScopes.includes('') && allPossibleScopes.length === 1;
+        const foundProviderLabel = foundPreparedProvider.providers.map(v => v.provide).map(tokenLabel).join(', ');
 
         if (!unscoped && !allPossibleScopes.includes(fromScope)) {
             const t = stringifyType(options.type, { showFullDefinition: false });
             throw new DependenciesUnmetError(
                 `Dependency '${options.name}: ${t}' of ${of} can not be injected into ${fromScope ? 'scope ' + fromScope : 'no scope'}, ` +
-                `since ${t} only exists in scope${allPossibleScopes.length === 1 ? '' : 's'} ${allPossibleScopes.join(', ')}.`
+                `since ${foundProviderLabel} only exists in scope${allPossibleScopes.length === 1 ? '' : 's'} ${allPossibleScopes.join(', ')}.`,
             );
         }
 
@@ -661,30 +713,34 @@ export class Injector implements InjectorInterface {
 
         const resolveFromModule = foundPreparedProvider.resolveFrom || foundPreparedProvider.modules[0];
         if (resolveFromModule === this.module) {
-            return `injector.resolver(${tokenVar}, scope)`;
+            return `injector.resolver(${tokenVar}, scope, ${destinationVar}) ${orThrow}`;
         }
-        return `${compiler.reserveConst(resolveFromModule)}.injector.resolver(${tokenVar}, scope) ${orThrow}`;
+        return `${compiler.reserveConst(resolveFromModule)}.injector.resolver(${tokenVar}, scope, ${destinationVar}) ${orThrow}`;
     }
 
-    createResolver(type: Type, scope?: Scope): Resolver<any> {
+    createResolver(type: Type, scope?: Scope, label?: string): Resolver<any> {
         const resolveDependenciesFrom = [this.module];
         const optional = isOptional(type);
         if (type.kind === ReflectionKind.propertySignature || type.kind === ReflectionKind.property) type = type.type;
         if (type.kind === ReflectionKind.parameter) type = type.type;
+
+        type = getInjectOptions(type) || type;
 
         // if (type.kind === ReflectionKind.union) {
         //     type = type.types.some(v => v.kind !== ReflectionKind.undefined);
         // }
 
         if (type.kind === ReflectionKind.class) {
-            const module = findModuleForConfig(type.classType, resolveDependenciesFrom);
-            if (module) return module.getConfig();
+            const found = findModuleForConfig(type.classType, resolveDependenciesFrom);
+            if (found) return () => getPathValue(found.module.getConfig(), found.path);
         }
 
         if (type.kind === ReflectionKind.class && type.classType === TagRegistry) return () => this.buildContext.tagRegistry;
 
-        if (type.kind === ReflectionKind.class && resolveDependenciesFrom[0] instanceof type.classType) {
-            return () => resolveDependenciesFrom[0];
+        if (type.kind === ReflectionKind.class) {
+            for (const module of resolveDependenciesFrom) {
+                if (module instanceof type.classType) return () => module;
+            }
         }
 
         if (type.kind === ReflectionKind.class && isPrototypeOfBase(type.classType, Tag)) {
@@ -697,14 +753,21 @@ export class Injector implements InjectorInterface {
             return new type.classType(args);
         }
 
+        if (type.kind === ReflectionKind.function && type.typeName === 'PartialFactory') {
+            const factoryType = type.typeArguments?.[0];
+            const factory = partialFactory(factoryType, this);
+            return (scopeIn?: Scope) => factory(scopeIn);
+        }
+
         if (isWithAnnotations(type)) {
             if (type.kind === ReflectionKind.objectLiteral) {
-                if (type.typeName === 'Pick' && type.typeArguments && type.typeArguments.length === 2) {
-                    if (type.typeArguments[0].kind === ReflectionKind.class) {
-                        const module = findModuleForConfig(type.typeArguments[0].classType, resolveDependenciesFrom);
-                        if (module) {
-                            const fullConfig = module.getConfig();
-                            let index = type.typeArguments[1];
+                const pickArguments = getPickArguments(type);
+                if (pickArguments) {
+                    if (pickArguments[0].kind === ReflectionKind.class) {
+                        const found = findModuleForConfig(pickArguments[0].classType, resolveDependenciesFrom);
+                        if (found) {
+                            const fullConfig = getPathValue(found.module.getConfig(), found.path);
+                            let index = pickArguments[1];
                             if (index.kind === ReflectionKind.literal) {
                                 index = { kind: ReflectionKind.union, types: [index] };
                             }
@@ -726,44 +789,44 @@ export class Injector implements InjectorInterface {
 
             if (type.indexAccessOrigin) {
                 let current = type;
-                let module: InjectorModule | undefined;
-                let config: { [name: string]: any } = {};
+                let config: { [name: string]: any } | undefined = undefined;
 
                 while (current && current.indexAccessOrigin) {
                     if (current.indexAccessOrigin.container.kind === ReflectionKind.class) {
-                        module = findModuleForConfig(current.indexAccessOrigin.container.classType, resolveDependenciesFrom);
-                        if (!module) return () => undefined;
-                        config = module.getConfig();
+                        const found = findModuleForConfig(current.indexAccessOrigin.container.classType, resolveDependenciesFrom);
+                        // Only because it has indexAccessOrigin as class doesn't mean it must be a config reference.
+                        // We can safely ignore it if it's not a config reference.
+                        if (found) {
+                            config = getPathValue(found.module.getConfig(), found.path);
+                        }
                     }
-                    if (current.indexAccessOrigin.index.kind === ReflectionKind.literal) {
+                    if (config !== undefined && current.indexAccessOrigin.index.kind === ReflectionKind.literal) {
                         const index = current.indexAccessOrigin.index.literal;
                         config = config[String(index)];
                     }
                     current = current.indexAccessOrigin.container;
                 }
-                return () => config;
-            }
-        }
 
-        let findToken: Token = type;
-        if (isType(findToken)) {
-            if (findToken.kind === ReflectionKind.class) {
-                findToken = findToken.classType;
-            } else if (findToken.kind === ReflectionKind.literal) {
-                findToken = findToken.literal;
+                if (config !== undefined) return () => config;
             }
         }
 
         let foundPreparedProvider: PreparedProvider | undefined = undefined;
         for (const module of resolveDependenciesFrom) {
-            foundPreparedProvider = module.getPreparedProvider(findToken);
+            foundPreparedProvider = module.getPreparedProvider(type, foundPreparedProvider);
+        }
+
+        if (resolveDependenciesFrom[0] !== this.module) {
+            //the provider was exported from another module, so we need to check if there is a more specific candidate
+            foundPreparedProvider = this.module.getPreparedProvider(type, foundPreparedProvider);
         }
 
         if (!foundPreparedProvider) {
-            //try if parents have anything
-            const foundInModule = this.module.resolveToken(findToken);
-            if (foundInModule) {
-                foundPreparedProvider = foundInModule.getPreparedProvider(findToken);
+            //go up parent hierarchy
+            let current: InjectorModule | undefined = this.module;
+            while (current && !foundPreparedProvider) {
+                foundPreparedProvider = current.getPreparedProvider(type, foundPreparedProvider);
+                current = current.parent;
             }
         }
 
@@ -773,7 +836,7 @@ export class Injector implements InjectorInterface {
             if (optional) return () => undefined;
             const t = stringifyType(type, { showFullDefinition: false });
             throw new ServiceNotFoundError(
-                `Undefined service "${t}". Type has no matching provider in ${fromScope ? 'scope ' + fromScope : 'no scope'}.`
+                `Undefined service "${label ? label + ': ' : ''}${t}". Type has no matching provider in ${fromScope ? 'scope ' + fromScope : 'no scope'}.`,
             );
         }
 
@@ -790,7 +853,7 @@ export class Injector implements InjectorInterface {
 
         const resolveFromModule = foundPreparedProvider.resolveFrom || foundPreparedProvider.modules[0];
 
-        return (scopeIn?: Scope) => resolveFromModule.injector!.resolver!(foundPreparedProvider!.token, scopeIn || scope);
+        return (scopeIn?: Scope) => resolveFromModule.injector!.resolver!(getContainerToken(foundPreparedProvider!.token), scopeIn || scope);
     }
 }
 
@@ -812,12 +875,10 @@ export class BuildContext {
      * In the process of preparing providers, each module redirects their
      * global setup calls in this registry.
      */
-    globalSetupProviderRegistry: SetupProviderRegistry = new SetupProviderRegistry;
+    globalConfigurationProviderRegistry: ConfigurationProviderRegistry = new ConfigurationProviderRegistry;
 }
 
-export interface Resolver<T> {
-    (scope?: Scope): T;
-}
+export type Resolver<T> = (scope?: Scope) => T;
 
 /**
  * A InjectorContext is responsible for taking a root InjectorModule and build all Injectors.
@@ -836,17 +897,17 @@ export class InjectorContext {
         return this.getInjector(module || this.rootModule).createResolver(resolveReceiveType(type), this.scope);
     }
 
+    getOrUndefined<T>(token?: ReceiveType<T> | Token<T>, module?: InjectorModule): ResolveToken<T> | undefined {
+        try {
+            return this.get(token, module);
+        } catch (error) {
+            return;
+        }
+    }
+
     get<T>(token?: ReceiveType<T> | Token<T>, module?: InjectorModule): ResolveToken<T> {
         const injector = this.getInjector(module || this.rootModule);
-        if ('string' === typeof token || 'number' === typeof token || 'bigint' === typeof token ||
-            'boolean' === typeof token || 'symbol' === typeof token || isFunction(token) || isClass(token) || token instanceof RegExp) {
-            return injector.get(token, this.scope) as ResolveToken<T>;
-        } else if (isType(token)) {
-            return injector.createResolver(isType(token) ? token as Type : resolveReceiveType(token), this.scope)(this.scope);
-        } else if (isArray(token)) {
-            return injector.createResolver(resolveReceiveType(token), this.scope)(this.scope);
-        }
-        throw new Error(`Invalid get<T> argument given ${token}`);
+        return injector.get(token, this.scope);
     }
 
     instantiationCount(token: Token, module?: InjectorModule, scope?: string): number {
@@ -854,7 +915,11 @@ export class InjectorContext {
     }
 
     set<T>(token: T, value: any, module?: InjectorModule): void {
-        return this.getInjector(module || this.rootModule).set(token, value, this.scope);
+        return this.getInjector(module || this.rootModule).set(
+            getContainerToken(token),
+            value,
+            this.scope,
+        );
     }
 
     static forProviders(providers: ProviderWithScope[]) {
@@ -877,12 +942,13 @@ export class InjectorContext {
     }
 }
 
-export function injectedFunction<T extends (...args: any) => any>(fn: T, injector: Injector, skipParameters: number = 0): ((scope?: Scope, ...args: any[]) => ReturnType<T>) {
-    const type = reflect(fn);
-    if (type.kind === ReflectionKind.function) {
+export function injectedFunction<T extends (...args: any) => any>(fn: T, injector: Injector, skipParameters: number = 0, type?: Type, skipTypeParameters?: number): ((scope?: Scope, ...args: any[]) => ReturnType<T>) {
+    type = type || reflect(fn);
+    skipTypeParameters = skipTypeParameters === undefined ? skipParameters : skipTypeParameters;
+    if (type.kind === ReflectionKind.function || type.kind === ReflectionKind.method) {
         const args: Resolver<any>[] = [];
-        for (let i = skipParameters; i < type.parameters.length; i++) {
-            args.push(injector.createResolver(type.parameters[i]));
+        for (let i = skipTypeParameters; i < type.parameters.length; i++) {
+            args.push(injector.createResolver(type.parameters[i], undefined, type.parameters[i].name));
         }
 
         if (skipParameters === 0) {
@@ -911,4 +977,72 @@ export function injectedFunction<T extends (...args: any) => any>(fn: T, injecto
         }
     }
     return fn;
+}
+
+export function partialFactory(
+    type: Type | undefined,
+    injector: Injector,
+) {
+    if (!type) throw new Error('Can not create partial factory for undefined type');
+
+    // must be lazy because creating resolvers for types that are never resolved & unresolvable will throw
+    function createLazyResolver(type: Type, label?: string): Resolver<any> {
+        let resolver: Resolver<any> | undefined = undefined;
+        return (scope?: Scope) => {
+            if (!resolver) {
+                resolver = injector.createResolver(type, scope, label);
+            }
+            return resolver(scope);
+        };
+    }
+
+    if (type.kind === ReflectionKind.class) {
+        const classType = type.classType;
+        const reflectionClass = ReflectionClass.from(classType);
+
+        const args: { name: string; resolve: (scope?: Scope) => ReturnType<Resolver<any>> }[] = [];
+        const constructor = reflectionClass.getMethodOrUndefined('constructor');
+        if (constructor) {
+            for (const parameter of constructor.getParameters()) {
+                args.push({
+                    name: parameter.name,
+                    resolve: createLazyResolver(parameter.getType() as Type, parameter.name),
+                });
+            }
+        }
+
+        const properties = new Map<keyof any, (scope?: Scope) => ReturnType<Resolver<any>>>();
+        for (const property of reflectionClass.getProperties()) {
+            const tokenType = getInjectOptions(property.type);
+            if (!tokenType) continue;
+
+            properties.set(property.getName(), createLazyResolver(tokenType, property.name));
+        }
+
+        return (scope?: Scope) => <T>(partial: Partial<{ [K in keyof T]: T[K] }>) => {
+            const instance = new classType(...(args.map((v) => partial[v.name as keyof T] ?? v.resolve(scope))));
+            for (const [property, resolve] of properties.entries()) {
+                instance[property] ??= partial[property as keyof T] ?? resolve(scope);
+            }
+            return instance as T;
+        };
+    }
+
+    if (type.kind === ReflectionKind.objectLiteral) {
+        const properties = new Map<keyof any, (scope?: Scope) => ReturnType<Resolver<any>>>();
+        for (const property of type.types) {
+            if (property.kind !== ReflectionKind.propertySignature) continue;
+            properties.set(property.name, createLazyResolver(property, String(property.name)));
+        }
+
+        return (scope?: Scope) => <T>(partial: Partial<{ [K in keyof T]: T[K] }>) => {
+            const obj: any = {};
+            for (const [property, resolve] of properties.entries()) {
+                obj[property] = partial[property as keyof T] ?? resolve(scope);
+            }
+            return obj as T;
+        };
+    }
+
+    throw new Error(`Can not create partial factory for ${stringifyType(type, { showFullDefinition: false })}`);
 }

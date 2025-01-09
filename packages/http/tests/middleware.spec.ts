@@ -1,8 +1,8 @@
 import { expect, test } from '@jest/globals';
-import { http } from '../src/decorator';
-import { createHttpKernel } from './utils';
-import { HttpMiddleware, httpMiddleware } from '../src/middleware';
-import { HttpRequest, HttpResponse } from '../src/model';
+import { http } from '../src/decorator.js';
+import { createHttpKernel } from './utils.js';
+import { HttpMiddleware, httpMiddleware } from '../src/middleware.js';
+import { HttpRequest, HttpResponse } from '../src/model.js';
 import { AppModule } from '@deepkit/app';
 import { sleep } from '@deepkit/core';
 
@@ -16,7 +16,7 @@ class Controller {
 test('middleware empty', async () => {
     const httpKernel = createHttpKernel([Controller], [], [], [httpMiddleware.for((req, res, next) => {
         next();
-    })]);
+    }).timeout(100)]);
 
     const response = await httpKernel.request(HttpRequest.GET('/user/name1'));
     expect(response.statusCode).toEqual(200);

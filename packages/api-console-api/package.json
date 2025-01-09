@@ -1,12 +1,13 @@
 {
   "name": "@deepkit/api-console-api",
-  "version": "1.0.1-alpha.71",
+  "version": "1.0.1-alpha.155",
   "type": "commonjs",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
   "types": "./dist/cjs/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/cjs/index.d.ts",
       "require": "./dist/cjs/index.js",
       "default": "./dist/esm/index.js"
     }
@@ -24,25 +25,26 @@
   "peerDependencies": {
     "@deepkit/bson": "^1.0.1-alpha.43",
     "@deepkit/core": "^1.0.1-alpha.43",
-    "@deepkit/crypto": "^1.0.1-alpha.35",
     "@deepkit/injector": "^1.0.1-alpha.43",
     "@deepkit/logger": "^1.0.1-alpha.43",
     "@deepkit/rpc": "^1.0.1-alpha.43",
     "@deepkit/type": "^1.0.1-alpha.63"
   },
   "devDependencies": {
-    "@deepkit/bson": "^1.0.1-alpha.71",
-    "@deepkit/core": "^1.0.1-alpha.65",
-    "@deepkit/crypto": "^1.0.1-alpha.65",
-    "@deepkit/injector": "^1.0.1-alpha.71",
-    "@deepkit/logger": "^1.0.1-alpha.65",
-    "@deepkit/rpc": "^1.0.1-alpha.71",
-    "@deepkit/type": "^1.0.1-alpha.71"
+    "@deepkit/bson": "^1.0.1-alpha.155",
+    "@deepkit/core": "^1.0.1-alpha.154",
+    "@deepkit/injector": "^1.0.1-alpha.155",
+    "@deepkit/logger": "^1.0.1-alpha.155",
+    "@deepkit/rpc": "^1.0.1-alpha.155",
+    "@deepkit/type": "^1.0.1-alpha.155"
   },
   "jest": {
     "testEnvironment": "node",
     "transform": {
       "^.+\\.(ts|tsx)$": "ts-jest"
+    },
+    "moduleNameMapper": {
+      "(.+)\\.js": "$1"
     },
     "testMatch": [
       "**/tests/**/*.spec.ts",

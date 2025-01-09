@@ -10,8 +10,8 @@
 
 import { asyncOperation, CustomError } from '@deepkit/core';
 import { ReceiveType } from '@deepkit/type';
-import { RpcTypes } from '../model';
-import type { RpcMessage } from '../protocol';
+import { RpcTypes } from '../model.js';
+import type { RpcMessage } from '../protocol.js';
 
 export class UnexpectedMessageType extends CustomError {
 }
@@ -27,7 +27,6 @@ export class RpcMessageSubject {
 
     constructor(
         private continuation: <T>(type: number, body?: T, schema?: ReceiveType<T>) => void,
-
         /**
          * Releases this subject. It is necessary that eventually every created subject is released,
          * otherwise dramatic performance decrease and memory leak will happen.
@@ -62,6 +61,9 @@ export class RpcMessageSubject {
         return this;
     }
 
+    /**
+     * Waits for the Ack message from the server, then closes the subject.
+     */
     async ackThenClose(): Promise<undefined> {
         return asyncOperation<undefined>((resolve, reject) => {
             this.onReply((next) => {
@@ -81,6 +83,9 @@ export class RpcMessageSubject {
         });
     }
 
+    /**
+     * Wait for next message to arrive.
+     */
     async waitNextMessage<T>(): Promise<RpcMessage> {
         return asyncOperation<any>((resolve, reject) => {
             this.onReply((next) => {
@@ -90,6 +95,9 @@ export class RpcMessageSubject {
         });
     }
 
+    /**
+     * Wait for next message with body parse.
+     */
     async waitNext<T>(type: number, schema?: ReceiveType<T>): Promise<T> {
         return asyncOperation<any>((resolve, reject) => {
             this.onReply((next) => {
@@ -108,6 +116,9 @@ export class RpcMessageSubject {
         });
     }
 
+    /**
+     * Waits for the first message of a specific type, then closes the subject.
+     */
     async firstThenClose<T = RpcMessage>(type: number, schema?: ReceiveType<T>): Promise<T> {
         return await asyncOperation<any>((resolve, reject) => {
             this.onReply((next) => {

@@ -1,6 +1,6 @@
 {
   "name": "@deepkit/sql",
-  "version": "1.0.1-alpha.71",
+  "version": "1.0.1-alpha.155",
   "description": "deepkit/orm base SQL",
   "type": "commonjs",
   "main": "./dist/cjs/index.js",
@@ -8,11 +8,13 @@
   "types": "./dist/cjs/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/cjs/index.d.ts",
       "require": "./dist/cjs/index.js",
       "browser": "./dist/esm/browser.js",
       "default": "./dist/esm/index.js"
     },
     "./commands": {
+      "types": "./dist/cjs/commands.d.ts",
       "require": "./dist/cjs/commands.js",
       "default": "./dist/esm/commands.js"
     }
@@ -47,19 +49,27 @@
     "sqlstring-sqlite": "^0.1.1"
   },
   "devDependencies": {
-    "@deepkit/app": "^1.0.1-alpha.71",
-    "@deepkit/core": "^1.0.1-alpha.65",
-    "@deepkit/injector": "^1.0.1-alpha.71",
-    "@deepkit/logger": "^1.0.1-alpha.65",
-    "@deepkit/orm": "^1.0.1-alpha.71",
-    "@deepkit/stopwatch": "^1.0.1-alpha.71",
-    "@deepkit/type": "^1.0.1-alpha.71"
+    "@deepkit/app": "^1.0.1-alpha.155",
+    "@deepkit/core": "^1.0.1-alpha.154",
+    "@deepkit/injector": "^1.0.1-alpha.155",
+    "@deepkit/logger": "^1.0.1-alpha.155",
+    "@deepkit/orm": "^1.0.1-alpha.155",
+    "@deepkit/stopwatch": "^1.0.1-alpha.155",
+    "@deepkit/type": "^1.0.1-alpha.155"
   },
   "jest": {
     "runner": "../../jest-serial-runner.js",
     "testEnvironment": "node",
     "transform": {
-      "^.+\\.(ts|tsx)$": "ts-jest"
+      "^.+\\.(ts|tsx)$": [
+        "ts-jest",
+        {
+          "tsconfig": "<rootDir>/tsconfig.spec.json"
+        }
+      ]
+    },
+    "moduleNameMapper": {
+      "(.+)\\.js": "$1"
     },
     "testTimeout": 50000,
     "testMatch": [

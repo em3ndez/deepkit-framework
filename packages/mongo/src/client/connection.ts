@@ -8,22 +8,19 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { arrayRemoveItem, asyncOperation } from '@deepkit/core';
-import { Host } from './host';
+import { arrayRemoveItem, asyncOperation, formatError } from '@deepkit/core';
+import { Host } from './host.js';
 import { createConnection, Socket } from 'net';
 import { connect as createTLSConnection, TLSSocket } from 'tls';
-import { Command } from './command/command';
+import { Command, TransactionalMessage } from './command/command.js';
 import { stringifyType, Type, uuid } from '@deepkit/type';
 import { BSONBinarySerializer, getBSONSerializer, getBSONSizer, Writer } from '@deepkit/bson';
-import { HandshakeCommand } from './command/handshake';
-import { MongoClientConfig } from './config';
-import { MongoError } from './error';
-
-// @ts-ignore
-import * as turbo from 'turbo-net';
+import { HandshakeCommand } from './command/handshake.js';
+import { MongoClientConfig } from './config.js';
+import { MongoConnectionError, MongoError } from './error.js';
 import { DatabaseTransaction } from '@deepkit/orm';
-import { CommitTransactionCommand } from './command/commitTransaction';
-import { AbortTransactionCommand } from './command/abortTransaction';
+import { CommitTransactionCommand } from './command/commitTransaction.js';
+import { AbortTransactionCommand } from './command/abortTransaction.js';
 
 export enum MongoConnectionStatus {
     pending = 'pending',
@@ -33,8 +30,28 @@ export enum MongoConnectionStatus {
 }
 
 export interface ConnectionRequest {
-    writable?: boolean;
-    nearest?: boolean;
+    readonly: boolean;
+    nearest: boolean;
+}
+
+export class MongoStats {
+    /**
+     * How many connections have been created.
+     */
+    connectionsCreated: number = 0;
+
+    /**
+     * How many connections have been reused.
+     */
+    connectionsReused: number = 0;
+
+    /**
+     * How many connection requests were queued because pool was full.
+     */
+    connectionsQueued: number = 0;
+
+    bytesReceived: number = 0;
+    bytesSent: number = 0;
 }
 
 export class MongoConnectionPool {
@@ -44,12 +61,17 @@ export class MongoConnectionPool {
      */
     public connections: MongoConnection[] = [];
 
-    protected queue: ((connection: MongoConnection) => void)[] = [];
+    protected queue: { resolve: (connection: MongoConnection) => void, request: ConnectionRequest }[] = [];
 
     protected nextConnectionClose: Promise<boolean> = Promise.resolve(true);
 
-    constructor(protected config: MongoClientConfig,
-                protected serializer: BSONBinarySerializer) {
+    protected lastError?: Error;
+
+    constructor(
+        protected config: MongoClientConfig,
+        protected serializer: BSONBinarySerializer,
+        protected stats: MongoStats,
+    ) {
     }
 
     protected async waitForAllConnectionsToConnect(throws: boolean = false): Promise<void> {
@@ -60,12 +82,15 @@ export class MongoConnectionPool {
             }
         }
 
-        if (promises.length) {
+        if (!promises.length) return;
+        try {
             if (throws) {
                 await Promise.all(promises);
             } else {
                 await Promise.allSettled(promises);
             }
+        } catch (error: any) {
+            throw new MongoConnectionError(`Failed to connect: ${formatError(error)}`, { cause: error });
         }
     }
 
@@ -81,7 +106,10 @@ export class MongoConnectionPool {
         }
     }
 
+    protected ensureHostsConnectedPromise?: Promise<void>;
+
     public async ensureHostsConnected(throws: boolean = false) {
+        if (this.ensureHostsConnectedPromise) return this.ensureHostsConnectedPromise;
         //make sure each host has at least one connection
         //getHosts automatically updates hosts (mongodb-srv) and returns new one,
         //so we don't need any interval to automatically update it.
@@ -91,17 +119,22 @@ export class MongoConnectionPool {
             this.newConnection(host);
         }
 
-        await this.waitForAllConnectionsToConnect(throws);
+        return this.ensureHostsConnectedPromise = asyncOperation(async (resolve) => {
+            await this.waitForAllConnectionsToConnect(throws);
+            resolve(undefined);
+        }).then(() => {
+            this.ensureHostsConnectedPromise = undefined;
+        });
     }
 
     protected findHostForRequest(hosts: Host[], request: ConnectionRequest): Host {
         //todo, handle request.nearest
         for (const host of hosts) {
-            if (request.writable && host.isWritable()) return host;
-            if (!request.writable && host.isReadable()) return host;
+            if (!request.readonly && host.isWritable()) return host;
+            if (request.readonly && host.isReadable()) return host;
         }
 
-        throw new MongoError(`Could not find host for connection request. (writable=${request.writable}, hosts=${hosts.length})`);
+        throw new MongoConnectionError(`Could not find host for connection request. (readonly=${request.readonly}, hosts=${hosts.length}). Last Error: ${this.lastError}`);
     }
 
     protected createAdditionalConnectionForRequest(request: ConnectionRequest): MongoConnection {
@@ -112,12 +145,17 @@ export class MongoConnectionPool {
     }
 
     protected newConnection(host: Host): MongoConnection {
+        this.stats.connectionsCreated++;
         const connection = new MongoConnection(this.connectionId++, host, this.config, this.serializer, (connection) => {
             arrayRemoveItem(host.connections, connection);
             arrayRemoveItem(this.connections, connection);
             //onClose does not automatically reconnect. Only new commands re-establish connections.
         }, (connection) => {
             this.release(connection);
+        }, (bytesSent) => {
+            this.stats.bytesSent += bytesSent;
+        }, (bytesReceived) =>{
+            this.stats.bytesReceived += bytesReceived;
         });
         host.connections.push(connection);
         this.connections.push(connection);
@@ -125,16 +163,20 @@ export class MongoConnectionPool {
     }
 
     protected release(connection: MongoConnection) {
-        if (this.queue.length) {
-            const waiter = this.queue.shift();
-            if (waiter) {
-                waiter(connection);
-                return;
-            }
+        for (let i = 0; i < this.queue.length; i++) {
+            const waiter = this.queue[i];
+            if (!this.matchRequest(connection, waiter.request)) continue;
+
+            this.stats.connectionsReused++;
+            this.queue.splice(i, 1);
+            waiter.resolve(connection);
+            //we don't set reserved/set cleanupTimeout,
+            //since the connection is already reserved and the timeout
+            //is only set when the connection actually starting idling.
+            return;
         }
 
         connection.reserved = false;
-        // console.log('release', connection.id, JSON.stringify(this.config.options.maxIdleTimeMS));
         connection.cleanupTimeout = setTimeout(() => {
             if (this.connections.length <= this.config.options.minPoolSize) {
                 return;
@@ -144,25 +186,34 @@ export class MongoConnectionPool {
         }, this.config.options.maxIdleTimeMS);
     }
 
+    protected matchRequest(connection: MongoConnection, request: ConnectionRequest): boolean {
+        if (!request.readonly && !connection.host.isWritable()) return false;
+
+        if (!request.readonly) {
+            if (connection.host.isSecondary() && !this.config.options.secondaryReadAllowed) return false;
+            if (!connection.host.isReadable()) return false;
+        }
+
+        return true;
+    }
+
     /**
      * Returns an existing or new connection, that needs to be released once done using it.
      */
-    async getConnection(request: ConnectionRequest = {}): Promise<MongoConnection> {
+    async getConnection(request: Partial<ConnectionRequest> = {}): Promise<MongoConnection> {
+        const r = Object.assign({ readonly: false, nearest: false }, request) as ConnectionRequest;
+
         await this.ensureHostsConnected(true);
 
         for (const connection of this.connections) {
             if (!connection.isConnected()) continue;
             if (connection.reserved) continue;
 
-            if (request.nearest) throw new Error('Nearest not implemented yet');
+            if (request.nearest) throw new MongoConnectionError('Nearest not implemented yet');
 
-            if (request.writable && !connection.host.isWritable()) continue;
+            if (!this.matchRequest(connection, r)) continue;
 
-            if (!request.writable) {
-                if (connection.host.isSecondary() && !this.config.options.secondaryReadAllowed) continue;
-                if (!connection.host.isReadable()) continue;
-            }
-
+            this.stats.connectionsReused++;
             connection.reserved = true;
             if (connection.cleanupTimeout) {
                 clearTimeout(connection.cleanupTimeout);
@@ -172,14 +223,15 @@ export class MongoConnectionPool {
             return connection;
         }
 
-        if (this.connections.length <= this.config.options.maxPoolSize) {
-            const connection = await this.createAdditionalConnectionForRequest(request);
+        if (this.connections.length < this.config.options.maxPoolSize) {
+            const connection = this.createAdditionalConnectionForRequest(r);
             connection.reserved = true;
             return connection;
         }
 
         return asyncOperation((resolve) => {
-            this.queue.push(resolve);
+            this.stats.connectionsQueued++;
+            this.queue.push({ resolve, request: r });
         });
     }
 }
@@ -187,7 +239,6 @@ export class MongoConnectionPool {
 export function readUint32LE(buffer: Uint8Array | ArrayBuffer, offset: number = 0): number {
     return buffer[offset] + (buffer[offset + 1] * 2 ** 8) + (buffer[offset + 2] * 2 ** 16) + (buffer[offset + 3] * 2 ** 24);
 }
-
 
 export class MongoDatabaseTransaction extends DatabaseTransaction {
     static txnNumber: bigint = 0n;
@@ -197,7 +248,7 @@ export class MongoDatabaseTransaction extends DatabaseTransaction {
     txnNumber: bigint = 0n;
     started: boolean = false;
 
-    applyTransaction(cmd: any) {
+    applyTransaction(cmd: TransactionalMessage) {
         if (!this.lsid) return;
         cmd.lsid = this.lsid;
         cmd.txnNumber = this.txnNumber;
@@ -210,6 +261,7 @@ export class MongoDatabaseTransaction extends DatabaseTransaction {
 
     async begin() {
         if (!this.connection) return;
+        // see https://github.com/mongodb/specifications/blob/master/source/sessions/driver-sessions.rst
         this.lsid = { id: uuid() };
         this.txnNumber = MongoDatabaseTransaction.txnNumber++;
         // const res = await this.connection.execute(new StartSessionCommand());
@@ -218,7 +270,7 @@ export class MongoDatabaseTransaction extends DatabaseTransaction {
 
     async commit() {
         if (!this.connection) return;
-        if (this.ended) throw new Error('Transaction ended already');
+        if (this.ended) throw new MongoError('Transaction ended already');
 
         await this.connection.execute(new CommitTransactionCommand());
         this.ended = true;
@@ -227,7 +279,7 @@ export class MongoDatabaseTransaction extends DatabaseTransaction {
 
     async rollback() {
         if (!this.connection) return;
-        if (this.ended) throw new Error('Transaction ended already');
+        if (this.ended) throw new MongoError('Transaction ended already');
         if (!this.started) return;
 
         await this.connection.execute(new AbortTransactionCommand());
@@ -242,7 +294,7 @@ export class MongoConnection {
     public bufferSize: number = 2.5 * 1024 * 1024;
 
     public connectingPromise?: Promise<void>;
-    public lastCommand?: { command: Command, promise?: Promise<any> };
+    public lastCommand?: { command: Command<unknown>, promise?: Promise<any> };
 
     public activeCommands: number = 0;
     public executedCommands: number = 0;
@@ -255,6 +307,10 @@ export class MongoConnection {
     public transaction?: MongoDatabaseTransaction;
 
     responseParser: ResponseParser;
+    error?: Error;
+
+    bytesReceived: number = 0;
+    bytesSent: number = 0;
 
     protected boundSendMessage = this.sendMessage.bind(this);
 
@@ -265,15 +321,17 @@ export class MongoConnection {
         protected serializer: BSONBinarySerializer,
         protected onClose: (connection: MongoConnection) => void,
         protected onRelease: (connection: MongoConnection) => void,
+        protected onSent: (bytes: number) => void,
+        protected onReceived: (bytes: number) => void,
     ) {
-        const responseParser = this.responseParser = new ResponseParser(this.onResponse.bind(this));
+        this.responseParser = new ResponseParser(this.onResponse.bind(this));
 
         if (this.config.options.ssl === true) {
             const options: { [name: string]: any } = {
                 host: host.hostname,
                 port: host.port,
                 timeout: config.options.connectTimeoutMS,
-                servername: host.hostname
+                servername: host.hostname,
             };
             const optional = {
                 ca: config.options.tlsCAFile,
@@ -290,15 +348,23 @@ export class MongoConnection {
             }
 
             this.socket = createTLSConnection(options);
-            this.socket.on('data', (data) => this.responseParser.feed(data));
+            this.socket.on('data', (data) => {
+                this.bytesReceived += data.byteLength;
+                this.onReceived(data.byteLength);
+                this.responseParser.feed(data);
+            });
         } else {
             this.socket = createConnection({
                 host: host.hostname,
                 port: host.port,
-                timeout: config.options.connectTimeoutMS
+                timeout: config.options.connectTimeoutMS,
             });
 
-            this.socket.on('data', (data) => this.responseParser.feed(data));
+            this.socket.on('data', (data) => {
+                this.bytesReceived += data.byteLength;
+                this.onReceived(data.byteLength);
+                this.responseParser.feed(data);
+            });
 
             // const socket = this.socket = turbo.connect(host.port, host.hostname);
             // // this.socket.setNoDelay(true);
@@ -323,8 +389,10 @@ export class MongoConnection {
         });
 
         //important to catch it, so it doesn't bubble up
-        this.connect().catch(() => {
+        this.connect().catch((error) => {
+            this.error = error;
             this.socket.end();
+            onClose(this);
         });
     }
 
@@ -360,7 +428,7 @@ export class MongoConnection {
         // const offset = 16 + 4 + 8 + 4 + 4; //QUERY_REPLY
         const message = response.slice(offset, size);
 
-        if (!this.lastCommand) throw new Error(`Got a server response without active command`);
+        if (!this.lastCommand) throw new MongoError(`Got a server response without active command`);
 
         this.lastCommand.command.handleResponse(message);
     }
@@ -370,9 +438,9 @@ export class MongoConnection {
      * A promises is return that is resolved with the  when executed successfully, or rejected
      * when timed out, parser error, or any other error.
      */
-    public async execute<T extends Command>(command: T): Promise<ReturnType<T['execute']>> {
+    public async execute<T extends Command<unknown>>(command: T): Promise<ReturnType<T['execute']>> {
         if (this.status === MongoConnectionStatus.pending) await this.connect();
-        if (this.status === MongoConnectionStatus.disconnected) throw new Error('Disconnected');
+        if (this.status === MongoConnectionStatus.disconnected) throw new MongoError('Disconnected');
 
         if (this.lastCommand && this.lastCommand.promise) {
             await this.lastCommand.promise;
@@ -429,6 +497,8 @@ export class MongoConnection {
             writer.writeInt32(messageLength);
 
             //detect backPressure
+            this.bytesSent += buffer.byteLength;
+            this.onSent(buffer.byteLength);
             this.socket.write(buffer);
         } catch (error) {
             console.log('failed sending message', message, 'for type', stringifyType(type));
@@ -437,7 +507,7 @@ export class MongoConnection {
     }
 
     async connect(): Promise<void> {
-        if (this.status === MongoConnectionStatus.disconnected) throw new Error('Connection disconnected');
+        if (this.status === MongoConnectionStatus.disconnected) throw new MongoError('Connection disconnected');
         if (this.status !== MongoConnectionStatus.pending) return;
 
         this.status = MongoConnectionStatus.connecting;
@@ -446,7 +516,7 @@ export class MongoConnection {
             this.socket.on('error', (error) => {
                 this.connectingPromise = undefined;
                 this.status = MongoConnectionStatus.disconnected;
-                reject(error);
+                reject(new MongoConnectionError(formatError(error.message), { cause: error }));
             });
 
             if (this.socket.destroyed) {
@@ -463,7 +533,7 @@ export class MongoConnection {
             } else {
                 this.status = MongoConnectionStatus.disconnected;
                 this.connectingPromise = undefined;
-                reject(new MongoError('Could not complete handshake 🤷‍️'));
+                reject(new MongoError('Connection error: Could not complete handshake 🤷‍️'));
             }
         });
 
@@ -476,7 +546,7 @@ export class ResponseParser {
     protected currentMessageSize: number = 0;
 
     constructor(
-        protected readonly onMessage: (response: Uint8Array) => void
+        protected readonly onMessage: (response: Uint8Array) => void,
     ) {
     }
 
@@ -536,7 +606,7 @@ export class ResponseParser {
                 }
 
                 const nextCurrentSize = readUint32LE(currentBuffer);
-                if (nextCurrentSize <= 0) throw new Error('message size wrong');
+                if (nextCurrentSize <= 0) throw new MongoError('message size wrong');
                 currentSize = nextCurrentSize;
                 //buffer and size has been set. consume this message in the next loop iteration
             }

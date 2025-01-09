@@ -9,11 +9,11 @@
  */
 
 import { IncomingMessage, OutgoingHttpHeader, OutgoingHttpHeaders, ServerResponse } from 'http';
-import { UploadedFile } from './router';
+import { UploadedFile } from './router.js';
 import * as querystring from 'querystring';
 import { Writable } from 'stream';
-import { metaAnnotation, ReflectionKind, Type, ValidationErrorItem } from '@deepkit/type';
-import { isArray } from '@deepkit/core';
+import { metaAnnotation, ReflectionKind, Type, TypeAnnotation, ValidationErrorItem } from '@deepkit/type';
+import { asyncOperation, isArray } from '@deepkit/core';
 
 export class HttpResponse extends ServerResponse {
     status(code: number) {
@@ -22,8 +22,65 @@ export class HttpResponse extends ServerResponse {
     }
 }
 
+/**
+ * Reads the body of the request and returns it as a Buffer.
+ * The result will be cached in the request object as `request.body`.
+ *
+ * Deepkit's router will automatically use `request.body` if available.
+ */
+export function readBody(request: IncomingMessage): Promise<Buffer> {
+    return asyncOperation((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        request.on('data', (chunk: Buffer) => {
+            chunks.push(chunk);
+        });
+        request.on('end', () => {
+            const body = Buffer.concat(chunks);
+            //the router uses this now instead of trying to read the body again
+            (request as HttpRequest).body = body;
+            resolve(body);
+        });
+        request.on('error', (error: Error) => {
+            reject(error);
+        });
+    });
+}
+
+export function createRequestWithCachedBody(request: Partial<IncomingMessage>, body: Buffer): HttpRequest {
+    const headers = request.headers;
+    const method = request.method;
+    const url = request.url;
+
+    const writable = new Writable({
+        write(chunk, encoding, callback) {
+            callback();
+        },
+        writev(chunks, callback) {
+            callback();
+        }
+    });
+    return new (class extends HttpRequest {
+        url = url;
+        method = method;
+        position = 0;
+
+        headers = headers as any;
+
+        _read(size: number) {
+            if (this.complete) {
+                this.push(null);
+            } else {
+                //in Node 18 this seems to be necessary to not trigger the abort event
+                this.complete = true;
+                this.push(body);
+            }
+        }
+    })(writable as any);
+}
+
 export type HttpRequestQuery = { [name: string]: string };
 export type HttpRequestResolvedParameters = { [name: string]: any };
+export type HttpRequestPositionedParameters = { arguments: any[], parameters: HttpRequestResolvedParameters };
 
 export class BodyValidationError {
     constructor(
@@ -46,7 +103,7 @@ export class BodyValidationError {
     }
 
     getErrorMessageForPath(path: string): string {
-        return this.getErrorsForPath(path).map(v => v.message).join(', ');
+        return this.getErrorsForPath(path).map(v => v.toString()).join(', ');
     }
 }
 
@@ -59,10 +116,151 @@ export class ValidatedBody<T> {
     }
 }
 
-export type HttpBody<T> = T & { __meta?: ['httpBody'] };
-export type HttpBodyValidation<T> = ValidatedBody<T> & { __meta?: ['httpBodyValidation'] };
-export type HttpQuery<T, Options extends { name?: string } = {}> = T & { __meta?: ['httpQuery', Options] };
-export type HttpQueries<T, Options extends { name?: string } = {}> = T & { __meta?: ['httpQueries', Options] };
+/**
+ * Marks a parameter as HTTP body and reads the value from the request body.
+ *
+ * @example
+ * ```typescript
+ * class Controller {
+ *   @http.GET('/api')
+ *   route(body: HttpBody<{username: string}>) {
+ *     //body is {username: string} and required
+ *     //could also reference an interface or type alias via `HttpBody<MyInterface>`
+ *   }
+ * }
+ *
+ * // curl /api -d '{"username":"Peter"}'
+ */
+export type HttpBody<T> = T & TypeAnnotation<'httpBody'>;
+export type HttpBodyValidation<T> = ValidatedBody<T> & TypeAnnotation<'httpBodyValidation'>;
+
+export interface HttpRequestParserOptions {
+    withPath?: boolean;
+    withBody?: boolean;
+    withQuery?: boolean;
+    withHeader?: boolean;
+}
+
+/**
+ * Delays the parsing of the path/body/query/header to the very last moment, when the parameter is actually used.
+ *
+ * If no options are provided, the parser will receive data from path, header, body, and query, in this order.
+ * This basically allows to fetch data from all possible HTTP sources in one go.
+ *
+ * You can disable various sources by providing the options, e.g. `{withBody: false}` to disable body parsing.
+ * Or `{withQuery: false}` to disable query parsing. Or `{withHeader: false}` to disable header parsing.
+ * To only parse the body, use `{withQuery: false, withHeader: false}`.
+ *
+ * @example
+ * ```typescript
+ * async route(parser: HttpRequestParser<{authorization: string}>) {
+ *    const data = await parser();
+ *    console.log(data.authorization);
+ * }
+ * ```
+ *
+ * Note that the parsers is based on all defined parameters (e.g. `userId: HttpQuery<string>` => {userId: string}),
+ * and then starts from there applying header, body, and then query values.
+ * This means you also get access to defined path parameters, like:
+ *
+ * ```typescript
+ * @http.GET('teams/:teamId')
+ * async route(teamId: string) {
+ *    //teamId is string
+ * }
+ *
+ * httpWorkflow.onController.listen((event, parser: HttpRequestParser<{teamId: string}>) => {
+ *  const data = await parser();
+ *  console.log(data.teamId);
+ * });
+ * ```
+ *
+ * HttpRequestParser is necessary in event listeners, since they are instantiated synchronously,
+ * but body is parsed asynchronously. So use in event listeners HttpRequestParser instead of HttpBody.
+ */
+export type HttpRequestParser<T> = ((options?: HttpRequestParserOptions) => Promise<T>) & TypeAnnotation<'httpRequestParser', T>;
+
+/**
+ * Marks a parameter as HTTP path and reads the value from the request path.
+ * This is normally not requires since the parameter name automatically maps to the path parameter,
+ * but in case of requesting the path parameter in for example listeners, this is required.
+ * The name option can be used to change the parameter name.
+ *
+ * @example
+ * ```typescript
+ * app.listen(httpWorkflow.onController, (event, request: HttpRequest, groupId: HttpPath<number>) => {
+ *   console.log(groupId); //123
+ * });
+ *
+ * class Controller {
+ *   @http.GET('/api/:groupId')
+ *   route(groupId: number) {
+ *     //groupId is number and required
+ *     //same as `groupId: HttpPath<number>`
+ *   }
+ * }
+ * ```
+ */
+export type HttpPath<T, Options extends { name?: string } = {}> = T & TypeAnnotation<'httpPath', Options>;
+
+/**
+ * Marks a parameter as HTTP header and reads the value from the request header.
+ *
+ * @example
+ * ```typescript
+ * class Controller {
+ *    @http.GET('/api')
+ *    route(authorization: HttpHeader<string>) {
+ *         //authorization is string and required
+ *         //use `authorization?: HttpHeader<string>` to make it optional
+ *    }
+ * }
+ *
+ * // curl /api -H 'Authorization: 123'
+ * ```
+ *
+ * To change the header name, use `param: HttpHeader<string, {name: 'X-My-Header'}>`.
+ */
+export type HttpHeader<T, Options extends { name?: string } = {}> = T & TypeAnnotation<'httpHeader', Options>;
+
+/**
+ * Marks a parameter as HTTP query and reads the value from the request query string.
+ *
+ * @example
+ * ```typescript
+ * class Controller {
+ *   @http.GET('/api')
+ *   route(limit: HttpQuery<number>) {
+ *      //limit is number and required
+ *      //use `limit?: HttpQuery<number>` to make it optional
+ *   }
+ * }
+ *
+ * // curl /api?limit=10
+ * ```
+ */
+export type HttpQuery<T, Options extends { name?: string } = {}> = T & TypeAnnotation<'httpQuery', Options>;
+
+/**
+ * Marks a parameter as HTTP query objects and reads multiple values from the request query string into an object.
+ *
+ * @example
+ * ```typescript
+ * interface Query {
+ *    limit?: number;
+ *    offset?: number;
+ *    sort?: 'asc' | 'desc';
+ * }
+ *
+ * class Controller {
+ *  @http.GET('/api')
+ *  route(query: HttpQueries<Query>) {
+ *    //query is an object containing limit, offset, and sort
+ * }
+ *
+ * // curl /api?limit=10&offset=20&sort=asc
+ */
+export type HttpQueries<T, Options extends { name?: string } = {}> = T & TypeAnnotation<'httpQueries', Options>;
 
 /**
  * For all parameters used in the URL path, a regular expression of /[^/]+/ is used. To change that, use getRegExp.
@@ -78,13 +276,14 @@ export type HttpQueries<T, Options extends { name?: string } = {}> = T & { __met
  * }
  * ```
  */
-export type HttpRegExp<T, Pattern extends string> = T & { __meta?: ['httpRegExp', Pattern] };
+export type HttpRegExp<T, Pattern extends string | RegExp> = T & { __meta?: never & ['httpRegExp', Pattern] };
 
-export function getRegExp(type: Type): string | undefined {
+export function getRegExp(type: Type): string | RegExp | undefined {
     const options = metaAnnotation.getForName(type, 'httpRegExp');
     if (!options || !options[0]) return;
-    if (options[0].kind !== ReflectionKind.literal || 'string' !== typeof options[0].literal) return;
-    return options[0].literal;
+    if (options[0].kind === ReflectionKind.literal && 'string' === typeof options[0].literal) return options[0].literal;
+    if (options[0].kind === ReflectionKind.literal && options[0].literal instanceof RegExp) return options[0].literal;
+    return;
 }
 
 export class RequestBuilder {
@@ -106,40 +305,11 @@ export class RequestBuilder {
     }
 
     build(): HttpRequest {
-        const headers = this._headers;
-        const method = this.method;
-        const url = this.getUrl();
-        const bodyContent = this.contentBuffer;
-
-        const writable = new Writable({
-            write(chunk, encoding, callback) {
-                -
-                    callback();
-            },
-            writev(chunks, callback) {
-                callback();
-            }
-        });
-        const request = new (class extends HttpRequest {
-            url = url;
-            method = method;
-            position = 0;
-
-            headers = headers;
-
-            done = false;
-
-            _read(size: number) {
-                if (!this.done) {
-                    this.push(bodyContent);
-                    process.nextTick(() => {
-                        this.emit('end');
-                    });
-                    this.done = true;
-                }
-            }
-        })(writable as any);
-        return request;
+        return createRequestWithCachedBody({
+            method: this.method,
+            url: this.getUrl(),
+            headers: this._headers,
+        }, this.contentBuffer);
     }
 
     headers(headers: { [name: string]: string }): this {
@@ -159,6 +329,32 @@ export class RequestBuilder {
         return this;
     }
 
+    multiPart(items: { name: string, file?: Uint8Array, fileName?: string, json?: any }[]): this {
+        const boundary = '--------------------------' + Math.random().toString(36).substr(2, 10);
+        this._headers['content-type'] = 'multipart/form-data; boundary=' + boundary;
+        const parts = items.map(item => {
+            if (item.file) {
+                const header = Buffer.from(`--${boundary}\r
+Content-Disposition: form-data; name="${item.name}"; filename="${item.fileName || 'file'}"\r
+Content-Type: application/octet-stream\r
+\r\n`, 'utf8');
+                return Buffer.concat([header, item.file, Buffer.from('\r\n', 'utf8')]);
+            } else if (item.json) {
+                const header = Buffer.from(`--${boundary}\r
+Content-Disposition: form-data; name="${item.name}"\r
+Content-Type: application/json\r
+\r\n`, 'utf8');
+                return Buffer.concat([header, Buffer.from(JSON.stringify(item.json) + '\r\n', 'utf8')]);
+            } else {
+                throw new Error('Invalid multiPart item');
+            }
+        });
+        parts.push(Buffer.from(`--${boundary}--`, 'utf8'));
+        this.contentBuffer = Buffer.concat(parts);
+        this._headers['content-length'] = String(this.contentBuffer.byteLength);
+        return this;
+    }
+
     body(body: string | Buffer): this {
         if ('string' === typeof body) {
             this.contentBuffer = Buffer.from(body, 'utf8');
@@ -169,8 +365,12 @@ export class RequestBuilder {
         return this;
     }
 
-    query(query: any): this {
-        this.queryPath = querystring.stringify(query);
+    query(query: any | string): this {
+        if ('string' === typeof query) {
+            this.queryPath = query;
+        } else {
+            this.queryPath = querystring.stringify(query);
+        }
         return this;
     }
 }
@@ -184,10 +384,18 @@ export class HttpRequest extends IncomingMessage {
     public uploadedFiles: { [name: string]: UploadedFile } = {};
 
     /**
-     * Cache of parsed fields. If middleware prior to Deepkit populates this,
-     * Deepkit will re-use it.
+     * The router sets the body when it was read.
      */
-    public body?: { [name: string]: any };
+    public body?: Buffer;
+
+    async readBody(): Promise<Buffer> {
+        if (this.body) return this.body;
+        return await readBody(this);
+    }
+
+    async readBodyText(): Promise<string> {
+        return (await this.readBody()).toString('utf8');
+    }
 
     static GET(path: string): RequestBuilder {
         return new RequestBuilder(path);
@@ -236,11 +444,12 @@ export class HttpRequest extends IncomingMessage {
 
 export class MemoryHttpResponse extends HttpResponse {
     public body: Buffer = Buffer.alloc(0);
-    public headers: {[name: string]: number | string | string[] | undefined} = Object.create(null);
+    public headers: { [name: string]: number | string | string[] | undefined } = Object.create(null);
 
-    setHeader(name: string, value: number | string | ReadonlyArray<string>) {
+    setHeader(name: string, value: number | string | ReadonlyArray<string>): this {
         this.headers[name] = value as any;
         super.setHeader(name, value);
+        return this;
     }
 
     removeHeader(name: string) {
@@ -271,6 +480,10 @@ export class MemoryHttpResponse extends HttpResponse {
         } catch (error: any) {
             throw new Error(`Could not parse JSON: ${error.message}, body: ${json}`);
         }
+    }
+
+    get text(): string {
+        return this.bodyString;
     }
 
     get bodyString(): string {
@@ -314,6 +527,9 @@ export class MemoryHttpResponse extends HttpResponse {
             }
             this.body = Buffer.concat([this.body, chunk]);
         }
-        return super.end(chunk, encoding, callback);
+        this.emit('finish');
+        super.end(chunk, encoding, callback);
+        this.emit('close');
+        return this;
     }
 }

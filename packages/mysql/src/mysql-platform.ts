@@ -9,14 +9,43 @@
  */
 
 import { Pool } from 'mariadb';
-import { mySqlSerializer } from './mysql-serializer';
-import { isUUIDType, ReflectionKind, ReflectionProperty, Serializer, TypeNumberBrand } from '@deepkit/type';
-import { Column, DefaultPlatform, isSet } from '@deepkit/sql';
-import { MysqlSchemaParser } from './mysql-schema-parser';
+import { mySqlSerializer } from './mysql-serializer.js';
+import {
+    isAutoIncrementType,
+    isReferenceType,
+    isUUIDType,
+    ReflectionClass,
+    ReflectionKind,
+    ReflectionProperty,
+    Serializer,
+    Type,
+    TypeNumberBrand,
+} from '@deepkit/type';
+import {
+    Column,
+    DefaultPlatform,
+    IndexModel,
+    isSet,
+    noopSqlTypeCaster,
+    PreparedAdapter,
+    typeResolvesToBigInt,
+    typeResolvesToBoolean,
+    typeResolvesToDate,
+    typeResolvesToInteger,
+    typeResolvesToNumber,
+    typeResolvesToString,
+} from '@deepkit/sql';
+import { MysqlSchemaParser } from './mysql-schema-parser.js';
+import { MySQLSQLFilterBuilder } from './filter-builder.js';
+
+export function mysqlJsonTypeCaster(placeholder: string): string {
+    return `CAST(${placeholder} AS JSON)`;
+}
 
 export class MySQLPlatform extends DefaultPlatform {
     protected override defaultSqlType = 'longtext';
-    protected override annotationId = 'mysql';
+    public override annotationId = 'mysql';
+
     protected override defaultNowExpression = 'now()';
     override schemaParserType = MysqlSchemaParser;
 
@@ -29,19 +58,17 @@ export class MySQLPlatform extends DefaultPlatform {
         this.nativeTypeInformation.set('longtext', { needsIndexPrefix: true, defaultIndexSize: 767 });
         this.nativeTypeInformation.set('longblob', { needsIndexPrefix: true, defaultIndexSize: 767 });
 
-        this.addType(ReflectionKind.class, 'json');
-        this.addType(ReflectionKind.objectLiteral, 'json');
-        this.addType(ReflectionKind.array, 'json');
-        this.addType(ReflectionKind.union, 'json');
+        this.addType(() => true, 'json');
 
-        this.addType(v => v.kind === ReflectionKind.enum && v.indexType.kind === ReflectionKind.number, 'integer');
+        this.addType(typeResolvesToNumber, 'double');
+        this.addType(isAutoIncrementType, 'int');
+        this.addType(typeResolvesToInteger, 'integer');
+        this.addType(typeResolvesToBigInt, 'bigint');
+        this.addType(typeResolvesToBoolean, 'tinyint', 1);
+        this.addType(typeResolvesToString, 'longtext');
+
         this.addType(v => v.kind === ReflectionKind.enum && v.indexType.kind === ReflectionKind.string, 'VARCHAR', 255);
-        this.addType(v => v.kind === ReflectionKind.enum && v.indexType.kind === ReflectionKind.union, 'json');
 
-        this.addType(v => v.kind === ReflectionKind.any, 'json');
-
-        this.addType(ReflectionKind.number, 'double');
-        this.addType(ReflectionKind.bigint, 'bigint');
         this.addType(type => type.kind === ReflectionKind.number && type.brand === TypeNumberBrand.integer, 'int');
         this.addType(type => type.kind === ReflectionKind.number && type.brand === TypeNumberBrand.int8, 'tinyint');
         this.addType(type => type.kind === ReflectionKind.number && type.brand === TypeNumberBrand.uint8, 'tinyint', undefined, undefined, true);
@@ -53,11 +80,33 @@ export class MySQLPlatform extends DefaultPlatform {
         this.addType(type => type.kind === ReflectionKind.number && type.brand === TypeNumberBrand.float64, 'double');
         this.addType(type => type.kind === ReflectionKind.number && type.brand === TypeNumberBrand.float, 'double');
 
-        this.addType(type => type.kind === ReflectionKind.class && type.classType === Date, 'datetime');
-        this.addType(ReflectionKind.boolean, 'tinyint', 1);
+        this.addType(typeResolvesToDate, 'datetime');
         this.addType(isUUIDType, 'binary', 16);
 
         this.addBinaryType('longblob');
+    }
+
+    override createSqlFilterBuilder(adapter: PreparedAdapter, schema: ReflectionClass<any>, tableName: string): MySQLSQLFilterBuilder {
+        return new MySQLSQLFilterBuilder(adapter, schema, tableName, this.serializer, new this.placeholderStrategy);
+    }
+
+    override getSqlTypeCaster(type: Type): (placeholder: string) => string {
+        if (isReferenceType(type)) {
+            type = ReflectionClass.from(type).getPrimary().type;
+        }
+        if (this.isJson(type)) return mysqlJsonTypeCaster;
+        return noopSqlTypeCaster;
+    }
+
+    supportsSelectFor(): boolean {
+        return true;
+    }
+
+    /**
+     * MySQL can compare SQL values with JSON values directly.
+     */
+    deepColumnAccessorRequiresJsonString(): boolean {
+        return false;
     }
 
     protected setColumnType(column: Column, typeProperty: ReflectionProperty) {
@@ -71,6 +120,10 @@ export class MySQLPlatform extends DefaultPlatform {
                 column.defaultExpression = undefined;
             }
         }
+    }
+
+    getDropIndexDDL(index: IndexModel): string {
+        return `DROP INDEX ${this.getIdentifier(index)} ON ${this.getIdentifier(index.table)}`;
     }
 
     getColumnDDL(column: Column) {

@@ -8,14 +8,14 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { ConnectionRequest, MongoConnection, MongoConnectionPool, MongoDatabaseTransaction } from './connection';
-import { isErrorRetryableRead, isErrorRetryableWrite, MongoError } from './error';
+import { ConnectionRequest, MongoConnection, MongoConnectionPool, MongoDatabaseTransaction, MongoStats } from './connection.js';
+import { isErrorRetryableRead, isErrorRetryableWrite, MongoError } from './error.js';
 import { sleep } from '@deepkit/core';
-import { Command } from './command/command';
-import { DropDatabaseCommand } from './command/dropDatabase';
-import { MongoClientConfig } from './config';
+import { Command } from './command/command.js';
+import { DropDatabaseCommand } from './command/dropDatabase.js';
+import { MongoClientConfig } from './config.js';
 import { ReflectionClass } from '@deepkit/type';
-import { mongoBinarySerializer } from '../mongo-serializer';
+import { mongoBinarySerializer } from '../mongo-serializer.js';
 import { BSONBinarySerializer } from '@deepkit/bson';
 
 export class MongoClient {
@@ -23,6 +23,7 @@ export class MongoClient {
 
     public readonly config: MongoClientConfig;
     public connectionPool: MongoConnectionPool;
+    public stats: MongoStats = new MongoStats;
 
     protected serializer: BSONBinarySerializer = mongoBinarySerializer;
 
@@ -30,7 +31,7 @@ export class MongoClient {
         connectionString: string
     ) {
         this.config = new MongoClientConfig(connectionString);
-        this.connectionPool = new MongoConnectionPool(this.config, this.serializer);
+        this.connectionPool = new MongoConnectionPool(this.config, this.serializer, this.stats);
     }
 
     public resolveCollectionName(schema: ReflectionClass<any>): string {
@@ -53,7 +54,7 @@ export class MongoClient {
     /**
      * Returns an existing or new connection, that needs to be released once done using it.
      */
-    async getConnection(request: ConnectionRequest = {}, transaction?: MongoDatabaseTransaction): Promise<MongoConnection> {
+    async getConnection(request: Partial<ConnectionRequest> = {}, transaction?: MongoDatabaseTransaction): Promise<MongoConnection> {
         if (transaction && transaction.connection) return transaction.connection;
         const connection = await this.connectionPool.getConnection(request);
         if (transaction) {
@@ -70,9 +71,9 @@ export class MongoClient {
         return connection;
     }
 
-    public async execute<T extends Command>(command: T): Promise<ReturnType<T['execute']>> {
+    public async execute<T extends Command<unknown>>(command: T): Promise<ReturnType<T['execute']>> {
         const maxRetries = 10;
-        const request = { writable: command.needsWritableHost() };
+        const request = { readonly: !command.needsWritableHost() };
 
         for (let i = 1; i <= maxRetries; i++) {
             const connection = await this.connectionPool.getConnection(request);

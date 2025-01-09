@@ -27,8 +27,8 @@ import {
     Type,
     UnionToIntersection
 } from '@deepkit/type';
-import { RouteParameterResolver } from './router';
-import { httpMiddleware, HttpMiddleware, HttpMiddlewareConfig, HttpMiddlewareFn } from './middleware';
+import { RouteParameterResolver } from './router.js';
+import { httpMiddleware, HttpMiddleware, HttpMiddlewareConfig, HttpMiddlewareFn } from './middleware.js';
 
 type HttpActionMiddleware = (() => HttpMiddlewareConfig) | ClassType<HttpMiddleware> | HttpMiddlewareFn;
 
@@ -46,6 +46,8 @@ export class HttpController {
     resolverForToken: Map<any, ClassType> = new Map();
     resolverForParameterName: Map<string, ClassType> = new Map();
 
+    private actionsProcessed = new Set<HttpAction>();
+
     getUrl(action: HttpAction): string {
         return urlJoin('/', this.baseUrl, action.path);
     }
@@ -55,9 +57,13 @@ export class HttpController {
     }
 
     getActions(): Set<HttpAction> {
-        for (const a of this.actions) {
-            for (const g of this.groups) {
-                if (!a.groups.includes(g)) a.groups.push(g);
+        for (const action of this.actions) {
+            if (!this.actionsProcessed.has(action)) {
+                action.groups = [
+                    ...this.groups,
+                    ...action.groups.filter((g) => !this.groups.includes(g)),
+                ];
+                this.actionsProcessed.add(action);
             }
         }
 
@@ -65,7 +71,9 @@ export class HttpController {
     }
 
     removeAction(methodName: string): void {
-        this.actions.delete(this.getAction(methodName));
+        const action = this.getAction(methodName);
+        this.actions.delete(action);
+        this.actionsProcessed.delete(action);
     }
 
     getAction(methodName: string): HttpAction {
@@ -183,6 +191,22 @@ export class HttpControllerDecorator {
 }
 
 export const httpClass: ClassDecoratorResult<typeof HttpControllerDecorator> = createClassDecoratorContext(HttpControllerDecorator);
+
+export function getActions(target: ClassType): HttpAction[] {
+    const parent = Object.getPrototypeOf(target);
+    const results: HttpAction[] = parent ? getActions(parent) : [];
+
+    const config = httpClass._fetch(target);
+    if (config) {
+        for (const action of config.getActions()) {
+            const existing = results.findIndex(v => v.methodName === action.methodName);
+            if (existing !== -1) results.splice(existing, 1);
+            results.push(action);
+        }
+    }
+
+    return results;
+}
 
 export class HttpActionDecorator {
     t = new HttpAction;
@@ -388,9 +412,11 @@ export class HttpActionDecorator {
 type HttpActionFluidDecorator<T, D extends Function> = {
     [name in keyof T]: name extends 'response' ? <T2>(statusCode: number, description?: string, type?: ReceiveType<T2>) => D & HttpActionFluidDecorator<T, D>
         : T[name] extends (...args: infer K) => any ? (...args: K) => D & HttpActionFluidDecorator<T, D>
-        : D & HttpActionFluidDecorator<T, D> & { _data: ExtractApiDataType<T> };
+            : D & HttpActionFluidDecorator<T, D> & { _data: ExtractApiDataType<T> };
 };
-type HttpActionPropertyDecoratorResult = HttpActionFluidDecorator<ExtractClass<typeof HttpActionDecorator>, PropertyDecoratorFn> & DecoratorAndFetchSignature<typeof HttpActionDecorator, PropertyDecoratorFn>;
+type HttpActionPropertyDecoratorResult =
+    HttpActionFluidDecorator<ExtractClass<typeof HttpActionDecorator>, PropertyDecoratorFn>
+    & DecoratorAndFetchSignature<typeof HttpActionDecorator, PropertyDecoratorFn>;
 
 export const httpAction: HttpActionPropertyDecoratorResult = createPropertyDecoratorContext(HttpActionDecorator);
 

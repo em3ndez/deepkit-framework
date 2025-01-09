@@ -1,7 +1,7 @@
 import { ClassType, isClass } from '@deepkit/core';
 import { AppModule } from '@deepkit/app';
 import { createFreeDecoratorContext } from '@deepkit/type';
-import { HttpRequest, HttpResponse } from './model';
+import { HttpRequest, HttpResponse } from './model.js';
 import { InjectorModule } from '@deepkit/injector';
 
 export type HttpMiddlewareFn = (req: HttpRequest, res: HttpResponse, next: (err?: any) => void) => void | Promise<void>;
@@ -35,7 +35,7 @@ export class HttpMiddlewareConfig {
     routeNames: string[] = [];
     excludeRouteNames: string[] = [];
 
-    timeout: number = 4_000;
+    timeout?: number;
 
     modules: InjectorModule<any>[] = [];
 

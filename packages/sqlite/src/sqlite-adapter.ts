@@ -10,18 +10,27 @@
 
 import { AbstractClassType, asyncOperation, ClassType, empty } from '@deepkit/core';
 import {
-    DatabaseAdapter,
+    DatabaseDeleteError,
+    DatabaseError,
     DatabaseLogger,
+    DatabasePatchError,
     DatabasePersistenceChangeSet,
     DatabaseSession,
     DatabaseTransaction,
+    DatabaseUpdateError,
     DeleteResult,
+    ensureDatabaseError,
     OrmEntity,
     PatchResult,
-    UniqueConstraintFailure
+    primaryKeyObjectConverter,
+    UniqueConstraintFailure,
 } from '@deepkit/orm';
 import {
+    asAliasName,
     DefaultPlatform,
+    prepareBatchUpdate,
+    PreparedEntity,
+    splitDotPath,
     SqlBuilder,
     SQLConnection,
     SQLConnectionPool,
@@ -31,12 +40,37 @@ import {
     SQLPersistence,
     SQLQueryModel,
     SQLQueryResolver,
-    SQLStatement
+    SQLStatement,
 } from '@deepkit/sql';
-import { Changes, getPartialSerializeFunction, getSerializeFunction, ReceiveType, ReflectionClass, resolvePath } from '@deepkit/type';
+import {
+    Changes,
+    getPatchSerializeFunction,
+    getSerializeFunction,
+    ReceiveType,
+    ReflectionClass,
+    resolvePath,
+} from '@deepkit/type';
 import sqlite3 from 'better-sqlite3';
-import { SQLitePlatform } from './sqlite-platform';
+import { SQLitePlatform } from './sqlite-platform.js';
 import { FrameCategory, Stopwatch } from '@deepkit/stopwatch';
+
+/**
+ * Converts a specific database error to a more specific error, if possible.
+ */
+function handleSpecificError(session: DatabaseSession, error: DatabaseError): Error {
+    let cause: any = error;
+    while (cause) {
+        if (cause instanceof Error) {
+            if (cause.message.includes('UNIQUE constraint failed')
+            ) {
+                return new UniqueConstraintFailure(`${cause.message}`, { cause: error });
+            }
+            cause = cause.cause;
+        }
+    }
+
+    return error;
+}
 
 export class SQLiteStatement extends SQLStatement {
     constructor(protected logger: DatabaseLogger, protected sql: string, protected stmt: sqlite3.Statement, protected stopwatch?: Stopwatch) {
@@ -50,7 +84,8 @@ export class SQLiteStatement extends SQLStatement {
             const res = this.stmt.get(...params);
             this.logger.logQuery(this.sql, params);
             return res;
-        } catch (error) {
+        } catch (error: any) {
+            error = ensureDatabaseError(error);
             this.logger.failedQuery(error, this.sql, params);
             throw error;
         } finally {
@@ -65,7 +100,8 @@ export class SQLiteStatement extends SQLStatement {
             const res = this.stmt.all(...params);
             this.logger.logQuery(this.sql, params);
             return res;
-        } catch (error) {
+        } catch (error: any) {
+            error = ensureDatabaseError(error);
             this.logger.failedQuery(error, this.sql, params);
             throw error;
         } finally {
@@ -121,18 +157,17 @@ export class SQLiteConnection extends SQLConnection {
         super(connectionPool, logger, transaction, stopwatch);
         this.db = new SQLiteConnection.DatabaseConstructor(this.dbPath);
         this.db.exec('PRAGMA foreign_keys=ON');
+        this.db.function('regexp', { deterministic: true }, (regex, text) => {
+            const splitter = regex.indexOf('::');
+            if (splitter !== -1) {
+                return new RegExp(regex.substring(splitter + 2), regex.substring(0, splitter)).test(text) ? 1 : 0;
+            }
+            return new RegExp(regex).test(text) ? 1 : 0;
+        });
     }
 
     async prepare(sql: string) {
         return new SQLiteStatement(this.logger, sql, this.db.prepare(sql), this.stopwatch);
-    }
-
-    protected handleError(error: Error | string): void {
-        const message = 'string' === typeof error ? error : error.message;
-        if (message.includes('UNIQUE constraint failed')) {
-            //todo: extract table name, column name, and find ClassSchema
-            throw new UniqueConstraintFailure();
-        }
     }
 
     async run(sql: string, params: any[] = []) {
@@ -144,7 +179,7 @@ export class SQLiteConnection extends SQLConnection {
             const result = stmt.run(...params);
             this.changes = result.changes;
         } catch (error: any) {
-            this.handleError(error);
+            error = ensureDatabaseError(error);
             this.logger.failedQuery(error, sql, params);
             throw error;
         } finally {
@@ -159,7 +194,7 @@ export class SQLiteConnection extends SQLConnection {
             this.db.exec(sql);
             this.logger.logQuery(sql, []);
         } catch (error: any) {
-            this.handleError(error);
+            error = ensureDatabaseError(error);
             this.logger.failedQuery(error, sql, []);
             throw error;
         } finally {
@@ -180,8 +215,10 @@ export class SQLiteConnectionPool extends SQLConnectionPool {
     //we keep the first connection alive
     protected firstConnection?: SQLiteConnection;
 
-    constructor(protected dbPath: string) {
+    constructor(protected dbPath: string | ':memory:') {
         super();
+        //memory databases can not have more than one connection
+        if (dbPath === ':memory:') this.maxConnections = 1;
     }
 
     close() {
@@ -202,7 +239,7 @@ export class SQLiteConnectionPool extends SQLConnectionPool {
         }
 
         const connection = this.firstConnection && this.firstConnection.released ? this.firstConnection :
-            this.activeConnections > this.maxConnections
+            this.activeConnections >= this.maxConnections
                 //we wait for the next query to be released and reuse it
                 ? await asyncOperation<SQLiteConnection>((resolve) => {
                     this.queue.push(resolve);
@@ -256,6 +293,10 @@ export class SQLitePersistence extends SQLPersistence {
         super(platform, connectionPool, database);
     }
 
+    override handleSpecificError(error: Error): Error {
+        return handleSpecificError(this.session, error);
+    }
+
     protected getInsertSQL(classSchema: ReflectionClass<any>, fields: string[], values: string[]): string {
         if (fields.length === 0) {
             const pkName = this.platform.quoteIdentifier(classSchema.getPrimary().name);
@@ -266,138 +307,111 @@ export class SQLitePersistence extends SQLPersistence {
         return super.getInsertSQL(classSchema, fields, values);
     }
 
-    async batchUpdate<T extends OrmEntity>(classSchema: ReflectionClass<T>, changeSets: DatabasePersistenceChangeSet<T>[]): Promise<void> {
-        const partialSerialize = getPartialSerializeFunction(classSchema.type, this.platform.serializer.serializeRegistry);
-        const tableName = this.platform.getTableIdentifier(classSchema);
-        const pkName = classSchema.getPrimary().name;
-        const pkField = this.platform.quoteIdentifier(pkName);
+    async batchUpdate<T extends OrmEntity>(entity: PreparedEntity, changeSets: DatabasePersistenceChangeSet<T>[]): Promise<void> {
+        const prepared = prepareBatchUpdate(this.platform, entity, changeSets);
+        if (!prepared) return;
 
-        const values: { [name: string]: any[] } = {};
-        const setNames: string[] = [];
-        const aggregateSelects: { [name: string]: { id: any, sql: string }[] } = {};
-        const requiredFields: { [name: string]: 1 } = {};
-
-        const assignReturning: { [name: string]: { item: any, names: string[] } } = {};
-        const setReturning: { [name: string]: 1 } = {};
-
-        for (const changeSet of changeSets) {
-            const where: string[] = [];
-
-            const pk = partialSerialize(changeSet.primaryKey);
-            for (const i in pk) {
-                if (!pk.hasOwnProperty(i)) continue;
-                where.push(`${this.platform.quoteIdentifier(i)} = ${this.platform.quoteValue(pk[i])}`);
-                requiredFields[i] = 1;
-            }
-
-            if (!values[pkName]) values[pkName] = [];
-            values[pkName].push(this.platform.quoteValue(changeSet.primaryKey[pkName]));
-
-            const fieldAddedToValues: { [name: string]: 1 } = {};
-            const id = changeSet.primaryKey[pkName];
-
-            //todo: handle changes.$unset
-
-            if (changeSet.changes.$set) {
-                const value = partialSerialize(changeSet.changes.$set);
-                for (const i in value) {
-                    if (!value.hasOwnProperty(i)) continue;
-                    if (!values[i]) {
-                        values[i] = [];
-                        setNames.push(`${this.platform.quoteIdentifier(i)} = _b.${this.platform.quoteIdentifier(i)}`);
-                    }
-                    requiredFields[i] = 1;
-                    fieldAddedToValues[i] = 1;
-                    values[i].push(this.platform.quoteValue(value[i]));
-                }
-            }
-
-            if (changeSet.changes.$inc) {
-                for (const i in changeSet.changes.$inc) {
-                    if (!changeSet.changes.$inc.hasOwnProperty(i)) continue;
-                    const value = changeSet.changes.$inc[i];
-                    if (!aggregateSelects[i]) aggregateSelects[i] = [];
-
-                    if (!values[i]) {
-                        values[i] = [];
-                        setNames.push(`${this.platform.quoteIdentifier(i)} = _b.${this.platform.quoteIdentifier(i)}`);
-                    }
-
-                    if (!assignReturning[id]) {
-                        assignReturning[id] = { item: changeSet.item, names: [] };
-                    }
-
-                    assignReturning[id].names.push(i);
-                    setReturning[i] = 1;
-
-                    aggregateSelects[i].push({
-                        id: changeSet.primaryKey[pkName],
-                        sql: `_origin.${this.platform.quoteIdentifier(i)} + ${this.platform.quoteValue(value)}`
-                    });
-                    requiredFields[i] = 1;
-                    if (!fieldAddedToValues[i]) {
-                        fieldAddedToValues[i] = 1;
-                        values[i].push(this.platform.quoteValue(null));
-                    }
-                }
-            }
-        }
-
+        const placeholderStrategy = new this.platform.placeholderStrategy();
+        const params: any[] = [];
         const selects: string[] = [];
         const valuesValues: string[] = [];
+        const valuesSetValues: string[] = [];
         const valuesNames: string[] = [];
+        const valuesSetNames: string[] = [];
         const _rename: string[] = [];
+        const _renameSet: string[] = [];
 
         let j = 1;
-        for (const i in values) {
-            valuesNames.push(i);
-            _rename.push(`column${j++} as ${i}`);
+        const index = j++;
+        _renameSet.push(`column${index} as ${prepared.originPkField}`);
+        _rename.push(`column${index} as ${prepared.originPkField}`);
+        for (const fieldName of prepared.changedFields) {
+            const index = j++;
+            valuesNames.push(fieldName);
+            _rename.push(`column${index} as ${entity.fieldMap[fieldName].columnNameEscaped}`);
+            _renameSet.push(`column${index} as _changed_${fieldName}`);
+            valuesSetNames.push('_changed_' + fieldName);
         }
 
-        for (let i = 0; i < values[pkName].length; i++) {
-            valuesValues.push('(' + valuesNames.map(name => values[name][i]).join(',') + ')');
+        for (let i = 0; i < changeSets.length; i++) {
+            params.push(prepared.primaryKeys[i]);
+            let pkValue = placeholderStrategy.getPlaceholder();
+            valuesValues.push('(' + pkValue + ',' + valuesNames.map(name => {
+                params.push(prepared.values[name][i]);
+                return placeholderStrategy.getPlaceholder();
+            }).join(',') + ')');
         }
 
-        for (const i in requiredFields) {
-            if (aggregateSelects[i]) {
+        for (let i = 0; i < changeSets.length; i++) {
+            params.push(prepared.primaryKeys[i]);
+            let valuesSetValueSql = placeholderStrategy.getPlaceholder();
+            for (const fieldName of prepared.changedFields) {
+                valuesSetValueSql += ', ' + prepared.valuesSet[fieldName][i];
+            }
+            valuesSetValues.push('(' + valuesSetValueSql + ')');
+        }
+
+        for (const i of prepared.changedFields) {
+            const col = entity.fieldMap[i].columnNameEscaped;
+            const colChanged = this.platform.quoteIdentifier('_changed_' + i);
+            if (prepared.aggregateSelects[i]) {
                 const select: string[] = [];
                 select.push('CASE');
-                for (const item of aggregateSelects[i]) {
-                    select.push(`WHEN _.${pkField} = ${item.id} THEN ${item.sql}`);
+                for (const item of prepared.aggregateSelects[i]) {
+                    select.push(`WHEN _.${prepared.originPkField} = ${item.id} THEN ${item.sql}`);
                 }
-                select.push(`ELSE _.${this.platform.quoteIdentifier(i)} END as ${this.platform.quoteIdentifier(i)}`);
+
+                select.push(`ELSE IIF(_set.${colChanged} = 0, _origin.${col}, _.${col}) END as ${col}`);
                 selects.push(select.join(' '));
             } else {
-                selects.push('_.' + i);
+                selects.push(`IIF(_set.${colChanged} = 0, _origin.${col}, _.${col}) as ${col}`);
             }
         }
 
+        const connection = await this.getConnection(); //will automatically be released in SQLPersistence
+        await connection.exec(`DROP TABLE IF EXISTS _b`);
+
         const sql = `
-              DROP TABLE IF EXISTS _b;
               CREATE TEMPORARY TABLE _b AS
-                SELECT ${selects.join(', ')}
+                SELECT _.${prepared.originPkField}, ${selects.join(', ')}
                 FROM (SELECT ${_rename.join(', ')} FROM (VALUES ${valuesValues.join(', ')})) as _
-                INNER JOIN ${tableName} as _origin ON (_origin.${pkField} = _.${pkField});
-              UPDATE
-                ${tableName}
-                SET ${setNames.join(', ')}
-              FROM
-                _b
-              WHERE ${tableName}.${pkField} = _b.${pkField};
+                INNER JOIN (SELECT ${_renameSet.join(', ')} FROM (VALUES ${valuesSetValues.join(', ')})) as _set ON (_.${prepared.originPkField} = _set.${prepared.originPkField})
+                INNER JOIN ${prepared.tableName} as _origin ON (_origin.${prepared.pkField} = _.${prepared.originPkField});
         `;
 
-        const connection = await this.getConnection(); //will automatically be released in SQLPersistence
-        await connection.exec(sql);
+        await connection.run(sql, params);
 
-        if (!empty(setReturning)) {
-            const returnings = await connection.execAndReturnAll('SELECT * FROM _b');
-            for (const returning of returnings) {
-                const r = assignReturning[returning[pkName]];
+        const updateSql = `
+            UPDATE
+            ${prepared.tableName}
+            SET ${prepared.setNames.join(', ')}
+            FROM
+            _b
+            WHERE ${prepared.tableName}.${prepared.pkField} = _b.${prepared.originPkField};
+        `;
+        try {
+            await connection.exec(updateSql);
 
-                for (const name of r.names) {
-                    r.item[name] = returning[name];
+            if (!empty(prepared.setReturning)) {
+                const returnings = await connection.execAndReturnAll('SELECT * FROM _b');
+                for (const returning of returnings) {
+                    const r = prepared.assignReturning[returning[prepared.originPkName]];
+                    if (!r) continue;
+
+                    for (const name of r.names) {
+                        r.item[name] = returning[name];
+                    }
                 }
             }
+        } catch (error: any) {
+            const reflection = ReflectionClass.from(entity.type);
+            error = new DatabaseUpdateError(
+                reflection,
+                changeSets,
+                `Could not update ${reflection.getClassName()} in database`,
+                { cause: error },
+            );
+            throw this.handleSpecificError(error);
         }
     }
 
@@ -423,8 +437,12 @@ export class SQLiteQueryResolver<T extends OrmEntity> extends SQLQueryResolver<T
         protected connectionPool: SQLiteConnectionPool,
         protected platform: DefaultPlatform,
         classSchema: ReflectionClass<T>,
-        session: DatabaseSession<DatabaseAdapter>) {
-        super(connectionPool, platform, classSchema, session);
+        session: DatabaseSession<SQLDatabaseAdapter>) {
+        super(connectionPool, platform, classSchema, session.adapter, session);
+    }
+
+    override handleSpecificError(error: Error): Error {
+        return handleSpecificError(this.session, error);
     }
 
     async delete(model: SQLQueryModel<T>, deleteResult: DeleteResult<T>): Promise<void> {
@@ -433,10 +451,10 @@ export class SQLiteQueryResolver<T extends OrmEntity> extends SQLQueryResolver<T
         const primaryKey = this.classSchema.getPrimary();
         const pkName = primaryKey.name;
         const pkField = this.platform.quoteIdentifier(primaryKey.name);
-        const sqlBuilder = new SqlBuilder(this.platform);
+        const sqlBuilder = new SqlBuilder(this.adapter);
         const tableName = this.platform.getTableIdentifier(this.classSchema);
         const select = sqlBuilder.select(this.classSchema, model, { select: [pkField] });
-        const primaryKeyConverted = getSerializeFunction(primaryKey.property, this.platform.serializer.deserializeRegistry);
+        const primaryKeyConverted = primaryKeyObjectConverter(this.classSchema, this.platform.serializer.deserializeRegistry);
         if (sqlBuilderFrame) sqlBuilderFrame.end();
 
         const connectionFrame = this.session.stopwatch ? this.session.stopwatch.start('Connection acquisition') : undefined;
@@ -455,6 +473,10 @@ export class SQLiteQueryResolver<T extends OrmEntity> extends SQLQueryResolver<T
             for (const row of rows) {
                 deleteResult.primaryKeys.push(primaryKeyConverted(row[pkName]));
             }
+        } catch (error: any) {
+            error = new DatabaseDeleteError(this.classSchema, `Could not delete ${this.classSchema.getClassName()} in database`, { cause: error });
+            error.query = model;
+            error = this.handleSpecificError(error);
         } finally {
             connection.release();
         }
@@ -466,18 +488,18 @@ export class SQLiteQueryResolver<T extends OrmEntity> extends SQLQueryResolver<T
         const selectParams: any[] = [];
         const tableName = this.platform.getTableIdentifier(this.classSchema);
         const primaryKey = this.classSchema.getPrimary();
-        const primaryKeyConverted = getSerializeFunction(primaryKey.property, this.platform.serializer.deserializeRegistry);
+        const primaryKeyConverted = primaryKeyObjectConverter(this.classSchema, this.platform.serializer.deserializeRegistry);
 
         const fieldsSet: { [name: string]: 1 } = {};
         const aggregateFields: { [name: string]: { converted: (v: any) => any } } = {};
 
-        const partialSerialize = getPartialSerializeFunction(this.classSchema.type, this.platform.serializer.serializeRegistry);
-        const $set = changes.$set ? partialSerialize(changes.$set) : undefined;
+        const patchSerialize = getPatchSerializeFunction(this.classSchema.type, this.platform.serializer.serializeRegistry);
+        const $set = changes.$set ? patchSerialize(changes.$set, undefined, { normalizeArrayIndex: true }) : undefined;
 
         if ($set) for (const i in $set) {
             if (!$set.hasOwnProperty(i)) continue;
             fieldsSet[i] = 1;
-            select.push(`? as ${this.platform.quoteIdentifier(i)}`);
+            select.push(` ? as ${this.platform.quoteIdentifier(asAliasName(i))}`);
             selectParams.push($set[i]);
         }
 
@@ -496,12 +518,19 @@ export class SQLiteQueryResolver<T extends OrmEntity> extends SQLQueryResolver<T
             if (!changes.$inc.hasOwnProperty(i)) continue;
             fieldsSet[i] = 1;
             aggregateFields[i] = { converted: getSerializeFunction(resolvePath(i, this.classSchema.type), this.platform.serializer.serializeRegistry) };
-            select.push(`(${this.platform.quoteIdentifier(i)} + ${this.platform.quoteValue(changes.$inc[i])}) as ${this.platform.quoteIdentifier(i)}`);
+
+            select.push(`(${this.platform.getColumnAccessor('', i)} + ${this.platform.quoteValue(changes.$inc[i])}) as ${this.platform.quoteIdentifier(asAliasName(i))}`);
         }
 
         const set: string[] = [];
         for (const i in fieldsSet) {
-            set.push(`${this.platform.quoteIdentifier(i)} = _b.${this.platform.quoteIdentifier(i)}`);
+            if (i.includes('.')) {
+                let [firstPart, secondPart] = splitDotPath(i);
+                if (!secondPart.startsWith('[')) secondPart = '.' + secondPart;
+                set.push(`${this.platform.quoteIdentifier(firstPart)} = json_set(${this.platform.quoteIdentifier(firstPart)}, '$${secondPart}', _b.${this.platform.quoteIdentifier(asAliasName(i))})`);
+            } else {
+                set.push(`${this.platform.quoteIdentifier(i)} = _b.${this.platform.quoteIdentifier(i)}`);
+            }
         }
 
         let bPrimaryKey = primaryKey.name;
@@ -513,17 +542,19 @@ export class SQLiteQueryResolver<T extends OrmEntity> extends SQLQueryResolver<T
             select.unshift(this.platform.quoteIdentifier(primaryKey.name));
         }
 
-        const sqlBuilder = new SqlBuilder(this.platform, selectParams);
+        const sqlBuilder = new SqlBuilder(this.adapter, selectParams);
         const selectSQL = sqlBuilder.select(this.classSchema, model, { select });
+        if (!set.length) {
+            throw new DatabaseError('SET is empty');
+        }
 
         const sql = `
-              UPDATE
+            UPDATE
                 ${tableName}
-              SET
-                ${set.join(', ')}
-              FROM
+            SET ${set.join(', ')}
+            FROM
                 _b
-              WHERE ${tableName}.${this.platform.quoteIdentifier(primaryKey.name)} = _b.${this.platform.quoteIdentifier(bPrimaryKey)};
+            WHERE ${tableName}.${this.platform.quoteIdentifier(primaryKey.name)} = _b.${this.platform.quoteIdentifier(bPrimaryKey)};
         `;
         if (sqlBuilderFrame) sqlBuilderFrame.end();
 
@@ -548,13 +579,16 @@ export class SQLiteQueryResolver<T extends OrmEntity> extends SQLQueryResolver<T
                     patchResult.returning[i].push(aggregateFields[i].converted(returning[i]));
                 }
             }
+        } catch (error: any) {
+            error = new DatabasePatchError(this.classSchema, model, changes, `Could not patch ${this.classSchema.getClassName()} in database`, { cause: error });
+            throw this.handleSpecificError(error);
         } finally {
             connection.release();
         }
     }
 }
 
-export class SQLiteDatabaseQuery<T> extends SQLDatabaseQuery<T> {
+export class SQLiteDatabaseQuery<T extends OrmEntity> extends SQLDatabaseQuery<T> {
 }
 
 export class SQLiteDatabaseQueryFactory extends SQLDatabaseQueryFactory {
@@ -573,9 +607,11 @@ export class SQLiteDatabaseAdapter extends SQLDatabaseAdapter {
     public readonly connectionPool: SQLiteConnectionPool;
     public readonly platform = new SQLitePlatform();
 
-    constructor(protected sqlitePath: string = ':memory:') {
+    constructor(protected sqlitePath: string | ':memory:' = ':memory:') {
         super();
-
+        if (this.sqlitePath.startsWith('sqlite://')) {
+            this.sqlitePath = this.sqlitePath.substring('sqlite://'.length);
+        }
         this.connectionPool = new SQLiteConnectionPool(this.sqlitePath);
     }
 

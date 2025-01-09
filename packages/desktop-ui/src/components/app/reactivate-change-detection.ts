@@ -8,16 +8,9 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import {
-    AfterViewInit,
-    ApplicationRef,
-    NgModule,
-    OnDestroy,
-    Type,
-    ɵComponentDef as ComponentDef,
-    ɵNG_COMP_DEF as NG_COMP_DEF
-} from '@angular/core';
-import { getClassName, throttleTime } from '@deepkit/core';
+import { AfterViewInit, ApplicationRef, inject, NgModule, OnDestroy, Type, ɵComponentDef as ComponentDef, ɵNG_COMP_DEF as NG_COMP_DEF } from '@angular/core';
+import { getClassName, nextTick, throttleTime } from '@deepkit/core';
+import { EventDispatcher, EventDispatcherUnsubscribe, EventOfEventToken, EventToken } from '@deepkit/event';
 import { Subscription } from 'rxjs';
 
 export function observeAction() {
@@ -128,6 +121,94 @@ export function unsubscribe<T extends OnDestroy>() {
     };
 }
 
+export interface EventHandler<T extends EventToken> {
+    dispatch(event?: EventOfEventToken<T>): Promise<any>;
+
+    listen(listener: (event: T['event']) => any | Promise<any>, order?: number): EventDispatcherUnsubscribe;
+}
+
+/**
+ * Creates a new function that calls the given event dispatcher with the given arguments.
+ *
+ * It's important to call this function either in constructor or as property initializer (as it uses Angular's fetch()).
+ *
+ * @example
+ * ```typescript
+ * const userAdded = new EventToken<User>('user.added');
+ *
+ * class MyComponent {
+ *     userAdded = eventHandler(userAdded);
+ *
+ *     async save() {
+ *         const user = new User;
+ *         await this.api.saveUser(user);
+ *         this.userAdded.dispatch(user);
+ *     }
+ * }
+ */
+export function eventHandler<T extends EventToken, C>(eventToken: T, component: C): EventHandler<T> {
+    const eventDispatcher = inject(EventDispatcher);
+
+    const listeners: EventDispatcherUnsubscribe[] = [];
+    addComponentHook((component as any).constructor, 'onDestroy', function () {
+        for (const listener of listeners) listener();
+    });
+
+    return {
+        dispatch(event?: EventOfEventToken<T>): Promise<any> {
+            return eventDispatcher.dispatch(eventToken, event);
+        },
+        listen(listener: (event: T['event']) => any | Promise<any>, order: number = 0): EventDispatcherUnsubscribe {
+            const unsub = eventDispatcher.listen(eventToken, listener);
+            listeners.push(unsub);
+            return unsub;
+        }
+    };
+}
+
+/**
+ * Listens on the given event token and calls the method when the event is triggered.
+ *
+ * @example
+ * ```typescript
+ *
+ * const MyEvent = new EventToken('my-event');
+ *
+ * @Component({
+ *     //..
+ * });
+ * class MyComponent {
+ *     @EventListener(MyEvent)
+ *     onMyEvent(event: MyEvent) {
+ *         console.log('event triggered', event);
+ *     }
+ * }
+ * ```
+ */
+export function EventListener(eventToken: EventToken) {
+    return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
+        const originalConstructor = target.constructor;
+
+        const newConstructor: any = function (...args: any[]) {
+            const instance = new originalConstructor(...args);
+            const store = lazyInitialize(instance);
+            const eventDispatcher = inject(EventDispatcher);
+            console.log('listen', eventToken, propertyKey);
+            store['Ωlistener_' + propertyKey] = eventDispatcher.listen(eventToken, (event) => {
+                instance[propertyKey](event);
+            });
+            return instance;
+        };
+        newConstructor.prototype = originalConstructor.prototype;
+        target.constructor = newConstructor;
+        addComponentHook(newConstructor, 'onDestroy', function () {
+            const store = lazyInitialize(this);
+            const unsubscribe = store['Ωlistener_' + propertyKey];
+            if (unsubscribe) unsubscribe();
+        });
+    };
+}
+
 /**
  * Important for components that use material design, which need Tick in AfterViewInit.
  */
@@ -145,7 +226,7 @@ export function reactiveComponent<T extends AfterViewInit>() {
  *
  * Optionally @observe({unsubscribe: true}) unsubscribes the whole value as well (calling unsubscribe() on current value) on NgOnDestroy or when net property value is set.
  */
-export function observe<T extends OnDestroy>(options: { unsubscribe?: true } = {}) {
+export function observe<T extends {}>(options: { unsubscribe?: true } = {}) {
     return function (target: T, propertyKey: string | symbol) {
 
         function unsub(value: any) {
@@ -228,7 +309,7 @@ export class ReactiveChangeDetectionModule {
     }
 
     public static tick() {
-        requestAnimationFrame(() => {
+        nextTick(() => {
             ReactiveChangeDetectionModule.throttled();
         });
     }

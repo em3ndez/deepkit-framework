@@ -8,30 +8,56 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import type { DatabaseAdapter, DatabasePersistence, DatabasePersistenceChangeSet } from './database-adapter';
-import { DatabaseEntityRegistry } from './database-adapter';
-import { DatabaseValidationError, OrmEntity } from './type';
-import { ClassType, CustomError } from '@deepkit/core';
+import type { DatabaseAdapter, DatabasePersistence, DatabasePersistenceChangeSet } from './database-adapter.js';
+import { DatabaseEntityRegistry } from './database-adapter.js';
+import { DatabaseValidationError, OrmEntity } from './type.js';
+import { AbstractClassType, ClassType, CustomError, forwardTypeArguments } from '@deepkit/core';
 import {
-    ReceiveType,
     getPrimaryKeyExtractor,
+    getTypeJitContainer,
     isReferenceInstance,
     markAsHydrated,
     PrimaryKeyFields,
+    ReceiveType,
     ReflectionClass,
+    ReflectionKind,
+    stringifyType,
+    Type,
     typeSettings,
     UnpopulatedCheck,
-    validate
+    validate,
 } from '@deepkit/type';
 import { GroupArraySort } from '@deepkit/topsort';
-import { getClassState, getInstanceState, getNormalizedPrimaryKey, IdentityMap } from './identity-map';
-import { getClassSchemaInstancePairs } from './utils';
-import { HydratorFn } from './formatter';
-import { getReference } from './reference';
-import { QueryDatabaseEmitter, UnitOfWorkCommitEvent, UnitOfWorkDatabaseEmitter, UnitOfWorkEvent, UnitOfWorkUpdateEvent } from './event';
-import { DatabaseLogger } from './logger';
+import { getClassState, getInstanceState, getNormalizedPrimaryKey, IdentityMap } from './identity-map.js';
+import { getClassSchemaInstancePairs } from './utils.js';
+import { HydratorFn } from './formatter.js';
+import { getReference } from './reference.js';
+import {
+    DatabaseErrorInsertEvent,
+    DatabaseErrorUpdateEvent,
+    onDatabaseError,
+    UnitOfWorkCommitEvent,
+    UnitOfWorkEvent,
+    UnitOfWorkUpdateEvent,
+} from './event.js';
+import { DatabaseLogger } from './logger.js';
 import { Stopwatch } from '@deepkit/stopwatch';
-import { AbstractClassType } from '@deepkit/core';
+import { EventDispatcher, EventDispatcherInterface, EventToken } from '@deepkit/event';
+import { DatabasePluginRegistry } from './plugin/plugin.js';
+
+function resolveReferenceToEntity(type: Type, entityRegistry: DatabaseEntityRegistry): ReflectionClass<any> {
+    if (type.kind === ReflectionKind.class) {
+        return getTypeJitContainer(type).resolveReferenceEntity ||= ReflectionClass.from(type.classType);
+    }
+
+    // object literals have no reference to the nominal type,
+    // so we look it up in the EntityRegistry
+    if (type.kind === ReflectionKind.objectLiteral) {
+        return getTypeJitContainer(type).resolveReferenceEntity ||= entityRegistry.get(type);
+    }
+
+    throw new Error(`Could not resolve reference to entity for ${stringifyType(type)}`);
+}
 
 let SESSION_IDS = 0;
 
@@ -39,12 +65,16 @@ export class DatabaseSessionRound<ADAPTER extends DatabaseAdapter> {
     protected addQueue = new Set<OrmEntity>();
     protected removeQueue = new Set<OrmEntity>();
 
+    protected addQueueResolved: [ReflectionClass<any>, OrmEntity][] = [];
+    protected removeQueueResolved: [ReflectionClass<any>, OrmEntity][] = [];
+
     protected inCommit: boolean = false;
     protected committed: boolean = false;
 
     constructor(
+        protected round: number = 0,
         protected session: DatabaseSession<any>,
-        protected emitter: UnitOfWorkDatabaseEmitter,
+        protected eventDispatcher: EventDispatcherInterface,
         public logger: DatabaseLogger,
         protected identityMap?: IdentityMap,
     ) {
@@ -59,59 +89,85 @@ export class DatabaseSessionRound<ADAPTER extends DatabaseAdapter> {
         return this.committed;
     }
 
-    public add(...items: OrmEntity[]): void {
+    public add(items: Iterable<OrmEntity>, classSchema?: ReflectionClass<any>): void {
         if (this.isInCommit()) throw new Error('Already in commit. Can not change queues.');
-
-        for (const item of items) {
-            if (this.removeQueue.has(item)) continue;
-            if (this.addQueue.has(item)) continue;
-
-            this.addQueue.add(item);
-
-            for (const dep of this.getReferenceDependencies(item)) {
-                this.add(dep);
-            }
-        }
-    }
-
-    protected getReferenceDependencies<T extends OrmEntity>(item: T): OrmEntity[] {
-        const result: OrmEntity[] = [];
-        const classSchema = this.session.entityRegistry.getFromInstance(item);
 
         const old = typeSettings.unpopulatedCheck;
         typeSettings.unpopulatedCheck = UnpopulatedCheck.None;
         try {
-            for (const reference of classSchema.getReferences()) {
-                if (reference.isBackReference()) continue;
+            for (const item of items) {
+                if (this.removeQueue.has(item)) continue;
+                if (this.addQueue.has(item)) continue;
 
-                //todo, check if join was populated. will throw otherwise
-                const v = item[reference.getNameAsString() as keyof T] as any;
-                if (v == undefined) continue;
+                this.addQueue.add(item);
 
-                // if (reference.isArray) {
-                //     if (isArray(v)) {
-                //         for (const i of v) {
-                //             if (isReference(v)) continue;
-                //             if (i instanceof reference.getResolvedClassType()) result.push(i);
-                //         }
-                //     }
-                // } else {
-                if (!isReferenceInstance(v)) result.push(v);
-                // }
+                const thisClassSchema = classSchema || this.session.entityRegistry.getFromInstance(item);
+                this.addQueueResolved.push([thisClassSchema, item]);
+
+                for (const [schema, dep] of this.getReferenceDependenciesWithSchema(thisClassSchema, item)) {
+                    this.add([dep], schema);
+                }
             }
         } finally {
             typeSettings.unpopulatedCheck = old;
+        }
+    }
+
+    protected getReferenceDependenciesWithSchema<T extends OrmEntity>(classSchema: ReflectionClass<any>, item: T): [ReflectionClass<any>, OrmEntity][] {
+        const result: [ReflectionClass<any>, OrmEntity][] = [];
+
+        for (const reference of classSchema.getReferences()) {
+            if (reference.isBackReference()) continue;
+            const v = item[reference.getNameAsString() as keyof T] as any;
+            if (v == undefined) continue;
+            if (!isReferenceInstance(v)) {
+                result.push([resolveReferenceToEntity(reference.type, this.session.entityRegistry), v]);
+            }
         }
 
         return result;
     }
 
-    public remove(...items: OrmEntity[]) {
+    protected getReferenceDependencies<T extends OrmEntity>(classSchema: ReflectionClass<any>, item: T): OrmEntity[] {
+        const result: OrmEntity[] = [];
+
+        for (const reference of classSchema.getReferences()) {
+            if (reference.isBackReference()) continue;
+            const v = item[reference.getNameAsString() as keyof T] as any;
+            if (v == undefined) continue;
+
+            // if (reference.isArray) {
+            //     if (isArray(v)) {
+            //         for (const i of v) {
+            //             if (isReference(v)) continue;
+            //             if (i instanceof reference.getResolvedClassType()) result.push(i);
+            //         }
+            //     }
+            // } else {
+            if (!isReferenceInstance(v)) result.push(v);
+            // }
+        }
+
+        return result;
+    }
+
+    public remove(items: OrmEntity[], schema?: ReflectionClass<any>) {
         if (this.isInCommit()) throw new Error('Already in commit. Can not change queues.');
+
+        const removeAdded: OrmEntity[] = [];
 
         for (const item of items) {
             this.removeQueue.add(item);
-            this.addQueue.delete(item);
+            this.removeQueueResolved.push([schema || this.session.entityRegistry.getFromInstance(item), item]);
+
+            if (this.addQueue.has(item)) {
+                this.addQueue.delete(item);
+                removeAdded.push(item);
+            }
+        }
+
+        if (removeAdded.length) {
+            this.addQueueResolved = this.addQueueResolved.filter(v => !removeAdded.includes(v[1]));
         }
     }
 
@@ -130,19 +186,19 @@ export class DatabaseSessionRound<ADAPTER extends DatabaseAdapter> {
     }
 
     protected async doDelete(persistence: DatabasePersistence) {
-        for (const [classSchema, items] of getClassSchemaInstancePairs(this.removeQueue.values())) {
-            if (this.emitter.onDeletePre.hasSubscriptions()) {
+        for (const [classSchema, items] of getClassSchemaInstancePairs(this.removeQueueResolved)) {
+            if (this.eventDispatcher.hasListeners(DatabaseSession.onDeletePre)) {
                 const event = new UnitOfWorkEvent(classSchema, this.session, items);
-                await this.emitter.onDeletePre.emit(event);
+                await this.eventDispatcher.dispatch(DatabaseSession.onDeletePre, event);
                 if (event.stopped) return;
             }
 
             await persistence.remove(classSchema, items);
             if (this.identityMap) this.identityMap.deleteMany(classSchema, items);
 
-            if (this.emitter.onDeletePost.hasSubscriptions()) {
+            if (this.eventDispatcher.hasListeners(DatabaseSession.onDeletePost)) {
                 const event = new UnitOfWorkEvent(classSchema, this.session, items);
-                await this.emitter.onDeletePost.emit(event);
+                await this.eventDispatcher.dispatch(DatabaseSession.onDeletePost, event);
             }
         }
     }
@@ -155,9 +211,8 @@ export class DatabaseSessionRound<ADAPTER extends DatabaseAdapter> {
         typeSettings.unpopulatedCheck = UnpopulatedCheck.None;
 
         try {
-            for (const item of this.addQueue.values()) {
-                const classSchema = this.session.entityRegistry.getFromInstance(item);
-                sorter.add(item, classSchema, this.getReferenceDependencies(item));
+            for (const [classSchema, item] of this.addQueueResolved) {
+                sorter.add(item, classSchema, this.getReferenceDependencies(classSchema, item));
             }
 
             sorter.sort();
@@ -194,32 +249,49 @@ export class DatabaseSessionRound<ADAPTER extends DatabaseAdapter> {
 
                 if (inserts.length) {
                     let doInsert = true;
-                    if (this.emitter.onInsertPre.hasSubscriptions()) {
+                    if (this.eventDispatcher.hasListeners(DatabaseSession.onInsertPre)) {
                         const event = new UnitOfWorkEvent(group.type, this.session, inserts);
-                        await this.emitter.onInsertPre.emit(event);
+                        await this.eventDispatcher.dispatch(DatabaseSession.onInsertPre, event);
                         if (event.stopped) doInsert = false;
                     }
                     if (doInsert) {
-                        await persistence.insert(group.type, inserts);
-                        if (this.emitter.onInsertPost.hasSubscriptions()) {
-                            await this.emitter.onInsertPost.emit(new UnitOfWorkEvent(group.type, this.session, inserts));
+                        try {
+                            await persistence.insert(group.type, inserts);
+                        } catch (error: any) {
+                            await this.eventDispatcher.dispatch(onDatabaseError, Object.assign(
+                                new DatabaseErrorInsertEvent(error, this.session, classState.classSchema),
+                                { inserts },
+                            ));
+                            throw error;
+                        }
+
+                        if (this.eventDispatcher.hasListeners(DatabaseSession.onInsertPost)) {
+                            await this.eventDispatcher.dispatch(DatabaseSession.onInsertPost, new UnitOfWorkEvent(group.type, this.session, inserts));
                         }
                     }
                 }
 
                 if (changeSets.length) {
                     let doUpdate = true;
-                    if (this.emitter.onUpdatePre.hasSubscriptions()) {
+                    if (this.eventDispatcher.hasListeners(DatabaseSession.onUpdatePre)) {
                         const event = new UnitOfWorkUpdateEvent(group.type, this.session, changeSets);
-                        await this.emitter.onUpdatePre.emit(event);
+                        await this.eventDispatcher.dispatch(DatabaseSession.onUpdatePre, event);
                         if (event.stopped) doUpdate = false;
                     }
 
                     if (doUpdate) {
-                        await persistence.update(group.type, changeSets);
+                        try {
+                            await persistence.update(group.type, changeSets);
+                        } catch (error: any) {
+                            await this.eventDispatcher.dispatch(onDatabaseError, Object.assign(
+                                new DatabaseErrorUpdateEvent(error, this.session, classState.classSchema),
+                                { changeSets },
+                            ));
+                            throw error;
+                        }
 
-                        if (this.emitter.onUpdatePost.hasSubscriptions()) {
-                            await this.emitter.onUpdatePost.emit(new UnitOfWorkUpdateEvent(group.type, this.session, changeSets));
+                        if (this.eventDispatcher.hasListeners(DatabaseSession.onUpdatePost)) {
+                            await this.eventDispatcher.dispatch(DatabaseSession.onUpdatePost, new UnitOfWorkUpdateEvent(group.type, this.session, changeSets));
                         }
                     }
                 }
@@ -264,8 +336,9 @@ export abstract class DatabaseTransaction {
     }
 }
 
-export class DatabaseSession<ADAPTER extends DatabaseAdapter> {
+export class DatabaseSession<ADAPTER extends DatabaseAdapter = DatabaseAdapter> {
     public readonly id = SESSION_IDS++;
+    public round: number = 0;
     public withIdentityMap = true;
 
     /**
@@ -292,26 +365,41 @@ export class DatabaseSession<ADAPTER extends DatabaseAdapter> {
 
     protected currentPersistence?: DatabasePersistence = undefined;
 
+    public static readonly onUpdatePre: EventToken<UnitOfWorkUpdateEvent<any>> = new EventToken('orm.session.update.pre');
+    public static readonly onUpdatePost: EventToken<UnitOfWorkUpdateEvent<any>> = new EventToken('orm.session.update.post');
+
+    public static readonly onInsertPre: EventToken<UnitOfWorkEvent<any>> = new EventToken('orm.session.insert.pre');
+    public static readonly onInsertPost: EventToken<UnitOfWorkEvent<any>> = new EventToken('orm.session.insert.post');
+
+    public static readonly onDeletePre: EventToken<UnitOfWorkEvent<any>> = new EventToken('orm.session.delete.pre');
+    public static readonly onDeletePost: EventToken<UnitOfWorkEvent<any>> = new EventToken('orm.session.delete.post');
+
+    public static readonly onCommitPre: EventToken<UnitOfWorkCommitEvent<any>> = new EventToken('orm.session.commit.pre');
+
     constructor(
         public readonly adapter: ADAPTER,
-        public readonly unitOfWorkEmitter: UnitOfWorkDatabaseEmitter = new UnitOfWorkDatabaseEmitter,
-        public readonly queryEmitter: QueryDatabaseEmitter = new QueryDatabaseEmitter(),
         public readonly entityRegistry: DatabaseEntityRegistry = new DatabaseEntityRegistry(),
+        public readonly eventDispatcher: EventDispatcherInterface = new EventDispatcher(),
+        public pluginRegistry: DatabasePluginRegistry = new DatabasePluginRegistry,
         public logger: DatabaseLogger = new DatabaseLogger,
         public stopwatch?: Stopwatch,
     ) {
         const queryFactory = this.adapter.queryFactory(this);
 
-        const self = this;
-
         //we cannot use arrow functions, since they can't have ReceiveType<T>
-        function query<T>(type?: ReceiveType<T> | ClassType<T> | AbstractClassType<T> | ReflectionClass<T>) {
-            return queryFactory.createQuery(type);
-        };
+        function query<T extends OrmEntity>(type?: ReceiveType<T> | ClassType<T> | AbstractClassType<T> | ReflectionClass<T>) {
+            const result = queryFactory.createQuery(type);
+            result.model.adapterName = adapter.getName();
+            return result;
+        }
+
         this.query = query as any;
 
         const factory = this.adapter.rawFactory(this);
-        this.raw = factory.create.bind(factory);
+        this.raw = (...args: any[]) => {
+            forwardTypeArguments(this.raw, factory.create);
+            return factory.create(...args);
+        };
     }
 
     /**
@@ -428,7 +516,7 @@ export class DatabaseSession<ADAPTER extends DatabaseAdapter> {
     }
 
     protected enterNewRound() {
-        this.rounds.push(new DatabaseSessionRound(this, this.unitOfWorkEmitter, this.logger, this.withIdentityMap ? this.identityMap : undefined));
+        this.rounds.push(new DatabaseSessionRound(this.round++, this, this.eventDispatcher, this.logger, this.withIdentityMap ? this.identityMap : undefined));
     }
 
     /**
@@ -441,19 +529,44 @@ export class DatabaseSession<ADAPTER extends DatabaseAdapter> {
             this.enterNewRound();
         }
 
-        this.getCurrentRound().add(...items);
+        this.getCurrentRound().add(items);
     }
 
     /**
-     * Adds a item to the remove queue. Use session.commit() to remove queued items from the database all at once.
+     * Adds a single or multiple items for a particular type to the to add/update queue. Use session.commit() to persist all queued items to the database.
+     *
+     * This works like Git: you add files, and later commit all in one batch.
+     */
+    public addAs<T extends OrmEntity>(items: T[], type?: ReceiveType<T> | ReflectionClass<any>) {
+        if (this.getCurrentRound().isInCommit()) {
+            this.enterNewRound();
+        }
+
+        this.getCurrentRound().add(items, ReflectionClass.from(type));
+    }
+
+    /**
+     * Adds item to the remove queue. Use session.commit() to remove queued items from the database all at once.
      */
     public remove(...items: OrmEntity[]) {
         if (this.getCurrentRound().isInCommit()) {
             this.enterNewRound();
         }
 
-        this.getCurrentRound().remove(...items);
+        this.getCurrentRound().remove(items);
     }
+
+    /**
+     * Adds item to the remove queue for a particular type. Use session.commit() to remove queued items from the database all at once.
+     */
+    public removeAs<T extends OrmEntity>(items: T[], type?: ReceiveType<T> | ReflectionClass<any>) {
+        if (this.getCurrentRound().isInCommit()) {
+            this.enterNewRound();
+        }
+
+        this.getCurrentRound().remove(items, ReflectionClass.from(type));
+    }
+
 
     /**
      * Resets all scheduled changes (add() and remove() calls).
@@ -488,7 +601,7 @@ export class DatabaseSession<ADAPTER extends DatabaseAdapter> {
                 Object.defineProperty(item, property.symbol, {
                     enumerable: false,
                     configurable: true,
-                    value: itemDB[property.getNameAsString() as keyof T]
+                    value: itemDB[property.getNameAsString() as keyof T],
                 });
             }
         }
@@ -507,44 +620,38 @@ export class DatabaseSession<ADAPTER extends DatabaseAdapter> {
             this.currentPersistence = this.adapter.createPersistence(this);
         }
 
-        if (!this.rounds.length) {
-            //we create a new round
-            this.enterNewRound();
-        }
+        try {
+            if (!this.rounds.length) {
+                //we create a new round
+                this.enterNewRound();
+            }
 
-        //make sure all stuff in the identity-map is known
-        const round = this.getCurrentRound();
-        if (this.withIdentityMap) {
-            for (const map of this.identityMap.registry.values()) {
-                for (const item of map.values()) {
-                    round.add(item.ref);
+            //make sure all stuff in the identity-map is known
+            const round = this.getCurrentRound();
+            if (this.withIdentityMap) {
+                for (const map of this.identityMap.registry.values()) {
+                    for (const item of map.values()) {
+                        round.add([item.ref]);
+                    }
                 }
             }
-        }
 
-        if (this.unitOfWorkEmitter.onCommitPre.hasSubscriptions()) {
-            const event = new UnitOfWorkCommitEvent(this);
-            await this.unitOfWorkEmitter.onCommitPre.emit(event);
-            if (event.stopped) return;
-        }
-
-        //we need to iterate via for i, because hooks might add additional rounds dynamically
-        for (let i = 0; i < this.rounds.length; i++) {
-            const round = this.rounds[i];
-            if (round.isCommitted() || round.isInCommit()) continue;
-
-            try {
-                await round.commit(this.currentPersistence);
-            } catch (error) {
-                this.rounds = [];
-                this.currentPersistence.release();
-                this.currentPersistence = undefined;
-                throw error;
+            if (this.eventDispatcher.hasListeners(DatabaseSession.onCommitPre)) {
+                const event = new UnitOfWorkCommitEvent(this);
+                await this.eventDispatcher.dispatch(DatabaseSession.onCommitPre, event);
+                if (event.stopped) return;
             }
-        }
 
-        this.currentPersistence.release();
-        this.currentPersistence = undefined;
-        this.rounds = [];
+            //we need to iterate via for i, because hooks might add additional rounds dynamically
+            for (let i = 0; i < this.rounds.length; i++) {
+                const round = this.rounds[i];
+                if (round.isCommitted() || round.isInCommit()) continue;
+                await round.commit(this.currentPersistence);
+            }
+        } finally {
+            this.currentPersistence.release();
+            this.currentPersistence = undefined;
+            this.rounds = [];
+        }
     }
 }

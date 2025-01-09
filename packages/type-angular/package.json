@@ -1,6 +1,6 @@
 {
   "name": "@deepkit/type-angular",
-  "version": "1.0.1-alpha.71",
+  "version": "1.0.1-alpha.155",
   "description": "Types angular forms",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -17,15 +17,18 @@
     "@deepkit/type": "^1.0.1-alpha.19"
   },
   "devDependencies": {
-    "@angular/core": "~10.2.3 || ~11.0.0",
-    "@angular/forms": "~10.2.3 || ~11.0.0",
-    "@deepkit/core": "^1.0.1-alpha.65",
-    "@deepkit/type": "^1.0.1-alpha.71",
-    "rxjs": "~6.6.0"
+    "@angular/core": "^17.1.0",
+    "@angular/forms": "^17.1.0",
+    "@deepkit/core": "^1.0.1-alpha.154",
+    "@deepkit/type": "^1.0.1-alpha.155",
+    "rxjs": "*"
   },
   "jest": {
     "transform": {
       "^.+\\.(ts|tsx)$": "ts-jest"
+    },
+    "moduleNameMapper": {
+      "(.+)\\.js": "$1"
     },
     "testMatch": [
       "**/tests/**/*.spec.ts"

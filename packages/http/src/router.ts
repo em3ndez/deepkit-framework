@@ -7,14 +7,9 @@
  *
  * You should have received a copy of the MIT License along with this program.
  */
-import { asyncOperation, ClassType, CompilerContext, getClassName, isClass, isObject, urlJoin } from '@deepkit/core';
+import { ClassType, CompilerContext, getClassName, isArray, isClass, urlJoin } from '@deepkit/core';
 import {
-    assertType,
     entity,
-    findMember,
-    getSerializeFunction,
-    getValidatorFunction,
-    metaAnnotation,
     ReflectionClass,
     ReflectionFunction,
     ReflectionKind,
@@ -22,44 +17,48 @@ import {
     SerializationOptions,
     serializer,
     Serializer,
-    stringifyType,
     Type,
-    typeToObject,
-    ValidationError
+    ValidationError,
 } from '@deepkit/type';
-// @ts-ignore
-import formidable from 'formidable';
-import querystring from 'querystring';
-import { HttpAction, httpClass, HttpController, HttpDecorator } from './decorator';
-import { BodyValidationError, getRegExp, HttpRequest, HttpRequestQuery, HttpRequestResolvedParameters, ValidatedBody } from './model';
-import { InjectorContext, InjectorModule, TagRegistry } from '@deepkit/injector';
+import { getActions, HttpAction, httpClass, HttpController, HttpDecorator } from './decorator.js';
+import { HttpRequest, HttpRequestPositionedParameters, HttpRequestQuery, HttpRequestResolvedParameters } from './model.js';
+import { InjectorContext, InjectorModule } from '@deepkit/injector';
 import { Logger, LoggerInterface } from '@deepkit/logger';
-import { HttpControllers } from './controllers';
+import { HttpControllers } from './controllers.js';
 import { MiddlewareRegistry, MiddlewareRegistryEntry } from '@deepkit/app';
-import { HttpMiddlewareConfig, HttpMiddlewareFn } from './middleware';
+import { HttpMiddlewareConfig, HttpMiddlewareFn } from './middleware.js';
 
 //@ts-ignore
 import qs from 'qs';
-import { isArray } from '@deepkit/core';
+import { HtmlResponse, JSONResponse, Response } from './http.js';
+import { getRequestParserCodeForParameters, ParameterForRequestParser, parseRoutePathToRegex } from './request-parser.js';
+import { HttpConfig } from './module.config.js';
 
-export type RouteParameterResolverForInjector = ((injector: InjectorContext) => any[] | Promise<any[]>);
+export type RouteParameterResolverForInjector = ((injector: InjectorContext) => HttpRequestPositionedParameters | Promise<HttpRequestPositionedParameters>);
 
 interface ResolvedController {
     parameters: RouteParameterResolverForInjector;
     routeConfig: RouteConfig;
     uploadedFiles: { [name: string]: UploadedFile };
-    middlewares?: (injector: InjectorContext) => { fn: HttpMiddlewareFn, timeout: number }[];
+    middlewares?: (injector: InjectorContext) => { fn: HttpMiddlewareFn, timeout?: number }[];
 }
+
+export const UploadedFileSymbol = Symbol('UploadedFile');
 
 @entity.name('@deepkit/UploadedFile')
 export class UploadedFile {
+    /**
+     * Validator to ensure the file was provided by the framework, and not the user spoofing it.
+     */
+    validator!: typeof UploadedFileSymbol | null;
+
     /**
      * The size of the uploaded file in bytes.
      */
     size!: number;
 
     /**
-     * The path this file is being written to.
+     * The local path this file is being written to. Will be deleted when request is handled.
      */
     path!: string;
 
@@ -85,6 +84,11 @@ export class UploadedFile {
     // hash!: string | 'sha1' | 'md5' | 'sha256' | null;
 }
 
+serializer.typeGuards.getRegistry(1).registerClass(UploadedFile, (type, state) => {
+    state.setContext({ UploadedFileSymbol });
+    state.addSetterAndReportErrorIfInvalid('uploadSecurity', 'Not an uploaded file', `typeof ${state.accessor} === 'object' && ${state.accessor} !== null && ${state.accessor}.validator === UploadedFileSymbol`);
+});
+
 export interface RouteFunctionControllerAction {
     type: 'function';
     //if not set, the root module is used
@@ -98,6 +102,11 @@ export interface RouteClassControllerAction {
     module?: InjectorModule<any>;
     controller: ClassType;
     methodName: string;
+}
+
+export function getRouteActionLabel(action: RouteClassControllerAction | RouteFunctionControllerAction): string {
+    if (action.type === 'controller') return `${getClassName(action.controller)}.${action.methodName}`;
+    return action.fn.name;
 }
 
 export class RouteConfig {
@@ -160,27 +169,27 @@ export class RouteConfig {
     }
 }
 
-class ParsedRoute {
+export class ParsedRoute {
     public regex?: string;
 
     public pathParameterNames: { [name: string]: number } = {};
 
-    protected parameters: ParsedRouteParameter[] = [];
+    protected parameters: ParameterForRequestParser[] = [];
 
     constructor(public routeConfig: RouteConfig) {
     }
 
-    addParameter(property: ReflectionParameter): ParsedRouteParameter {
-        const parameter = new ParsedRouteParameter(property);
+    addParameter(property: ReflectionParameter): ParameterForRequestParser {
+        const parameter = new ParameterForRequestParser(property);
         this.parameters.push(parameter);
         return parameter;
     }
 
-    getParameters(): ParsedRouteParameter[] {
+    getParameters(): ParameterForRequestParser[] {
         return this.parameters;
     }
 
-    getParameter(name: string): ParsedRouteParameter {
+    getParameter(name: string): ParameterForRequestParser {
         for (const parameter of this.parameters) {
             if (parameter.getName() === name) return parameter;
         }
@@ -188,87 +197,15 @@ class ParsedRoute {
     }
 }
 
-class ParsedRouteParameter {
-    regexPosition?: number;
-
-    constructor(
-        public parameter: ReflectionParameter,
-    ) {
-    }
-
-    get body() {
-        return metaAnnotation.getForName(this.parameter.type, 'httpBody') !== undefined;
-    }
-
-    get bodyValidation() {
-        return metaAnnotation.getForName(this.parameter.type, 'httpBodyValidation') !== undefined;
-    }
-
-    getType(): Type {
-        if (this.bodyValidation) {
-            assertType(this.parameter.type, ReflectionKind.class);
-            const valueType = findMember('value', this.parameter.type);
-            if (!valueType || valueType.kind !== ReflectionKind.property) throw new Error(`No property value found at ${stringifyType(this.parameter.type)}`);
-            return valueType.type as Type;
-        }
-        return this.parameter.type;
-    }
-
-    get query() {
-        return metaAnnotation.getForName(this.parameter.type, 'httpQuery') !== undefined;
-    }
-
-    get queries() {
-        return metaAnnotation.getForName(this.parameter.type, 'httpQueries') !== undefined;
-    }
-
-    get typePath(): string | undefined {
-        const typeOptions = metaAnnotation.getForName(this.parameter.type, 'httpQueries') || metaAnnotation.getForName(this.parameter.type, 'httpQuery');
-        if (!typeOptions) return;
-        const options = typeToObject(typeOptions[0]);
-        if (isObject(options)) return options.name;
-        return;
-    }
-
-    getName() {
-        return this.parameter.name;
-    }
-
-    isPartOfPath(): boolean {
-        return this.regexPosition !== undefined;
-    }
-}
-
-function parseRoutePathToRegex(routeConfig: RouteConfig): { regex: string, parameterNames: { [name: string]: number } } {
-    const parameterNames: { [name: string]: number } = {};
-    let path = routeConfig.getFullPath();
-
-    const fn = routeConfig.getReflectionFunction();
-
-    let argumentIndex = 0;
-    path = path.replace(/:(\w+)/g, (a, name) => {
-        parameterNames[name] = argumentIndex;
-        argumentIndex++;
-        const parameter = fn.getParameterOrUndefined(name);
-        if (parameter) {
-            const regExp = getRegExp(parameter.type);
-            if (regExp) return '(' + regExp + ')';
-        }
-        return String.raw`([^/]+)`;
-    });
-
-    return { regex: path, parameterNames };
-}
-
 export function parseRouteControllerAction(routeConfig: RouteConfig): ParsedRoute {
     const parsedRoute = new ParsedRoute(routeConfig);
 
-    const methodArgumentProperties = routeConfig.getReflectionFunction().getParameters();
-    const parsedPath = parseRoutePathToRegex(routeConfig);
+    const parameters = routeConfig.getReflectionFunction().getParameters();
+    const parsedPath = parseRoutePathToRegex(routeConfig.getFullPath(), parameters);
     parsedRoute.regex = parsedPath.regex;
     parsedRoute.pathParameterNames = parsedPath.parameterNames;
 
-    for (const property of methodArgumentProperties) {
+    for (const property of parameters) {
         const parsedParameter = parsedRoute.addParameter(property);
         parsedParameter.regexPosition = parsedPath.parameterNames[property.name];
     }
@@ -304,9 +241,13 @@ export interface RouteParameterResolverContext {
 
     query: HttpRequestQuery;
     parameters: HttpRequestResolvedParameters;
+    type: ReflectionParameter;
 }
 
-function filterMiddlewaresForRoute(middlewareRawConfigs: MiddlewareRegistryEntry[], routeConfig: RouteConfig, fullPath: string): { config: HttpMiddlewareConfig, module: InjectorModule<any> }[] {
+function filterMiddlewaresForRoute(middlewareRawConfigs: MiddlewareRegistryEntry[], routeConfig: RouteConfig, fullPath: string): {
+    config: HttpMiddlewareConfig,
+    module: InjectorModule<any>
+}[] {
     const middlewares = middlewareRawConfigs.slice(0);
     middlewares.push(...routeConfig.middlewares as any[]);
 
@@ -331,14 +272,20 @@ function filterMiddlewaresForRoute(middlewareRawConfigs: MiddlewareRegistryEntry
         if (v.config.selfModule && v.module.id !== routeConfig.module?.id) return false;
 
         if (v.config.routeNames.length) {
+            let found: boolean = false;
             for (const name of v.config.routeNames) {
                 if (name.includes('*')) {
                     const regex = new RegExp('^' + name.replace(/\*/g, '.*') + '$');
-                    if (!regex.test(routeConfig.name)) return false;
-                } else if (name !== routeConfig.name) {
-                    return false;
+                    if (regex.test(routeConfig.name)) {
+                        found = true;
+                        break;
+                    }
+                } else if (name === routeConfig.name) {
+                    found = true;
+                    break;
                 }
             }
+            if (!found) return false;
         }
 
         if (v.config.excludeRouteNames.length) {
@@ -408,6 +355,14 @@ function convertOptions(methods: string[], pathOrOptions: string | HttpRouterFun
     return { ...options, methods };
 }
 
+/**
+ * Annotated types like HTMLResponse/JSONResponse are not used for serialization.
+ */
+function filterValidReturnType(type: Type): Type | undefined {
+    if (type.kind === ReflectionKind.class && (type.classType === HtmlResponse || type.classType === JSONResponse || type.classType === Response)) return;
+    return type;
+}
+
 export abstract class HttpRouterRegistryFunctionRegistrar {
     protected defaultOptions: Partial<HttpRouterFunctionOptions> = {};
 
@@ -453,7 +408,7 @@ export abstract class HttpRouterRegistryFunctionRegistrar {
             type: 'function',
             fn: callback,
         }, action);
-        routeConfig.returnType = fn.getReturnType();
+        routeConfig.returnType = filterValidReturnType(fn.getReturnType());
         this.addRoute(routeConfig);
     }
 
@@ -524,7 +479,7 @@ export abstract class HttpRouterRegistryFunctionRegistrar {
         routeConfig.serializer = options.serializer;
         routeConfig.serializationOptions = options.serializationOptions;
 
-        routeConfig.returnType = fn.getReturnType();
+        routeConfig.returnType = filterValidReturnType(fn.getReturnType());
         this.addRoute(routeConfig);
     }
 }
@@ -576,7 +531,7 @@ export class HttpRouterRegistry extends HttpRouterRegistryFunctionRegistrar {
         if (!controllerData) throw new Error(`Http controller class ${getClassName(controller)} has no @http.controller decorator.`);
         const schema = ReflectionClass.from(controller);
 
-        for (const action of controllerData.getActions()) {
+        for (const action of getActions(controller)) {
             const routeAction: RouteClassControllerAction = {
                 type: 'controller',
                 controller,
@@ -587,7 +542,7 @@ export class HttpRouterRegistry extends HttpRouterRegistryFunctionRegistrar {
 
             routeConfig.module = module;
 
-            if (schema.hasMethod(action.methodName)) routeConfig.returnType = schema.getMethod(action.methodName).getReturnType();
+            if (schema.hasMethod(action.methodName)) routeConfig.returnType = filterValidReturnType(schema.getMethod(action.methodName).getReturnType());
             this.addRoute(routeConfig);
         }
     }
@@ -603,31 +558,10 @@ export class HttpRouter {
     protected buildId: number = 0;
     protected resolveFn?: (name: string, parameters: { [name: string]: any }) => string;
 
-    private parseBody(req: HttpRequest, files: { [name: string]: UploadedFile }) {
-        const form = formidable({
-            multiples: true,
-            hash: 'sha1',
-            enabledPlugins: ['octetstream', 'querystring', 'json'],
-        });
-        return asyncOperation((resolve, reject) => {
-            if (req.body) {
-                return resolve(req.body);
-            }
-            form.parse(req, (err: any, fields: any, files: any) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    const body = req.body = { ...fields, ...files };
-                    resolve(body);
-                }
-            });
-        });
-    }
-
     constructor(
         controllers: HttpControllers,
         private logger: LoggerInterface,
-        tagRegistry: TagRegistry,
+        private config: HttpConfig,
         private middlewareRegistry: MiddlewareRegistry = new MiddlewareRegistry,
         private registry: HttpRouterRegistry = new HttpRouterRegistry,
     ) {
@@ -642,139 +576,32 @@ export class HttpRouter {
 
     static forControllers(
         controllers: (ClassType | { module: InjectorModule<any>, controller: ClassType })[],
-        tagRegistry: TagRegistry = new TagRegistry(),
         middlewareRegistry: MiddlewareRegistry = new MiddlewareRegistry(),
-        module: InjectorModule<any> = new InjectorModule()
+        module: InjectorModule<any> = new InjectorModule(),
+        config: HttpConfig = new HttpConfig()
     ): HttpRouter {
         return new this(new HttpControllers(controllers.map(v => {
             return isClass(v) ? { controller: v, module } : v;
-        })), new Logger([], []), tagRegistry, middlewareRegistry);
+        })), new Logger([], []), config, middlewareRegistry);
     }
 
     protected getRouteCode(compiler: CompilerContext, routeConfig: RouteConfig): string {
-        const routeConfigVar = compiler.reserveVariable('routeConfigVar', routeConfig);
         const parsedRoute = parseRouteControllerAction(routeConfig);
         const path = routeConfig.getFullPath();
-        const prefix = path.substr(0, path.indexOf(':'));
+        const pathParamStarter = path.indexOf(':');
+        const prefix = path.substr(0, pathParamStarter);
 
         const regexVar = compiler.reserveVariable('regex', new RegExp('^' + parsedRoute.regex + '$'));
-        const setParameters: string[] = [];
-        const parameterNames: string[] = [];
-        const parameterValidator: string[] = [];
-        let bodyValidationErrorHandling = `if (bodyErrors.length) throw ValidationError.from(bodyErrors);`;
 
-        let enableParseBody = false;
-        const hasParameters = parsedRoute.getParameters().length > 0;
-        let requiresAsyncParameters = false;
-        let setParametersFromPath = '';
+        const hasParameters = pathParamStarter !== -1 || parsedRoute.getParameters().length > 0;
 
         const fullPath = routeConfig.getFullPath();
         const middlewareConfigs = filterMiddlewaresForRoute(this.middlewareRegistry.configs, routeConfig, fullPath);
 
-        for (const parameter of parsedRoute.getParameters()) {
-            if (parameter.body || parameter.bodyValidation) {
-                const type = parameter.getType();
-                const validatorVar = compiler.reserveVariable('argumentValidator', getValidatorFunction(undefined, type));
-                const converterVar = compiler.reserveVariable('argumentConverter', getSerializeFunction(type, serializer.deserializeRegistry));
+        const parameters = [...parsedRoute.getParameters()];
 
-                enableParseBody = true;
-                setParameters.push(`parameters.${parameter.parameter.name} = ${converterVar}(bodyFields, {loosely: true});`);
-                parameterValidator.push(`${validatorVar}(parameters.${parameter.parameter.name}, {errors: bodyErrors});`);
-                if (parameter.bodyValidation) {
-                    compiler.context.set('BodyValidation', ValidatedBody);
-                    compiler.context.set('BodyValidationError', BodyValidationError);
-                    parameterNames.push(`new BodyValidation(new BodyValidationError(bodyErrors), bodyErrors.length === 0 ? parameters.${parameter.parameter.name} : undefined)`);
-                    bodyValidationErrorHandling = '';
-                } else {
-                    parameterNames.push(`parameters.${parameter.parameter.name}`);
-                }
-            } else if (parameter.query || parameter.queries) {
-                const converted = getSerializeFunction(parameter.parameter.parameter, serializer.deserializeRegistry, undefined, parameter.getName());
-                const validator = getValidatorFunction(undefined, parameter.parameter.parameter,);
-                const converterVar = compiler.reserveVariable('argumentConverter', converted);
-                const validatorVar = compiler.reserveVariable('argumentValidator', validator);
-
-                const queryPath = parameter.typePath === undefined && parameter.query ? parameter.parameter.name : parameter.typePath;
-                const accessor = queryPath ? `['` + (queryPath.replace(/\./g, `']['`)) + `']` : '';
-                const queryAccessor = queryPath ? `_query${accessor}` : '_query';
-
-                setParameters.push(`parameters.${parameter.parameter.name} = ${converterVar}(${queryAccessor}, {loosely: true});`);
-                parameterNames.push(`parameters.${parameter.parameter.name}`);
-                parameterValidator.push(`${validatorVar}(parameters.${parameter.parameter.name}, {errors: validationErrors}, ${JSON.stringify(parameter.typePath || parameter.getName())});`);
-            } else {
-                parameterNames.push(`parameters.${parameter.parameter.name}`);
-
-                if (parameter.isPartOfPath()) {
-                    if (parameter.parameter.type.kind !== ReflectionKind.class) {
-                        const converted = getSerializeFunction(parameter.parameter.parameter, serializer.deserializeRegistry, undefined, parameter.getName());
-                        const converterVar = compiler.reserveVariable('argumentConverter', converted);
-                        setParameters.push(`parameters.${parameter.parameter.name} = ${converterVar}(_match[${1 + (parameter.regexPosition || 0)}], {loosely: true});`);
-
-                        const validator = getValidatorFunction(undefined, parameter.parameter.parameter);
-                        const validatorVar = compiler.reserveVariable('argumentValidator', validator);
-                        parameterValidator.push(`${validatorVar}(parameters.${parameter.parameter.name}, {errors: validationErrors}, ${JSON.stringify(parameter.getName())});`);
-                    } else {
-                        setParameters.push(`parameters.${parameter.parameter.name} = _match[${1 + (parameter.regexPosition || 0)}];`);
-                    }
-                }
-
-                const injectorToken = parameter.parameter.type.kind === ReflectionKind.class ? parameter.parameter.type.classType : undefined;
-                const injectorTokenVar = compiler.reserveVariable('classType', injectorToken);
-                const parameterResolverFoundVar = compiler.reserveVariable('parameterResolverFound', false);
-
-                setParameters.push(`${parameterResolverFoundVar} = false;`);
-
-                const resolver = routeConfig.resolverForParameterName.get(parameter.getName()) || routeConfig.resolverForToken.get(injectorToken);
-
-                //make sure all parameter values from the path are available
-                if (resolver && !setParametersFromPath) {
-                    for (const i in parsedRoute.pathParameterNames) {
-                        setParametersFromPath += `parameters.${i} = _match[${1 + parsedRoute.pathParameterNames[i]}];`;
-                    }
-                }
-
-                let injector = '_injector';
-                const moduleVar = routeConfig.module ? ', ' + compiler.reserveConst(routeConfig.module, 'module') : '';
-
-                if (resolver) {
-                    const resolverProvideTokenVar = compiler.reserveVariable('resolverProvideToken', resolver);
-                    requiresAsyncParameters = true;
-                    const instance = compiler.reserveVariable('resolverInstance');
-
-                    setParameters.push(`
-                    //resolver ${getClassName(resolver)} for ${parameter.getName()}
-                    ${instance} = ${injector}.get(${resolverProvideTokenVar}${moduleVar});
-                    if (!${parameterResolverFoundVar}) {
-                        ${parameterResolverFoundVar} = true;
-                        parameters.${parameter.parameter.name} = await ${instance}.resolve({
-                            token: ${injectorTokenVar},
-                            routeConfig: ${routeConfigVar},
-                            request: request,
-                            name: ${JSON.stringify(parameter.parameter.name)},
-                            value: parameters.${parameter.parameter.name},
-                            query: _query,
-                            parameters: parameters
-                        });
-                    }`);
-                }
-
-                if (!parameter.isPartOfPath()) {
-                    let injectorGet = `parameters.${parameter.parameter.name} = ${injector}.get(${injectorTokenVar});`;
-                    if (parameter.parameter.isOptional()) {
-                        injectorGet = `try {parameters.${parameter.parameter.name} = ${injector}.get(${injectorTokenVar}); } catch (e) {}`;
-                    }
-                    setParameters.push(`if (!${parameterResolverFoundVar}) ${injectorGet}`);
-                }
-            }
-        }
-
-        let parseBodyLoading = '';
-        if (enableParseBody) {
-            const parseBodyVar = compiler.reserveVariable('parseBody', this.parseBody.bind(this));
-            parseBodyLoading = `
-            const bodyFields = (await ${parseBodyVar}(request, uploadedFiles));`;
-            requiresAsyncParameters = true;
-        }
+        //look through all http listeners and check if they need any http parameters.
+        //the router then parses
 
         let matcher = `_path.startsWith(${JSON.stringify(prefix)}) && (_match = _path.match(${regexVar}))`;
         if (!hasParameters) {
@@ -804,21 +631,13 @@ export class HttpRouter {
             `;
         }
 
-        let parameters = '() => []';
-        if (setParameters.length) {
-            parameters = `${requiresAsyncParameters ? 'async' : ''} function(_injector){
-                const validationErrors = [];
-                const bodyErrors = [];
-                const parameters = {};
-                ${setParametersFromPath}
-                ${parseBodyLoading}
-                ${setParameters.join('\n')}
-                ${parameterValidator.join('\n')}
-                ${bodyValidationErrorHandling}
-                if (validationErrors.length) throw new ValidationError(validationErrors);
-                return [${parameterNames.join(',')}];
-            }`;
-        }
+        const parametersLoader = getRequestParserCodeForParameters(compiler, this.config.parser, parameters, {
+            module: routeConfig.module,
+            resolverForToken: routeConfig.resolverForToken,
+            resolverForParameterName: routeConfig.resolverForParameterName,
+            pathParameterNames: parsedRoute.pathParameterNames,
+            routeConfig
+        });
 
         let methodCheck = '';
         if (routeConfig.httpMethods.length) {
@@ -827,10 +646,11 @@ export class HttpRouter {
             }).join(' || ') + ') && ';
         }
 
+        const routeConfigVar = compiler.reserveVariable('routeConfigVar', routeConfig);
         return `
             //=> ${routeConfig.httpMethods.join(',')} ${path}
             if (${methodCheck}${matcher}) {
-                return {routeConfig: ${routeConfigVar}, parameters: ${parameters}, uploadedFiles: uploadedFiles, middlewares: ${middlewares}};
+                return {routeConfig: ${routeConfigVar}, parameters: ${parametersLoader}, uploadedFiles: uploadedFiles, middlewares: ${middlewares}};
             }
         `;
     }
@@ -895,6 +715,7 @@ export class HttpRouter {
             let _match;
             const _method = request.method || 'GET';
             const _url = request.url || '/';
+            const _headers = request.headers || {};
             const _qPosition = _url.indexOf('?');
             let uploadedFiles = {};
             const _path = _qPosition === -1 ? _url : _url.substr(0, _qPosition);

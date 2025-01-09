@@ -8,11 +8,35 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { Column, DefaultPlatform, IndexModel, isSet, SqlPlaceholderStrategy, Table } from '@deepkit/sql';
-import { postgresSerializer } from './postgres-serializer';
-import { isUUIDType, ReflectionClass, ReflectionKind, ReflectionProperty, Serializer, TypeNumberBrand } from '@deepkit/type';
-import { PostgresSchemaParser } from './postgres-schema-parser';
-import { PostgreSQLFilterBuilder } from './sql-filter-builder';
+import {
+    Column,
+    ColumnDiff,
+    DefaultPlatform,
+    IndexModel,
+    isSet,
+    PreparedAdapter,
+    SqlPlaceholderStrategy,
+    Table,
+    typeResolvesToBigInt,
+    typeResolvesToBoolean,
+    typeResolvesToDate,
+    typeResolvesToInteger,
+    typeResolvesToNumber,
+    typeResolvesToString,
+} from '@deepkit/sql';
+import { postgresSerializer } from './postgres-serializer.js';
+import {
+    isReferenceType,
+    isUUIDType,
+    ReflectionClass,
+    ReflectionKind,
+    ReflectionProperty,
+    Serializer,
+    Type,
+    TypeNumberBrand,
+} from '@deepkit/type';
+import { PostgresSchemaParser } from './postgres-schema-parser.js';
+import { PostgreSQLFilterBuilder } from './sql-filter-builder.js';
 import { isArray, isObject } from '@deepkit/core';
 import sqlstring from 'sqlstring';
 
@@ -54,7 +78,8 @@ export class PostgresPlaceholderStrategy extends SqlPlaceholderStrategy {
 
 export class PostgresPlatform extends DefaultPlatform {
     protected override defaultSqlType = 'text';
-    protected override annotationId = 'postgres';
+    public override annotationId = 'postgres';
+
     protected override defaultNowExpression = `now()`;
     public override readonly serializer: Serializer = postgresSerializer;
     override schemaParserType = PostgresSchemaParser;
@@ -63,22 +88,14 @@ export class PostgresPlatform extends DefaultPlatform {
 
     constructor() {
         super();
+        this.addType(() => true, 'jsonb'); //default everything is jsonb
 
-        this.addType(ReflectionKind.number, 'double precision');
-        this.addType(ReflectionKind.boolean, 'boolean');
+        this.addType(typeResolvesToNumber, 'double precision');
+        this.addType(typeResolvesToInteger, 'integer');
+        this.addType(typeResolvesToBigInt, 'bigint');
+        this.addType(typeResolvesToBoolean, 'boolean');
+        this.addType(typeResolvesToString, 'text');
 
-        this.addType(ReflectionKind.class, 'jsonb');
-        this.addType(ReflectionKind.objectLiteral, 'jsonb');
-        this.addType(ReflectionKind.array, 'jsonb');
-        this.addType(ReflectionKind.union, 'jsonb');
-
-        this.addType(v => v.kind === ReflectionKind.enum && v.indexType.kind === ReflectionKind.number, 'integer');
-        this.addType(v => v.kind === ReflectionKind.enum && v.indexType.kind === ReflectionKind.string, 'text');
-        this.addType(v => v.kind === ReflectionKind.enum && v.indexType.kind === ReflectionKind.union, 'jsonb');
-
-        this.addType(v => v.kind === ReflectionKind.any, 'jsonb');
-
-        this.addType(ReflectionKind.bigint, 'bigint');
         this.addType(type => type.kind === ReflectionKind.number && type.brand === TypeNumberBrand.integer, 'integer');
         this.addType(type => type.kind === ReflectionKind.number && type.brand === TypeNumberBrand.int8, 'smallint');
         this.addType(type => type.kind === ReflectionKind.number && type.brand === TypeNumberBrand.uint8, 'smallint');
@@ -92,7 +109,18 @@ export class PostgresPlatform extends DefaultPlatform {
 
         this.addType(isUUIDType, 'uuid');
         this.addBinaryType('bytea');
-        this.addType(type => type.kind === ReflectionKind.class && type.classType === Date, 'timestamp');
+        this.addType(typeResolvesToDate, 'timestamp');
+    }
+
+    override getSqlTypeCaster(type: Type): (placeholder: string) => string {
+        if (isReferenceType(type)) {
+            type = ReflectionClass.from(type).getPrimary().type;
+        }
+
+        const dbType = this.getTypeMapping(type);
+        if (!dbType) return super.getSqlTypeCaster(type);
+
+        return (placeholder: string) => placeholder + '::' + dbType.sqlType;
     }
 
     override getAggregateSelect(tableName: string, property: ReflectionProperty, func: string) {
@@ -102,8 +130,12 @@ export class PostgresPlatform extends DefaultPlatform {
         return super.getAggregateSelect(tableName, property, func);
     }
 
-    override createSqlFilterBuilder(schema: ReflectionClass<any>, tableName: string): PostgreSQLFilterBuilder {
-        return new PostgreSQLFilterBuilder(schema, tableName, this.serializer, new this.placeholderStrategy, this.quoteValue.bind(this), this.quoteIdentifier.bind(this));
+    override createSqlFilterBuilder(adapter: PreparedAdapter, schema: ReflectionClass<any>, tableName: string): PostgreSQLFilterBuilder {
+        return new PostgreSQLFilterBuilder(adapter, schema, tableName, this.serializer, new this.placeholderStrategy);
+    }
+
+    override getDeepColumnAccessor(table: string, column: string, path: string) {
+        return `${table ? table + '.' : ''}${this.quoteIdentifier(column)}->${this.quoteValue(path)}`;
     }
 
     override quoteValue(value: any): string {
@@ -112,10 +144,8 @@ export class PostgresPlatform extends DefaultPlatform {
         return escapeLiteral(value);
     }
 
-    override getColumnDDL(column: Column) {
+    protected getColumnType(column: Column): string {
         const ddl: string[] = [];
-
-        ddl.push(this.getIdentifier(column));
         if (column.isAutoIncrement) {
             ddl.push(`SERIAL`);
         } else {
@@ -131,7 +161,17 @@ export class PostgresPlatform extends DefaultPlatform {
             } else {
                 ddl.push((column.type || 'INTEGER') + column.getSizeDefinition());
             }
+        }
+        return ddl.filter(isSet).join(' ');
+    }
 
+    override getColumnDDL(column: Column) {
+        const ddl: string[] = [];
+
+        ddl.push(this.getIdentifier(column));
+        ddl.push(this.getColumnType(column));
+
+        if (!column.isAutoIncrement) {
             ddl.push(column.isNotNull ? this.getNotNullString() : this.getNullString());
             ddl.push(this.getColumnDefaultValueDDL(column));
         }
@@ -139,16 +179,72 @@ export class PostgresPlatform extends DefaultPlatform {
         return ddl.filter(isSet).join(' ');
     }
 
+    getModifyColumnDDL(diff: ColumnDiff): string {
+        // postgres doesn't support multiple column modifications in one ALTER TABLE statement
+        // see https://www.postgresql.org/docs/current/sql-altertable.html
+
+        const lines: string[] = [];
+
+        const identifier = this.getIdentifier(diff.to);
+
+        if (diff.from.type !== diff.to.type || diff.from.isAutoIncrement !== diff.to.isAutoIncrement) {
+            lines.push(`ALTER TABLE ${this.getIdentifier(diff.to.table)} ALTER ${identifier} TYPE ${this.getColumnType(diff.to)}`);
+        }
+
+        if (diff.from.isNotNull !== diff.to.isNotNull) {
+            if (diff.to.defaultExpression !== undefined || diff.to.defaultValue !== undefined) {
+                lines.push(`ALTER TABLE ${this.getIdentifier(diff.to.table)} ALTER ${identifier} SET ${this.getColumnDefaultValueDDL(diff.to)}`);
+            } else {
+                lines.push(`ALTER TABLE ${this.getIdentifier(diff.to.table)} ALTER ${identifier} DROP DEFAULT`);
+            }
+        }
+
+        if (diff.from.isNotNull !== diff.to.isNotNull) {
+            if (diff.to.isNotNull) {
+                //NOT NULL is newly added, so we need to update all existing rows to have a value
+                const defaultExpression = this.getDefaultExpression(diff.to);
+                if (defaultExpression) {
+                    lines.push(`UPDATE ${this.getIdentifier(diff.to.table)} SET ${identifier} = ${defaultExpression} WHERE ${identifier} IS NULL`);
+                }
+                lines.push(`ALTER TABLE ${this.getIdentifier(diff.to.table)} ALTER ${identifier} SET NOT NULL`);
+            } else {
+                lines.push(`ALTER TABLE ${this.getIdentifier(diff.to.table)} ALTER ${identifier} DROP NOT NULL`);
+            }
+        }
+
+        return lines.join(';\n')
+    }
+
+    getDefaultExpression(column: Column): string {
+        if (undefined !== column.defaultValue) {
+            // if type is from JSON type, we need to cast whatever is in defaultValue to JSON
+            if (column.type === 'jsonb') return `${this.quoteValue(JSON.stringify(column.defaultValue))}::jsonb`;
+            if (column.type === 'json') return `${this.quoteValue(JSON.stringify(column.defaultValue))}::json`;
+        }
+        return super.getDefaultExpression(column);
+    }
+
     getUniqueDDL(unique: IndexModel): string {
         return `CONSTRAINT ${this.getIdentifier(unique)} UNIQUE (${this.getColumnListDDL(unique.columns)})`;
     }
 
     getDropIndexDDL(index: IndexModel): string {
-        return `DROP CONSTRAINT ${this.getIdentifier(index)}`;
+        if (index.isUnique) {
+            return `ALTER TABLE ${this.getIdentifier(index.table)} DROP CONSTRAINT ${this.getIdentifier(index)}`;
+        }
+        return super.getDropIndexDDL(index);
     }
 
     supportsInlineForeignKey(): boolean {
         return false;
+    }
+
+    supportsAggregatedAlterTable(): boolean {
+        return false;
+    }
+
+    supportsSelectFor(): boolean {
+        return true;
     }
 
     getAutoIncrement() {

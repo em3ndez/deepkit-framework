@@ -1,3 +1,4 @@
+.yarn
 node_modules
 .idea
 docs
@@ -12,4 +13,8 @@ packages/benchmark/src/orm/end-to-end/sqlite/prisma.sqlite-journal
 packages/benchmark/results
 packages/example-app/var/debug
 packages/example-app/migrations
+packages/create-app/files/dist
+packages/create-app/files/var
 .vs
+.fleet
+.DS_Store

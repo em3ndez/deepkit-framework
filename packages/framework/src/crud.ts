@@ -237,7 +237,7 @@ function createController(schema: ReflectionClass<any>, options: AutoCrudOptions
             .response<ErrorMessage>(404, `When ${schema.name} was not found.`)
         async update(
             id: IdentifierType,
-            body: Partial<SchemaType>,
+            body: HttpBody<Partial<SchemaType>>,
         ) {
             let query = this.getDatabase().query(schema).filter({ [identifier.name]: id });
 
@@ -268,7 +268,7 @@ function createController(schema: ReflectionClass<any>, options: AutoCrudOptions
     return RestController;
 }
 
-export class CrudAppModule<T> extends AppModule<T> {
+export class CrudAppModule<T extends {}> extends AppModule<T> {
 }
 
 /**

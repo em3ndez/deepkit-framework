@@ -9,38 +9,58 @@
  */
 
 import { isArray, isPlainObject } from '@deepkit/core';
-import { isBackReferenceType, isReferenceType, ReflectionClass, ReflectionKind, resolvePath, Serializer, Type } from '@deepkit/type';
-import { SqlPlaceholderStrategy } from './platform/default-platform';
+import {
+    isBackReferenceType,
+    isReferenceType,
+    ReflectionClass,
+    ReflectionKind,
+    resolvePath,
+    Serializer,
+    Type,
+} from '@deepkit/type';
+import { SqlPlaceholderStrategy } from './platform/default-platform.js';
+import { getPreparedEntity, PreparedAdapter, PreparedEntity } from './prepare.js';
+import { SqlReference } from './sql-builder.js';
 
 type Filter = { [name: string]: any };
 
 export class SQLFilterBuilder {
     public params: any[] = [];
+    protected entity: PreparedEntity;
 
     constructor(
+        protected adapter: PreparedAdapter,
         protected schema: ReflectionClass<any>,
         protected tableName: string,
         protected serializer: Serializer,
         public placeholderStrategy: SqlPlaceholderStrategy,
-        protected quoteValue: (v: any) => string,
-        protected quoteId: (v: string) => string
     ) {
+        this.entity = getPreparedEntity(adapter, schema);
     }
 
     isNull() {
         return 'IS NULL';
     }
 
-    regexpComparator() {
-        return 'REGEXP';
+    regexpComparator(lvalue: string, value: RegExp): string {
+        return `${lvalue} REGEXP ${this.bindParam(value.source)}`;
+    }
+
+    isNotNull() {
+        return 'IS NOT NULL';
     }
 
     convert(filter: Filter): string {
         return this.conditions(filter, 'AND').trim();
     }
 
+    protected bindParam(value: any): string {
+        this.params.push(value);
+        return this.placeholderStrategy.getPlaceholder();
+    }
+
     /**
-     * Normalizes values necessary for the conection driver to bind parameters for prepared statements.
+     * Normalizes values necessary for the connection driver to bind parameters for prepared statements.
      * E.g. SQLite does not support boolean, so we convert boolean to number.
      */
     protected bindValue(value: any): any {
@@ -61,15 +81,14 @@ export class SQLFilterBuilder {
     }
 
     protected quoteIdWithTable(id: string): string {
-        if (this.tableName) return `${this.tableName}.${this.quoteId(id)}`;
-        return `${this.quoteId(id)}`;
+        return `${this.adapter.platform.getColumnAccessor(this.tableName, this.entity.fieldMap[id]?.columnName || id)}`;
     }
 
     requiresJson(type: Type): boolean {
         return type.kind === ReflectionKind.class || type.kind === ReflectionKind.objectLiteral || type.kind === ReflectionKind.array;
     }
 
-    protected condition(fieldName: string | undefined, value: any, comparison: 'eq' | 'gt' | 'gte' | 'in' | 'lt' | 'lte' | 'ne' | 'nin' | string): string {
+    protected condition(fieldName: string | undefined, value: any, comparison: 'eq' | 'gt' | 'gte' | 'in' | 'lt' | 'lte' | 'ne' | 'nin' | 'like' | string): string {
         if (fieldName === undefined) {
             throw new Error('No comparison operators at root level allowed');
         }
@@ -89,16 +108,16 @@ export class SQLFilterBuilder {
         else if (comparison === 'ne') cmpSign = '!=';
         else if (comparison === 'in') cmpSign = 'IN';
         else if (comparison === 'nin') cmpSign = 'NOT IN';
-        else if (comparison === 'regex') cmpSign = this.regexpComparator();
+        else if (comparison === 'like') cmpSign = 'LIKE';
+        else if (comparison === 'regex') return this.regexpComparator(this.quoteIdWithTable(fieldName), value);
         else throw new Error(`Comparator ${comparison} not supported.`);
 
-        const referenceValue = 'string' === typeof value && value[0] === '$';
         let rvalue = '';
-        if (referenceValue) {
-            rvalue = `${this.quoteIdWithTable(value.substr(1))}`;
+        if (value instanceof SqlReference) {
+            rvalue = `${this.quoteIdWithTable(value.field)}`;
         } else {
             if (value === undefined || value === null) {
-                cmpSign = this.isNull();
+                cmpSign = cmpSign === '!=' ? this.isNotNull() : this.isNull();
                 rvalue = '';
             } else {
                 const property = resolvePath(fieldName, this.schema.type);
@@ -109,7 +128,7 @@ export class SQLFilterBuilder {
                         for (let item of value) {
                             params.push(this.placeholderStrategy.getPlaceholder());
 
-                            if (!isReferenceType(property) && !isBackReferenceType(property) && this.requiresJson(property)) {
+                            if ((fieldName.includes('.') && this.adapter.platform.deepColumnAccessorRequiresJsonString()) || !isReferenceType(property) && !isBackReferenceType(property) && this.requiresJson(property)) {
                                 item = JSON.stringify(item);
                             }
                             this.params.push(this.bindValue(item));
@@ -119,7 +138,7 @@ export class SQLFilterBuilder {
                 } else {
                     rvalue = this.placeholderStrategy.getPlaceholder();
 
-                    if (!isReferenceType(property) && !isBackReferenceType(property) && this.requiresJson(property)) {
+                    if ((fieldName.includes('.') && this.adapter.platform.deepColumnAccessorRequiresJsonString()) || !isReferenceType(property) && !isBackReferenceType(property) && this.requiresJson(property)) {
                         value = JSON.stringify(value);
                     }
                     this.params.push(this.bindValue(value));
@@ -127,18 +146,7 @@ export class SQLFilterBuilder {
             }
         }
 
-        // if (comparison === 'in' || comparison === 'nin') rvalue = '(' + rvalue + ')';
-
-        if (fieldName.includes('.')) {
-            const [column, path] = this.splitDeepFieldPath(fieldName);
-            return `${this.getDeepColumnAccessor(this.tableName, column, path)} ${cmpSign} ${rvalue}`;
-        }
-
         return `${this.quoteIdWithTable(fieldName)} ${cmpSign} ${rvalue}`;
-    }
-
-    protected getDeepColumnAccessor(table: string, column: string, path: string) {
-        return `${table}.${this.quoteId(column)}->${this.quoteValue('$.' + path)}`;
     }
 
     protected splitDeepFieldPath(path: string): [column: string, path: string] {
@@ -157,8 +165,9 @@ export class SQLFilterBuilder {
             if (i === '$and') return this.conditionsArray(filter[i], 'AND');
             if (i === '$not') return `NOT ` + this.conditionsArray(filter[i], 'AND');
 
-            if (i === '$exists') sql.push(this.quoteValue(this.schema.hasProperty(i)));
-            else if (i[0] === '$') sql.push(this.condition(fieldName, filter[i], i.substr(1)));
+            if (i === '$exists') sql.push(this.adapter.platform.quoteValue(this.schema.hasProperty(i)));
+            else if (i[0] === '$') sql.push(this.condition(fieldName, filter[i], i.substring(1)));
+            else if (filter[i] instanceof RegExp) sql.push(this.condition(i, filter[i], 'regex'));
             else sql.push(this.condition(i, filter[i], 'eq'));
         }
 

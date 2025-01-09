@@ -1,11 +1,11 @@
 import { expect, test } from '@jest/globals';
-import { ReceiveType, ReflectionClass, resolveReceiveType } from '../src/reflection/reflection';
-import { AutoIncrement, BackReference, isReferenceType, MapName, MongoId, PrimaryKey, Reference, UUID } from '../src/reflection/type';
-import { cast, cloneClass, serialize } from '../src/serializer-facade';
-import { createReference } from '../src/reference';
-import { unpopulatedSymbol } from '../src/core';
+import { ReceiveType, ReflectionClass, resolveReceiveType } from '../src/reflection/reflection.js';
+import { AutoIncrement, BackReference, isReferenceType, MapName, MongoId, PrimaryKey, Reference, UUID } from '../src/reflection/type.js';
+import { cast, cloneClass, serialize } from '../src/serializer-facade.js';
+import { createReference } from '../src/reference.js';
+import { unpopulatedSymbol } from '../src/core.js';
 
-(BigInt.prototype as any).toJSON = function () {
+(BigInt.prototype as any).toJSON = function() {
     return this.toString();
 };
 
@@ -95,6 +95,7 @@ test('partial keeps explicitely undefined fields', () => {
 
     {
         const item = serializeToJson<Partial<Model>>({ title: undefined });
+        expect(item).toEqual({ title: null });
     }
 
     {
@@ -243,7 +244,7 @@ test('model 1', () => {
             filter: undefined,
             skip: undefined,
             limit: undefined,
-            sort: undefined
+            sort: undefined,
         };
         expect(roundTrip<Model>(model as any)).toEqual(model);
     }
@@ -356,7 +357,7 @@ test('relation 2', () => {
                 name: 'Marc 1',
                 id: 3,
                 version: 0,
-            })
+            }),
         ];
 
         expect(roundTrip<User[]>(items)).toEqual(items);
@@ -435,7 +436,7 @@ test('partial returns the model at second level', () => {
 
     expect(roundTrip<Partial<Model>>({ id: 23, config: config } as any)).toEqual({
         id: 23,
-        config: { big: false, color: 'red' }
+        config: { big: false, color: 'red' },
     });
     expect(roundTrip<Partial<Model>>({ id: 23, config: config } as any).config).toBeInstanceOf(Config);
 });
@@ -586,7 +587,7 @@ test('omit circular reference 1', () => {
         another?: Model;
 
         constructor(
-            public id: number = 0
+            public id: number = 0,
         ) {
         }
     }
@@ -755,9 +756,129 @@ test('dynamic properties', () => {
         }
     }
 
-    const back1 = deserializeFromJson<A>({'~type': 'abc'});
+    const back1 = deserializeFromJson<A>({ '~type': 'abc' });
     expect(back1.getType()).toBe('abc');
 
-    const back2 = deserializeFromJson<A>({'type': 'abc'});
+    const back2 = deserializeFromJson<A>({ 'type': 'abc' });
     expect(back2.getType()).toBe('abc');
+});
+
+test('class with statics', () => {
+    class PilotId {
+        public static readonly none: PilotId = new PilotId(0);
+
+        constructor(public readonly value: number) {
+        }
+
+        static from(value: number) {
+            return new PilotId(value);
+        }
+    }
+
+    expect(deserializeFromJson<PilotId>({ value: 34 })).toEqual({ value: 34 });
+    expect(serializeToJson<PilotId>({ value: 33 })).toEqual({ value: 33 });
+});
+
+test('primary key only for reference becomes reference', () => {
+    expect(deserializeFromJson<Team>({ id: 1, name: 'a', lead: 34 }).lead).toBeInstanceOf(User);
+    expect(deserializeFromJson<Team>({ id: 1, name: 'a', lead: { id: 34 } }).lead).toBeInstanceOf(User);
+});
+
+test('array with mongoid', () => {
+    interface Model {
+        references: Array<{ cls: string, id: MongoId }>;
+    }
+
+    expect(deserializeFromJson<Model>({ references: [{ cls: 'User', id: '5f3b9b3b9c6b2b1b1c0b1b1b' }] })).toEqual({
+        references: [{ cls: 'User', id: '5f3b9b3b9c6b2b1b1c0b1b1b' }],
+    });
+
+    expect(serializeToJson<Model>({ references: [{ cls: 'User', id: '5f3b9b3b9c6b2b1b1c0b1b1b' }] })).toEqual({
+        references: [{ cls: 'User', id: '5f3b9b3b9c6b2b1b1c0b1b1b' }],
+    });
+});
+
+test('Map part of union', () => {
+    type T1 = null | Map<Date, number>;
+    type T2 = null | { tags: Map<Date, number> };
+
+    expect(roundTrip<T1>(null)).toBe(null);
+    expect(roundTrip<T2>(null)).toBe(null);
+
+    {
+        const date = new Date;
+        const map = new Map<Date, number>([[date, 1]]);
+        expect(serializeToJson<T1>(map)).toEqual([[date.toJSON(), 1]]);
+        expect(roundTrip<T1>(map)).toEqual(map);
+        expect(roundTrip<T2>({ tags: map })).toEqual({ tags: map });
+    }
+
+    // empty map
+    {
+        const map = new Map<Date, number>();
+        expect(serializeToJson<T1>(map)).toEqual([]);
+        expect(roundTrip<T1>(map)).toEqual(map);
+        expect(roundTrip<T2>({ tags: map })).toEqual({ tags: map });
+    }
+});
+
+test('constructor property not assigned as property', () => {
+    //when a constructor property is assigned, it must be set via the constructor only
+    class Base {
+        constructor(public id: string) {
+        }
+    }
+
+    class Store {
+        id: string = '';
+    }
+
+    class Derived extends Base {
+        constructor(public store: Store) {
+            super(store.id.split(':')[0]);
+        }
+    }
+
+    const clazz = ReflectionClass.from(Derived);
+    expect(clazz.getConstructorOrUndefined()?.getParameter('store').isProperty()).toBe(true);
+    const parentConstructor = clazz.parent!.getConstructorOrUndefined();
+    expect(parentConstructor!.getParameter('id').isProperty()).toBe(true);
+
+    const store = new Store;
+    store.id = 'foo:bar';
+    const derived = new Derived(store);
+    expect(derived.id).toBe('foo');
+
+    const json = serializeToJson<Derived>(derived);
+    expect(json).toEqual({ id: 'foo', store: { id: 'foo:bar' } });
+
+    const back = deserializeFromJson<Derived>({
+        id: 'unrelated',
+        store: { id: 'foo:bar' },
+    });
+    expect(back).toEqual(derived);
+});
+
+test('custom symbol names as method names', () => {
+    class Model {
+        [Symbol.for('foo')]() {
+            return 'bar';
+        }
+    }
+
+    const type = ReflectionClass.from(Model);
+    const method = type.getMethod(Symbol.for('foo'));
+    expect(method).toBeDefined();
+});
+
+test('global symbol names as method names', () => {
+    class Model {
+        [Symbol.iterator]() {
+            return [];
+        }
+    }
+
+    const type = ReflectionClass.from(Model);
+    const method = type.getMethod(Symbol.iterator);
+    expect(method).toBeDefined();
 });

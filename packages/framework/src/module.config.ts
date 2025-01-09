@@ -7,8 +7,26 @@
  *
  * You should have received a copy of the MIT License along with this program.
  */
+import { HttpConfig } from '@deepkit/http';
 
 const isWindows = 'undefined' !== typeof process ? process.platform === 'win32' : false;
+
+export class BrokerConfig {
+    /**
+     * @description If startOnBootstrap is true, the broker server starts at this address. Unix socket path or host:port combination
+     */
+    listen: string = isWindows ? 'localhost:8811' : 'var/broker.sock';
+
+    /**
+     * @description If a different broker server should be used, this is its address. Unix socket path or host:port combination.
+     */
+    host: string | string[] = isWindows ? 'localhost:8811' : 'var/broker.sock';
+
+    /**
+     * @description Automatically starts a single broker in the main process. Disable it if you have a custom broker node.
+     */
+    startOnBootstrap: boolean = true;
+}
 
 export class FrameworkConfig {
     host: string = '0.0.0.0'; //binding to localhost is roughly 20% faster.
@@ -23,14 +41,24 @@ export class FrameworkConfig {
      */
     selfSigned?: boolean;
 
-    keepAliveTimeout?: number;
-
     path: string = '/';
+
+    /**
+     * The compression level to use when using the zlib module.
+     * 0 means no compression, and 9 is the maximum compression.
+     */
+    compression: number = 6;
 
     /**
      * @description A value of 0 means the main process handles requests alone. A value of > 0 means the main process does not handle any requests and anything is redirected to workers.
      */
     workers: number = 0;
+
+    /**
+     * When server is shutting down gracefully, this timeout is used to wait for all connections to be closed.
+     * Default is 5 seconds.
+     */
+    gracefulShutdownTimeout: number = 5;
 
     /**
      * @description Enables HTTPS server.
@@ -81,14 +109,24 @@ export class FrameworkConfig {
 
     debug: boolean = false;
 
+    /**
+     * @description If set, allows to call RPC methods via HTTP. The value is the base URL for the RPC calls.
+     * Use e.g. `/rpc/v1`
+     */
+    httpRpcBasePath: string = '';
+
     debugUrl: string = '_debug';
 
-    debugProfiler: boolean = true;
+    /**
+     * Whether profiling is enabled. This is automatically enabled when debug is enabled,
+     * but can be enabled separately.
+     */
+    profile: boolean = false;
 
     /**
      * @description IP:Port or unix socket name or named pipes.
      */
-    debugBrokerHost: string = isWindows ? '127.0.0.1:9882' : 'var/debug-broker.sock';
+    debugBrokerHost?: string;
 
     varPath: string = 'var/';
 
@@ -113,4 +151,12 @@ export class FrameworkConfig {
     migrateOnStartup: boolean = false;
 
     migrationDir: string = 'migrations';
+
+    broker: BrokerConfig = new BrokerConfig;
+
+    /**
+     * Will be forwarded to HttpModule.
+     * @see HttpConfig
+     */
+    http: HttpConfig = new HttpConfig;
 }

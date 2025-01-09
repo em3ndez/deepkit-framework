@@ -14,17 +14,23 @@ export type NumberFields<T> = { [K in keyof T]: T[K] extends number | bigint ? K
 export type Expression<T> = { [P in keyof T & string]?: string; }
 export type Partial<T> = { [P in keyof T & string]?: T[P] }
 
+export type DeepPartial<T> = {
+    [P in keyof T]?: T[P]
+} & { [deepPath: string]: any };
+
 export interface ChangesInterface<T> {
-    $set?: Partial<T> | T;
+    $set?: DeepPartial<T> | T;
     $unset?: { [path: string]: number };
     $inc?: Partial<Pick<T, NumberFields<T>>>;
 }
 
 export class Changes<T extends object> {
-    $set?: Partial<T> | T;
+    $set?: DeepPartial<T> | T;
     $unset?: { [path: string]: number };
     $inc?: Partial<Pick<T, NumberFields<T>>>;
     empty = true;
+
+    fieldNames: string[] = [];
 
     constructor(
         changes?: ChangesInterface<T>
@@ -58,8 +64,11 @@ export class Changes<T extends object> {
         this.empty = this.$set === undefined && this.$unset === undefined && this.$inc === undefined;
     }
 
-    replaceSet($set: Partial<T> | T) {
+    replaceSet($set: DeepPartial<T> | T) {
         this.$set = empty($set) ? undefined : $set;
+        for (const i in $set as any) {
+            if (!this.fieldNames.includes(i)) this.fieldNames.push(i);
+        }
         this.detectEmpty();
     }
 
@@ -68,6 +77,7 @@ export class Changes<T extends object> {
 
         if (!this.$set) this.$set = {};
         for (const i in $set as any) {
+            if (!this.fieldNames.includes(i)) this.fieldNames.push(i);
             (this.$set as any)[i] = ($set as any)[i];
         }
         this.detectEmpty();
@@ -76,18 +86,21 @@ export class Changes<T extends object> {
     increase(property: NumberFields<T>, increase: number = 1) {
         if (!this.$inc) this.$inc = {};
         (this.$inc as any)[property] = increase;
+        if ('string' === typeof property && !this.fieldNames.includes(property)) this.fieldNames.push(property);
         this.empty = false;
     }
 
     set(property: keyof T & string, value: any) {
         if (!this.$set) this.$set = {};
         (this.$set as any)[property] = value;
+        if ('string' === typeof property && !this.fieldNames.includes(property)) this.fieldNames.push(property);
         this.empty = false;
     }
 
     unset(property: keyof T & string, unset = true) {
         if (!this.$unset) this.$unset = {};
         (this.$unset as any)[property] = unset;
+        if ('string' === typeof property && !this.fieldNames.includes(property)) this.fieldNames.push(property);
         this.empty = false;
     }
 
@@ -132,8 +145,7 @@ export class AtomicChangeInstance<T extends object> {
 
     increase(property: NumberFields<T>, increase: number = 1) {
         this.object[property] += increase;
-        (this.changeSet.$inc as any)[property] = increase as any;
-        this.changeSet.empty = false;
+        this.changeSet.increase(property, increase);
     }
 }
 

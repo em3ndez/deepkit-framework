@@ -1,7 +1,9 @@
 import { expect, test } from '@jest/globals';
-import { Database } from '@deepkit/orm';
-import { MongoDatabaseAdapter } from '../src/adapter';
+import { Database, DatabaseErrorEvent, onDatabaseError } from '@deepkit/orm';
+import { MongoDatabaseAdapter } from '../src/adapter.js';
 import { entity, MongoId, PrimaryKey } from '@deepkit/type';
+import { MongoConnectionError, MongoDatabaseError } from '../src/client/error.js';
+import { assertDefined, assertInstanceOf } from '@deepkit/core';
 
 test('simple', async () => {
     @entity.name('asd')
@@ -12,7 +14,7 @@ test('simple', async () => {
         }
     }
 
-    const database = new Database(new MongoDatabaseAdapter('mongodb://localhost/test'));
+    const database = new Database(new MongoDatabaseAdapter('mongodb://127.0.0.1/test'));
     await database.query(Test).deleteMany();
 
     {
@@ -38,7 +40,7 @@ test('unit of work', async () => {
         }
     }
 
-    const database = new Database(new MongoDatabaseAdapter('mongodb://localhost/test'));
+    const database = new Database(new MongoDatabaseAdapter('mongodb://127.0.0.1/test'));
     await database.query(Test).deleteMany();
 
     const session = database.createSession();
@@ -69,7 +71,7 @@ test('repository', async () => {
         }
     }
 
-    const database = new Database(new MongoDatabaseAdapter('mongodb://localhost/test'));
+    const database = new Database(new MongoDatabaseAdapter('mongodb://127.0.0.1/test'));
     await database.query(Test).deleteMany();
     const item = new Test('asda');
     await database.persist(item);
@@ -100,7 +102,7 @@ test('session', async () => {
         }
     }
 
-    const database = new Database(new MongoDatabaseAdapter('mongodb://localhost/test'));
+    const database = new Database(new MongoDatabaseAdapter('mongodb://127.0.0.1/test'));
     await database.query(Test).deleteMany();
 
     await database.session(async (session) => {
@@ -116,4 +118,70 @@ test('session', async () => {
     }
 
     database.disconnect();
+});
+
+test('errors connect', async () => {
+    class Test {
+        _id: MongoId & PrimaryKey = '';
+
+        constructor(public name: string) {
+        }
+    }
+
+    const database = new Database(new MongoDatabaseAdapter('mongodb://invalid/test'));
+    let called: DatabaseErrorEvent | undefined;
+    database.listen(onDatabaseError, (event) => {
+        called = event;
+    });
+
+    await expect(() => database.query(Test).findOne()).rejects.toThrow('Failed to connect: getaddrinfo ENOTFOUND invalid');
+    await expect(() => database.query(Test).findOne()).rejects.toBeInstanceOf(MongoConnectionError);
+
+    assertDefined(called);
+    assertInstanceOf(called.error, MongoConnectionError);
+    expect(called.error.message).toContain('Failed to connect: getaddrinfo ENOTFOUND invalid');
+});
+
+test('errors raw', async () => {
+    class Test {
+        _id: MongoId & PrimaryKey = '';
+
+        constructor(public name: string) {
+        }
+    }
+
+    const database = new Database(new MongoDatabaseAdapter('mongodb://127.0.0.1/test'));
+    let called: DatabaseErrorEvent | undefined;
+    database.listen(onDatabaseError, (event) => {
+        called = event;
+    });
+
+    await expect(() => database.raw<Test>([{$invalid: 1}]).find()).rejects.toThrow('Unrecognized pipeline stage name');
+
+    assertDefined(called);
+    assertInstanceOf(called.error, MongoDatabaseError);
+    expect(called.error.code).toBe(40324);
+    expect(called.error.message).toContain('Unrecognized pipeline stage nam');
+});
+
+test('errors query', async () => {
+    class Test {
+        _id: MongoId & PrimaryKey = '';
+
+        constructor(public name: string) {
+        }
+    }
+
+    const database = new Database(new MongoDatabaseAdapter('mongodb://127.0.0.1/test'));
+    let called: DatabaseErrorEvent | undefined;
+    database.listen(onDatabaseError, (event) => {
+        called = event;
+    });
+
+    await expect(() => database.query<Test>().filter({$invalid: 1}).find()).rejects.toThrow('unknown top level operator: $invalid');
+
+    assertDefined(called);
+    assertInstanceOf(called.error, MongoDatabaseError);
+    expect(called.error.code).toBe(2);
+    expect(called.error.message).toContain('unknown top level operator: $invalid');
 });

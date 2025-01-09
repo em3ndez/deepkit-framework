@@ -1,8 +1,6 @@
 import {
     binaryBigIntAnnotation,
     BinaryBigIntType,
-    buildFunction,
-    callExtractedFunctionIfAvailable,
     collapsePath,
     ContainerAccessor,
     createTypeGuardFunction,
@@ -11,13 +9,14 @@ import {
     excludedAnnotation,
     executeTemplates,
     extendTemplateLiteral,
-    extractStateToFunctionAndCallIt,
+    getDeepConstructorProperties,
     getIndexCheck,
     getNameExpression,
     getStaticDefaultCodeForProperty,
     hasDefaultValue,
     isNullable,
     isOptional,
+    isPropertyMemberType,
     mongoIdAnnotation,
     ReflectionClass,
     ReflectionKind,
@@ -26,6 +25,7 @@ import {
     sortSignatures,
     TemplateState,
     Type,
+    TypeArray,
     TypeClass,
     TypeGuardRegistry,
     TypeIndexSignature,
@@ -36,10 +36,10 @@ import {
     TypeTemplateLiteral,
     TypeTuple,
     TypeUnion,
-    uuidAnnotation
+    uuidAnnotation,
 } from '@deepkit/type';
-import { seekElementSize } from './continuation';
-import { BSONType, digitByteSize, isSerializable } from './utils';
+import { seekElementSize } from './continuation.js';
+import { BSONType, digitByteSize, isSerializable } from './utils.js';
 
 function getNameComparator(name: string): string {
     //todo: support utf8 names
@@ -530,7 +530,8 @@ export function bsonTypeGuardTuple(type: TypeTuple, state: TemplateState) {
     `);
 }
 
-export function deserializeArray(elementType: Type, state: TemplateState) {
+export function deserializeArray(type: TypeArray, state: TemplateState) {
+    const elementType = type.type;
     const result = state.compilerContext.reserveName('result');
     const v = state.compilerContext.reserveName('v');
     const i = state.compilerContext.reserveName('i');
@@ -566,7 +567,8 @@ export function deserializeArray(elementType: Type, state: TemplateState) {
  * This array type guard goes through all array elements in order to determine the correct type.
  * This is only necessary when a union has at least 2 array members, otherwise a simple array check is enough.
  */
-export function bsonTypeGuardArray(elementType: Type, state: TemplateState) {
+export function bsonTypeGuardArray(type: TypeArray, state: TemplateState) {
+    const elementType = type.type;
     const v = state.compilerContext.reserveName('v');
     const i = state.compilerContext.reserveName('i');
     state.setContext({ digitByteSize, seekElementSize });
@@ -642,11 +644,6 @@ export function deserializeObjectLiteral(type: TypeClass | TypeObjectLiteral, st
     //         return;
     //     }
     // }
-
-    if (callExtractedFunctionIfAvailable(state, type)) return;
-    const extract = extractStateToFunctionAndCallIt(state, type);
-    state = extract.state;
-
     const lines: string[] = [];
     const signatures: TypeIndexSignature[] = [];
     const object = state.compilerContext.reserveName('object');
@@ -670,7 +667,7 @@ export function deserializeObjectLiteral(type: TypeClass | TypeObjectLiteral, st
             if (excludedAnnotation.isExcluded(member.type, state.registry.serializer.name)) continue;
             signatures.push(member);
         }
-        if (member.kind !== ReflectionKind.property && member.kind !== ReflectionKind.propertySignature) continue;
+        if (!isPropertyMemberType(member)) continue;
         if (!isSerializable(member.type)) continue;
         if (excludedAnnotation.isExcluded(member.type, state.registry.serializer.name)) continue;
 
@@ -756,7 +753,7 @@ export function deserializeObjectLiteral(type: TypeClass | TypeObjectLiteral, st
 
         for (const signature of signatures) {
             const check = isOptional(signature.type) ? `` : `elementType !== ${BSONType.UNDEFINED} &&`;
-            signatureLines.push(`else if (${check} ${getIndexCheck(state, i, signature.index)}) {
+            signatureLines.push(`else if (${check} ${getIndexCheck(state.compilerContext, i, signature.index)}) {
                 ${executeTemplates(state.fork(`${object}[${i}]`).extendPath(new RuntimeCode(i)).forPropertyName(new RuntimeCode(i)), signature.type)}
                 continue;
             }`);
@@ -782,6 +779,7 @@ export function deserializeObjectLiteral(type: TypeClass | TypeObjectLiteral, st
     if (type.kind === ReflectionKind.class && type.classType !== Object) {
         const reflection = ReflectionClass.from(type.classType);
         const constructor = reflection.getConstructorOrUndefined();
+
         if (constructor && constructor.parameters.length) {
             const constructorArguments: string[] = [];
             for (const parameter of constructor.getParameters()) {
@@ -789,8 +787,12 @@ export function deserializeObjectLiteral(type: TypeClass | TypeObjectLiteral, st
                 constructorArguments.push(parameter.getVisibility() === undefined ? 'undefined' : `${object}[${name}]`);
             }
 
+            const constructorProperties = getDeepConstructorProperties(type).map(v => String(v.name));
+            const resetDefaultSets = constructorProperties.map(v => `delete ${object}.${v};`);
+
             createClassInstance = `
                 ${state.setter} = new ${state.compilerContext.reserveConst(type.classType, 'classType')}(${constructorArguments.join(', ')});
+                ${resetDefaultSets.join('\n')}
                 Object.assign(${state.setter}, ${object});
             `;
         } else {
@@ -842,8 +844,6 @@ export function deserializeObjectLiteral(type: TypeClass | TypeObjectLiteral, st
             state.elementType = oldElementType;
         }
     `);
-
-    extract.setFunction(buildFunction(state, type));
 }
 
 export function bsonTypeGuardObjectLiteral(type: TypeClass | TypeObjectLiteral, state: TemplateState) {
@@ -861,10 +861,6 @@ export function bsonTypeGuardObjectLiteral(type: TypeClass | TypeObjectLiteral, 
     //     return;
     // }
 
-    if (callExtractedFunctionIfAvailable(state, type)) return;
-    const extract = extractStateToFunctionAndCallIt(state, type);
-    state = extract.state;
-
     const lines: string[] = [];
     const signatures: TypeIndexSignature[] = [];
     const valid = state.compilerContext.reserveName('valid');
@@ -879,7 +875,7 @@ export function bsonTypeGuardObjectLiteral(type: TypeClass | TypeObjectLiteral, 
             if (excludedAnnotation.isExcluded(member.type, state.registry.serializer.name)) continue;
             signatures.push(member);
         }
-        if (member.kind !== ReflectionKind.property && member.kind !== ReflectionKind.propertySignature) continue;
+        if (!isPropertyMemberType(member)) continue;
         if (!isSerializable(member.type)) continue;
         if (excludedAnnotation.isExcluded(member.type, state.registry.serializer.name)) continue;
 
@@ -930,7 +926,7 @@ export function bsonTypeGuardObjectLiteral(type: TypeClass | TypeObjectLiteral, 
         sortSignatures(signatures);
 
         for (const signature of signatures) {
-            signatureLines.push(`else if (${getIndexCheck(state, i, signature.index)}) {
+            signatureLines.push(`else if (${getIndexCheck(state.compilerContext, i, signature.index)}) {
                 ${executeTemplates(state.fork(valid).extendPath(new RuntimeCode(i)).forPropertyName(new RuntimeCode(i)), signature.type)}
 
                 if (!${valid}) break;
@@ -986,8 +982,6 @@ export function bsonTypeGuardObjectLiteral(type: TypeClass | TypeObjectLiteral, 
             ${state.setter} = ${valid};
         }
     `);
-
-    extract.setFunction(buildFunction(state, type));
 }
 
 export function bsonTypeGuardForBsonTypes(types: BSONType[]): (type: Type, state: TemplateState) => void {

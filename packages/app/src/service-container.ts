@@ -9,15 +9,37 @@
  */
 
 import { ClassType, getClassName, isClass, isFunction } from '@deepkit/core';
-import { EventDispatcher } from '@deepkit/event';
-import { AppModule, ConfigurationInvalidError, MiddlewareConfig, ModuleDefinition } from './module';
-import { Injector, InjectorContext, InjectorModule, isProvided, ProviderWithScope, resolveToken, Token } from '@deepkit/injector';
-import { cli } from './command';
+import { EventDispatcher, EventListenerRegistered, isEventListenerContainerEntryCallback } from '@deepkit/event';
+import { AddedListener, AppModule, ConfigurationInvalidError, MiddlewareConfig, ModuleDefinition } from './module.js';
+import {
+    injectedFunction,
+    Injector,
+    InjectorContext,
+    InjectorModule,
+    isProvided,
+    ProviderWithScope,
+    resolveToken,
+    Token,
+} from '@deepkit/injector';
+import { cli } from './command.js';
 import { WorkflowDefinition } from '@deepkit/workflow';
-import { deserialize, ReflectionClass, validate } from '@deepkit/type';
+import { deserialize, ReflectionClass, ReflectionFunction, validate } from '@deepkit/type';
+import { ConsoleTransport, Logger, ScopedLogger } from '@deepkit/logger';
+import { Stopwatch } from '@deepkit/stopwatch';
+
+/**
+ * @reflection never
+ */
+export interface ControllerConfig {
+    controller?: ClassType,
+    name?: string;
+    for?: string; //e.g. cli
+    callback?: Function;
+    module: InjectorModule;
+}
 
 export class CliControllerRegistry {
-    public readonly controllers = new Map<string, { controller: ClassType, module: InjectorModule }>();
+    public readonly controllers: ControllerConfig[] = [];
 }
 
 export type MiddlewareRegistryEntry = { config: MiddlewareConfig, module: AppModule<any> };
@@ -75,17 +97,27 @@ export class ServiceContainer {
         this.configLoaders.push(loader);
     }
 
+    /**
+     * Builds the whole module tree, processes all providers, controllers, and listeners.
+     * Makes InjectorContext available. Is usually automatically called when the injector is requested.
+     */
     public process() {
         if (this.injectorContext) return;
-
-        this.setupHook(this.appModule);
-        this.findModules(this.appModule);
 
         this.appModule.addProvider({ provide: ServiceContainer, useValue: this });
         this.appModule.addProvider({ provide: EventDispatcher, useValue: this.eventDispatcher });
         this.appModule.addProvider({ provide: CliControllerRegistry, useValue: this.cliControllerRegistry });
         this.appModule.addProvider({ provide: MiddlewareRegistry, useValue: this.middlewareRegistry });
         this.appModule.addProvider({ provide: InjectorContext, useFactory: () => this.injectorContext! });
+        this.appModule.addProvider({ provide: Stopwatch });
+        this.appModule.addProvider(ConsoleTransport);
+        if (!this.appModule.isProvided(Logger)) {
+            this.appModule.addProvider({ provide: Logger, useFactory: (t: ConsoleTransport) => new Logger([t]) });
+        }
+        this.appModule.addProvider(ScopedLogger);
+
+        this.setupHook(this.appModule);
+        this.findModules(this.appModule);
 
         this.processModule(this.appModule);
 
@@ -149,9 +181,14 @@ export class ServiceContainer {
     }
 
     protected bootstrapModules(): void {
-        for (const m of this.modules) {
-            if (m.options.bootstrap) {
-                this.getInjector(m).get(m.options.bootstrap);
+        for (const module of this.modules) {
+            if (module.options.bootstrap) {
+                this.getInjector(module).get(module.options.bootstrap);
+            }
+
+            for (const use of module.uses) {
+                const resolvedFunction = injectedFunction(use, this.getInjector(module));
+                resolvedFunction();
             }
         }
     }
@@ -200,6 +237,7 @@ export class ServiceContainer {
 
         const providers = module.getProviders();
         const controllers = module.getControllers();
+        const commands = module.getCommands();
         const listeners = module.getListeners();
         const middlewares = module.getMiddlewares();
 
@@ -221,21 +259,29 @@ export class ServiceContainer {
             this.middlewareRegistry.configs.push({ config, module });
         }
 
-        for (const listener of listeners) {
-            if (isClass(listener)) {
-                providers.unshift({ provide: listener });
-                this.eventDispatcher.registerListener(listener, module);
-            } else {
-                this.eventDispatcher.add(listener.eventToken, { fn: listener.callback, order: listener.order, module: listener.module || module });
-            }
+        for (const controller of controllers) {
+            this.processController(module, { module, controller });
         }
 
-        for (const controller of controllers) {
-            this.processController(module, controller);
+        for (const command of commands) {
+            this.processController(module, { module, for: 'cli', ...command });
         }
 
         for (const provider of providers) {
             this.processProvider(module, resolveToken(provider), provider);
+        }
+
+        for (const listener of listeners) {
+            if (isClass(listener)) {
+                providers.unshift({ provide: listener });
+                for (const listenerEntry of this.eventDispatcher.registerListener(listener, module)) {
+                    this.processListener(module, listenerEntry);
+                }
+            } else {
+                const listenerObject = { fn: listener.callback, order: listener.order, module: listener.module || module };
+                this.eventDispatcher.add(listener.eventToken, listenerObject);
+                this.processListener(module, { eventToken: listener.eventToken, listener: listenerObject });
+            }
         }
 
         for (const imp of module.getImports()) {
@@ -244,11 +290,38 @@ export class ServiceContainer {
         }
     }
 
-    protected processController(module: AppModule<any>, controller: ClassType) {
-        const cliConfig = cli._fetch(controller);
-        if (cliConfig) {
-            if (!module.isProvided(controller)) module.addProvider({ provide: controller, scope: 'cli' });
-            this.cliControllerRegistry.controllers.set(cliConfig.name, { controller, module });
+    protected processListener(module: AppModule<any>, listener: EventListenerRegistered) {
+        const addedListener: AddedListener = {
+            eventToken: listener.eventToken,
+            reflection: isEventListenerContainerEntryCallback(listener.listener)
+                ? ReflectionFunction.from(listener.listener.fn) : ReflectionClass.from(listener.listener.classType).getMethod(listener.listener.methodName),
+            module: listener.listener.module,
+            order: listener.listener.order,
+        };
+        for (const m of this.modules) {
+            m.processListener(module, addedListener);
+        }
+    }
+
+    protected processController(module: AppModule<any>, controller: ControllerConfig) {
+        let name = controller.name || '';
+        if (controller.controller) {
+
+            if (!name) {
+                const cliConfig = cli._fetch(controller.controller);
+                if (cliConfig) {
+                    controller.name = name || cliConfig.name || '';
+
+                    //make sure CLI controllers are provided in cli scope
+                    if (!module.isProvided(controller.controller)) {
+                        module.addProvider({ provide: controller.controller, scope: 'cli' });
+                    }
+                    this.cliControllerRegistry.controllers.push(controller);
+                }
+            }
+
+        } else if (controller.for === 'cli') {
+            this.cliControllerRegistry.controllers.push(controller);
         }
 
         for (const m of this.modules) {

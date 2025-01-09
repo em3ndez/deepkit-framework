@@ -23,3 +23,10 @@ export * from './src/reactive.js';
 export * from './src/reflection.js';
 export * from './src/url.js';
 export * from './src/array.js';
+export * from './src/types.js';
+export * from './src/buffer.js';
+
+// export * does not work for some reason
+// we get: packages/framework/src/debug/media.controller.ts:14:25 - error TS2305: Module '"@deepkit/core"' has no exported member 'pathJoin'.
+// exporting it explicitly works.
+export { pathDirectory, pathJoin, pathExtension, pathNormalize, pathBasename } from './src/path.js';

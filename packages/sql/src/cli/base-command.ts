@@ -1,15 +1,8 @@
-import { flag } from '@deepkit/app';
+import { Flag } from '@deepkit/app';
 
 export class BaseCommand {
     /**
-     * @description Database typescript files to import and read Database information
+     * @description Sets the migration directory.
      */
-    @flag
-    path: string[] = [];
-
-    /**
-     * @description Sets the migration directory
-     */
-    @flag
-    protected migrationDir: string = '';
+    protected migrationDir: string & Flag = '';
 }

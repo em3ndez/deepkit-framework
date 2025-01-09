@@ -8,7 +8,7 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { BaseResponse, Command } from './command';
+import { BaseResponse, Command } from './command.js';
 import { toFastProperties } from '@deepkit/core';
 import { InlineRuntimeType, ReflectionClass, typeOf, UUID } from '@deepkit/type';
 
@@ -25,7 +25,7 @@ interface InsertSchema {
     startTransaction?: boolean;
 }
 
-export class InsertCommand<T> extends Command {
+export class InsertCommand<T> extends Command<number> {
     constructor(
         protected schema: ReflectionClass<T>,
         protected documents: T[]
@@ -35,7 +35,7 @@ export class InsertCommand<T> extends Command {
 
     async execute(config, host, transaction): Promise<number> {
         const cmd: any = {
-            insert: this.schema.collectionName || this.schema.name || 'unknown',
+            insert: this.schema.getCollectionName() || 'unknown',
             $db: this.schema.databaseSchemaName || config.defaultDb || 'admin',
             documents: this.documents,
         };

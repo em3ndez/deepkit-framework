@@ -9,15 +9,15 @@
  */
 
 import { asyncOperation, getClassName, urlJoin } from '@deepkit/core';
-import { RpcClient } from '@deepkit/rpc';
+import { RpcClient, RpcKernel } from '@deepkit/rpc';
 import cluster from 'cluster';
 import { HttpRouter } from '@deepkit/http';
 import { BaseEvent, EventDispatcher, eventDispatcher, EventToken } from '@deepkit/event';
 import { InjectorContext } from '@deepkit/injector';
-import { FrameworkConfig } from './module.config';
+import { FrameworkConfig } from './module.config.js';
 import { LoggerInterface } from '@deepkit/logger';
-import { createRpcConnection, WebWorker, WebWorkerFactory } from './worker';
-import { RpcControllers } from './rpc';
+import { createRpcConnection, WebWorker, WebWorkerFactory } from './worker.js';
+import { RpcControllers } from './rpc.js';
 import '@deepkit/type';
 
 export class ServerBootstrapEvent extends BaseEvent {
@@ -78,8 +78,8 @@ export const onServerWorkerShutdown = new EventToken('server.worker.shutdown', S
 
 type ApplicationServerConfig = Pick<FrameworkConfig, 'server' | 'port' | 'host' | 'httpsPort' |
     'ssl' | 'sslKey' | 'sslCertificate' | 'sslCa' | 'sslCrl' |
-    'varPath' | 'selfSigned' | 'keepAliveTimeout' | 'workers' | 'publicDir' |
-    'debug' | 'debugUrl'>;
+    'varPath' | 'selfSigned' | 'workers' | 'publicDir' |
+    'debug' | 'debugUrl' | 'gracefulShutdownTimeout' | 'compression' | 'http'>;
 
 function needsHttpWorker(config: { publicDir?: string }, rpcControllers: RpcControllers, router: HttpRouter) {
     return Boolean(config.publicDir || rpcControllers.controllers.size || router.getRoutes().length);
@@ -146,6 +146,9 @@ export class ApplicationServer {
     protected onlineWorkers = 0;
     protected needsHttpWorker: boolean;
 
+    public onStop: Promise<void>;
+    protected stopResolver!: () => void;
+
     constructor(
         protected logger: LoggerInterface,
         protected webWorkerFactory: WebWorkerFactory,
@@ -153,21 +156,28 @@ export class ApplicationServer {
         protected rootScopedContext: InjectorContext,
         public config: ApplicationServerConfig,
         protected rpcControllers: RpcControllers,
+        protected rpcKernel: RpcKernel,
         protected router: HttpRouter,
     ) {
         this.needsHttpWorker = needsHttpWorker(config, rpcControllers, router);
+        this.onStop = new Promise((resolve) => this.stopResolver = resolve);
+    }
+
+    getHttpWorker(): WebWorker {
+        if (!this.httpWorker) throw new Error('HTTP worker not started');
+        return this.httpWorker;
     }
 
     /**
      * Closes all server listener and triggers shutdown events. This is only used for integration tests.
      */
-    public async close() {
+    public async close(graceful = false) {
         if (!this.started) return;
 
         await this.stopWorkers();
         await this.eventDispatcher.dispatch(onServerShutdown, new ServerShutdownEvent());
         await this.eventDispatcher.dispatch(onServerMainShutdown, new ServerShutdownEvent());
-        if (this.httpWorker) await this.httpWorker.close();
+        if (this.httpWorker) await this.httpWorker.close(graceful);
     }
 
     protected stopWorkers(): Promise<void> {
@@ -183,7 +193,7 @@ export class ApplicationServer {
                 }
             });
 
-            for (const worker of Object.values(cluster.workers)) {
+            for (const worker of Object.values(cluster.workers || {})) {
                 if (worker) worker.send('stop');
             }
         });
@@ -192,14 +202,6 @@ export class ApplicationServer {
     public async start(listenOnSignals: boolean = false) {
         if (this.started) throw new Error('ApplicationServer already started');
         this.started = true;
-
-        //listening to this signal is required to make ts-node-dev working with its reload feature.
-        if (listenOnSignals) {
-            process.on('SIGTERM', () => {
-                this.logger.warning('Received SIGTERM. Forced non-graceful shutdown.');
-                process.exit(0);
-            });
-        }
 
         if (cluster.isMaster) {
             if (this.config.workers) {
@@ -211,6 +213,7 @@ export class ApplicationServer {
 
         await this.eventDispatcher.dispatch(onServerBootstrap, new ServerBootstrapEvent());
 
+        let killRequests = 0;
         if (this.config.workers > 1) {
             if (cluster.isMaster) {
                 await this.eventDispatcher.dispatch(onServerMainBootstrap, new ServerBootstrapEvent());
@@ -228,22 +231,34 @@ export class ApplicationServer {
                     cluster.on('exit', (w) => {
                         this.onlineWorkers--;
                         if (this.stopping) return;
-                        this.logger.warning(`Worker ${w.id} died. Restarted`);
+                        this.logger.warn(`Worker ${w.id} died. Restarted`);
                         cluster.fork();
                     });
                 });
 
                 if (listenOnSignals) {
-                    process.on('SIGINT', async () => {
+                    const stopServer = (signal: string) => async () => {
+                        killRequests++;
+                        if (killRequests === 3) {
+                            this.logger.warn(`Received ${signal}. Force stopping server ...`);
+                            process.exit(1);
+                            return;
+                        }
                         if (this.stopping) {
-                            this.logger.warning('Received SIGINT. Stopping already in process ...');
+                            this.logger.warn(`Received ${signal}. Stopping already in process. Try again to force stop.`);
                             return;
                         }
                         this.stopping = true;
-                        this.logger.warning('Received SIGINT. Stopping server ...');
+                        this.logger.warn(`Received ${signal}. Stopping server ...`);
                         await this.stopWorkers();
-                        process.exit(0);
-                    });
+                        this.stopResolver();
+                        setTimeout(() => {
+                            //give onAppShutdown a chance to react
+                            process.exit(0);
+                        }, 10);
+                    };
+                    process.on('SIGINT', stopServer('SIGINT'));
+                    process.on('SIGTERM', stopServer('SIGTERM'));
                 }
 
                 await this.eventDispatcher.dispatch(onServerBootstrapDone, new ServerBootstrapEvent());
@@ -253,7 +268,7 @@ export class ApplicationServer {
                     if (msg === 'stop') {
                         await this.eventDispatcher.dispatch(onServerShutdown, new ServerShutdownEvent());
                         await this.eventDispatcher.dispatch(onServerWorkerShutdown, new ServerShutdownEvent());
-                        if (this.httpWorker) this.httpWorker.close();
+                        if (this.httpWorker) await this.httpWorker.close(true);
                         process.exit(0);
                     }
                 });
@@ -263,9 +278,14 @@ export class ApplicationServer {
                     //we need to register to it though so the process doesn't get killed.
                 });
 
+                process.on('SIGTERM', async () => {
+                    //we don't do anything in sigint, as the master controls our process.
+                    //we need to register to it though so the process doesn't get killed.
+                });
+
                 await this.eventDispatcher.dispatch(onServerWorkerBootstrap, new ServerBootstrapEvent());
                 if (this.needsHttpWorker) {
-                    this.httpWorker = this.webWorkerFactory.create(cluster.worker.id, this.config);
+                    this.httpWorker = this.webWorkerFactory.create(cluster.worker!.id, this.config);
                     this.httpWorker.start();
                 }
                 await this.eventDispatcher.dispatch(onServerBootstrapDone, new ServerBootstrapEvent());
@@ -273,18 +293,30 @@ export class ApplicationServer {
             }
         } else {
             if (listenOnSignals) {
-                process.on('SIGINT', async () => {
+                const stopServer = (signal: string) => async () => {
+                    killRequests++;
+                    if (killRequests === 3) {
+                        this.logger.warn(`Received ${signal}. Force stopping server ...`);
+                        process.exit(1);
+                        return;
+                    }
                     if (this.stopping) {
-                        this.logger.warning('Received SIGINT. Stopping already in process ...');
+                        this.logger.warn(`Received ${signal}. Stopping already in process. Try again to force stop.`);
                         return;
                     }
                     this.stopping = true;
-                    this.logger.warning('Received SIGINT. Stopping server ...');
+                    this.logger.warn('Received SIGINT. Stopping server ...');
                     await this.eventDispatcher.dispatch(onServerShutdown, new ServerShutdownEvent());
                     await this.eventDispatcher.dispatch(onServerMainShutdown, new ServerShutdownEvent());
-                    if (this.httpWorker) this.httpWorker.close();
-                    process.exit(0);
-                });
+                    if (this.httpWorker) await this.httpWorker.close(true);
+                    this.stopResolver();
+                    setTimeout(() => {
+                        //give onAppShutdown a chance to react
+                        process.exit(0);
+                    }, 10);
+                };
+                process.on('SIGINT', stopServer('SIGINT'));
+                process.on('SIGTERM', stopServer('SIGTERM'));
             }
             await this.eventDispatcher.dispatch(onServerBootstrap, new ServerBootstrapEvent());
             await this.eventDispatcher.dispatch(onServerMainBootstrap, new ServerBootstrapEvent());
@@ -299,6 +331,8 @@ export class ApplicationServer {
         if (cluster.isMaster) {
             this.logger.log(`Server started.`);
         }
+
+        return listenOnSignals ? this.onStop : Promise.resolve();
     }
 
     public getWorker(): WebWorker {
@@ -307,21 +341,21 @@ export class ApplicationServer {
     }
 
     public createClient(): RpcClient {
-        const worker = this.getWorker();
         const context = this.rootScopedContext;
+        const rpcKernel = this.rpcKernel;
 
         return new RpcClient({
             connect(connection) {
-                const kernelConnection = createRpcConnection(context, worker.rpcKernel, {
-                    write: (buffer) => connection.onData(buffer),
-                    close: () => connection.onClose(),
+                const kernelConnection = createRpcConnection(context, rpcKernel, {
+                    writeBinary: (buffer) => connection.readBinary(buffer),
+                    close: () => connection.onClose('closed'),
                 });
 
                 connection.onConnected({
                     close() {
                         kernelConnection.close();
                     },
-                    send(message) {
+                    writeBinary(message: Uint8Array) {
                         queueMicrotask(() => {
                             kernelConnection.feed(message);
                         });

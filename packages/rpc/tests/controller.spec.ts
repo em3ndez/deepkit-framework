@@ -1,11 +1,28 @@
-import { assertType, entity, Positive, ReflectionClass, ReflectionKind } from '@deepkit/type';
+import { assertType, entity, Minimum, Positive, ReflectionClass, ReflectionKind } from '@deepkit/type';
 import { expect, test } from '@jest/globals';
-import { DirectClient } from '../src/client/client-direct';
-import { getActions, rpc } from '../src/decorators';
-import { RpcKernel, RpcKernelConnection } from '../src/server/kernel';
-import { Session, SessionState } from '../src/server/security';
-import { BehaviorSubject } from 'rxjs';
-import { getClassName } from '@deepkit/core';
+import { DirectClient, RpcDirectClientAdapter } from '../src/client/client-direct.js';
+import { getActions, rpc, RpcController } from '../src/decorators.js';
+import { RpcKernel, RpcKernelConnection } from '../src/server/kernel.js';
+import { Session, SessionState } from '../src/server/security.js';
+import { BehaviorSubject, Observable } from 'rxjs';
+import { getClassName, sleep } from '@deepkit/core';
+import { ProgressTracker } from '@deepkit/core-rxjs';
+import { Logger, MemoryLogger } from '@deepkit/logger';
+import { RpcClient } from '../src/client/client.js';
+import { InjectorContext } from '@deepkit/injector';
+import { RpcControllerState } from '../src/client/action.js';
+
+test('default name', () => {
+    @rpc.controller()
+    class Controller {
+    }
+
+    const controller = new RpcController();
+
+    controller.classType = Controller;
+
+    expect(controller.getPath()).toBe('Controller');
+});
 
 test('decorator', async () => {
     @rpc.controller('name')
@@ -453,5 +470,382 @@ test('disable type reuse', async () => {
         const res = await controller.testDeep();
         expect(res.items[0]).not.toBeInstanceOf(Model);
         expect(res.items[0]).toEqual({ title: '123' });
+    }
+});
+
+test('progress tracker', async () => {
+    class Controller {
+        progress = new ProgressTracker();
+        tracker = this.progress.track('test', 10);
+
+        @rpc.action()
+        async getProgress(): Promise<ProgressTracker> {
+            return this.progress;
+        }
+
+        @rpc.action()
+        increase(): void {
+            this.tracker.done++;
+        }
+
+        @rpc.action()
+        done(): void {
+            this.tracker.done = 10;
+        }
+    }
+
+    const kernel = new RpcKernel();
+    kernel.registerController(Controller, 'myController');
+
+    const client = new DirectClient(kernel);
+    client.disableTypeReuse();
+    const controller = client.controller<Controller>('myController');
+
+    {
+        const res = await controller.getProgress();
+        expect(res).toBeInstanceOf(ProgressTracker);
+        expect(res.progress).toEqual(0);
+        expect(res.done).toEqual(0);
+        expect(res.total).toEqual(10);
+
+        await controller.increase();
+        await sleep(0.1);
+        expect(res.done).toEqual(1);
+        expect(res.total).toEqual(10);
+
+        await controller.done();
+        await sleep(0.1);
+        expect(res.done).toEqual(10);
+        expect(res.finished).toEqual(true);
+        expect(res.total).toEqual(10);
+    }
+});
+
+test('progress tracker stop', async () => {
+    let stopCalled = false;
+
+    class Controller {
+        @rpc.action()
+        async getProgress(): Promise<ProgressTracker> {
+            const tracker = new ProgressTracker();
+            const test1 = tracker.track('test1', 1000);
+
+            const int = setInterval(() => {
+                test1.done++;
+            }, 10);
+
+            test1.onStop(() => {
+                stopCalled = true;
+                clearInterval(int);
+            });
+
+            return tracker;
+        }
+    }
+
+    const kernel = new RpcKernel();
+    kernel.registerController(Controller, 'myController');
+
+    const client = new DirectClient(kernel);
+    client.disableTypeReuse();
+    const controller = client.controller<Controller>('myController');
+
+    {
+        const res = await controller.getProgress();
+        expect(res).toBeInstanceOf(ProgressTracker);
+        expect(res.done).toEqual(0);
+        expect(res.total).toEqual(1000);
+        await sleep(0.1);
+        expect(res.done).toBeGreaterThan(0);
+        expect(res.done).toBeLessThan(50);
+        res.stop();
+        await sleep(0.1);
+        expect(stopCalled).toBe(true);
+        expect(res.done).toBeLessThan(50);
+        expect(res.finished).toBe(false);
+        expect(res.stopped).toBe(true);
+        expect(res.ended).toBe(true);
+    }
+});
+
+test('progress tracker reuse', async () => {
+    class Controller {
+        trackers = [new ProgressTracker()];
+
+        constructor() {
+            const track = this.trackers[0].track('test', 10);
+            track.done = 5;
+        }
+
+        @rpc.action()
+        getProgress(id: number): ProgressTracker | undefined {
+            return this.trackers[id];
+        }
+    }
+
+    const kernel = new RpcKernel();
+    kernel.registerController(Controller, 'myController');
+    const client = new DirectClient(kernel);
+    const controller = client.controller<Controller>('myController');
+
+    {
+        const res = await controller.getProgress(0);
+        expect(res).toBeInstanceOf(ProgressTracker);
+        expect(res!.total).toBe(10);
+        expect(res!.done).toBe(5);
+    }
+
+    {
+        const res = await controller.getProgress(1);
+        expect(res).toBe(undefined);
+    }
+});
+
+test('missing types log warning', async () => {
+    class Controller {
+        @rpc.action()
+        test() {
+            return new Observable(observer => {
+                observer.next(123);
+                observer.complete();
+            });
+        }
+
+        @rpc.action()
+        test2(): Observable<any> {
+            return new Observable(observer => {
+                observer.next({ a: '123' });
+                observer.complete();
+            });
+        }
+
+        @rpc.action()
+        test3(): Observable<string> {
+            return new Observable(observer => {
+                observer.next('abc');
+                observer.complete();
+            });
+        }
+
+        @rpc.action()
+        test4() {
+            return { a: '123' };
+        }
+
+        @rpc.action()
+        test5(): { a: string } {
+            return { a: '123' };
+        }
+
+        @rpc.action()
+        test6() {
+            return 123;
+        }
+    }
+
+    const memoryLogger = new MemoryLogger();
+    const kernel = new RpcKernel(undefined, memoryLogger);
+    kernel.registerController(Controller, 'myController');
+    const client = new DirectClient(kernel);
+    const controller = client.controller<Controller>('myController');
+
+    const observable = await controller.test();
+    expect(await observable.toPromise()).toBe(123);
+    expect(memoryLogger.getOutput()).toContain('RPC action Controller.test returns an Observable, but no specific type');
+
+    memoryLogger.clear();
+    const observable2 = await controller.test2();
+    expect(await observable2.toPromise()).toEqual({ a: '123' });
+    expect(memoryLogger.getOutput()).toContain('RPC action Controller.test2 returns an Observable, but no specific type');
+
+    memoryLogger.clear();
+    const observable3 = await controller.test3();
+    expect(await observable3.toPromise()).toBe('abc');
+    expect(memoryLogger.getOutput()).not.toContain('RPC action Controller.test3 returns an Observable, but no specific type');
+
+    memoryLogger.clear();
+    const result = await controller.test4();
+    expect(result).toEqual({ a: '123' });
+    expect(memoryLogger.getOutput()).toContain('RPC action Controller.test4 returns an object, but no specific type');
+
+    memoryLogger.clear();
+    const result2 = await controller.test4();
+    expect(result2).toEqual({ a: '123' });
+    // does not log again
+    expect(memoryLogger.getOutput()).not.toContain('RPC action Controller.test4 returns an object, but no specific type');
+
+    memoryLogger.clear();
+    const result3 = await controller.test5();
+    expect(result3).toEqual({ a: '123' });
+    expect(memoryLogger.getOutput()).not.toContain('RPC action Controller.test5 returns a number, but no specific type');
+
+    memoryLogger.clear();
+    const result4 = await controller.test6();
+    expect(result4).toEqual(123);
+    expect(memoryLogger.getOutput()).not.toContain('RPC action Controller.test5 returns a number, but no specific type');
+});
+
+test('validation errors', async () => {
+    @rpc.logValidationErrors(true)
+    class Controller {
+        @rpc.action().logValidationErrors(false)
+        test1(value: number & Minimum<3>): any {
+            return value;
+        }
+
+        @rpc.action()
+        test2(value: number & Minimum<3>): any {
+            return value;
+        }
+
+        @rpc.action().logValidationErrors(true)
+        test3(value: number & Minimum<3>): any {
+            return value;
+        }
+
+        @rpc.action()
+        test4(value: number): { a: string } {
+            return 4 as any;
+        }
+    }
+
+    const memoryLogger = new MemoryLogger();
+    const kernel = new RpcKernel(undefined, memoryLogger);
+    kernel.registerController(Controller, 'myController');
+    const client = new DirectClient(kernel);
+
+    const controller = client.controller<Controller>('myController');
+
+    {
+        memoryLogger.clear();
+        await controller.test1(1).catch(() => true);
+        expect(memoryLogger.getOutput()).not.toContain('Validation error for arguments of Controller.test');
+    }
+
+    {
+        memoryLogger.clear();
+        await controller.test2(1).catch(() => true);
+        expect(memoryLogger.getOutput()).toContain('Validation error for arguments of Controller.test2');
+    }
+
+    {
+        memoryLogger.clear();
+        await controller.test3(1).catch(() => true);
+        expect(memoryLogger.getOutput()).toContain('Validation error for arguments of Controller.test3');
+    }
+
+    {
+        memoryLogger.clear();
+        await controller.test4(1).catch(() => true);
+        expect(memoryLogger.getOutput()).toContain('Action Controller.test4 return type serialization');
+    }
+});
+
+test('disable strict serialization', async () => {
+    @rpc.logValidationErrors(true)
+    class Controller {
+        constructor(protected logger: Logger) {
+        }
+
+        @rpc.action()
+        test(): { value: string } {
+            return 123 as any;
+        }
+
+        @rpc.action().strictSerialization(false)
+        test2(): { value: string } {
+            return 123 as any;
+        }
+
+        @rpc.action()
+        params1(value: { value: string }): void {
+            this.logger.log(`Got ${value}`);
+        }
+
+        @rpc.action().strictSerialization(false)
+        params2(value: { value: string }): void {
+            this.logger.log(`Got ${value}`);
+        }
+    }
+
+    const memoryLogger = new MemoryLogger();
+    const kernel = new RpcKernel(undefined, memoryLogger);
+    kernel.registerController(Controller, 'myController');
+
+    class DirectClient2 extends RpcClient {
+        getActionClient() {
+            return this.actionClient;
+        }
+        constructor(rpcKernel: RpcKernel, injector?: InjectorContext) {
+            super(new RpcDirectClientAdapter(rpcKernel, injector));
+        }
+    }
+
+    const client = new DirectClient2(kernel);
+
+    const actionsClient = client.getActionClient();
+    const state = new RpcControllerState('myController');
+
+    {
+        memoryLogger.clear();
+        await expect(actionsClient.action(state, 'test', [])).rejects.toThrow('Cannot convert 123 to {value: string}');
+    }
+
+    {
+        memoryLogger.clear();
+        const res = await actionsClient.action(state, 'test2', []);
+        expect(res).toBe(123);
+    }
+
+    {
+        memoryLogger.clear();
+        // simulate a malicious client that sends wrong data
+        await actionsClient.loadActionTypes(state, 'params1');
+        state.getState('params1').types!.callSchema = { kind: ReflectionKind.any } as any;
+        await expect(actionsClient.action(state, 'params1', [123])).rejects.toThrow('Validation error for arguments of Controller.params1');
+        expect(memoryLogger.getOutput()).not.toContain('Got 123');
+    }
+
+    {
+        memoryLogger.clear();
+        const res = await actionsClient.action(state, 'params2', [123]);
+        expect(memoryLogger.getOutput()).toContain('Got 123');
+    }
+});
+
+test('Observable<Buffer>', async () => {
+    class Controller {
+        @rpc.action()
+        test1(): Observable<Buffer> {
+            return new Observable(observer => {
+                observer.next(Buffer.from([1, 2, 3]));
+                observer.complete();
+            });
+        }
+
+        @rpc.action()
+        test2(): Observable<Uint8Array> {
+            return new Observable(observer => {
+                observer.next(Buffer.from([1, 2, 3]));
+                observer.complete();
+            });
+        }
+    }
+
+    const kernel = new RpcKernel();
+    kernel.registerController(Controller, 'myController');
+    const client = new DirectClient(kernel);
+    const controller = client.controller<Controller>('myController');
+
+    {
+        const res = await controller.test1();
+        const buffer = await res.toPromise();
+        expect(buffer).toBeUndefined();
+    }
+    {
+        const res = await controller.test2();
+        const buffer = await res.toPromise();
+        expect(buffer).toBeInstanceOf(Uint8Array);
+        expect(buffer!.toString()).toBe('1,2,3');
     }
 });

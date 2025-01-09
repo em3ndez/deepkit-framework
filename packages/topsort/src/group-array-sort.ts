@@ -8,12 +8,12 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { BaseImplementation, ElementNotFoundException } from './base';
+import { BaseImplementation, ElementNotFoundException } from './base.js';
 
 interface ItemElement<T, TYPE> {
     item: T;
     type: TYPE;
-    dependencies: T[],
+    dependencies: T[];
     dependenciesCount: number;
     visited: boolean;
     addedAtLevel: number;
@@ -60,11 +60,11 @@ export class GroupArraySort<T = string, TYPE = string> extends BaseImplementatio
             let minLevel = -1;
 
             if (element.dependencies.length) {
-                parents = parents || new Set<T>();
+                parents = parents ? new Set(parents) : new Set();
                 parents.add(element.item);
 
                 for (const dependency of element.dependencies) {
-                    let item = this.elements.get(dependency);
+                    const item = this.elements.get(dependency);
                     if (!item) {
                         if (this.throwOnNonExistingDependency) {
                             throw new ElementNotFoundException(element.item, dependency);

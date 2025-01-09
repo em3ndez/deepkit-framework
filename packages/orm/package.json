@@ -1,16 +1,15 @@
 {
   "name": "@deepkit/orm",
-  "version": "1.0.1-alpha.71",
+  "version": "1.0.1-alpha.155",
   "description": "Deepkit ORM, the fastest JIT-based ORM for Typescript",
   "type": "commonjs",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
-  "browser": "./dist/esm/browser.js",
   "types": "./dist/cjs/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/cjs/index.d.ts",
       "require": "./dist/cjs/index.js",
-      "browser": "./dist/esm/browser.js",
       "default": "./dist/esm/index.js"
     }
   },
@@ -26,28 +25,35 @@
   "license": "MIT",
   "peerDependencies": {
     "@deepkit/core": "^1.0.1-alpha.13",
+    "@deepkit/event": "^1.0.1-alpha.13",
     "@deepkit/injector": "^1.0.1-alpha.13",
     "@deepkit/logger": "^1.0.1-alpha.13",
     "@deepkit/stopwatch": "^1.0.1-alpha.13",
     "@deepkit/type": "^1.0.1-alpha.13"
   },
   "dependencies": {
-    "@deepkit/topsort": "^1.0.1-alpha.65",
+    "@deepkit/topsort": "^1.0.1-alpha.121",
     "sift": "^7.0.1"
   },
   "devDependencies": {
-    "@deepkit/core": "^1.0.1-alpha.65",
-    "@deepkit/injector": "^1.0.1-alpha.71",
-    "@deepkit/logger": "^1.0.1-alpha.65",
-    "@deepkit/stopwatch": "^1.0.1-alpha.71",
-    "@deepkit/type": "^1.0.1-alpha.71",
+    "@deepkit/core": "^1.0.1-alpha.154",
+    "@deepkit/event": "^1.0.1-alpha.155",
+    "@deepkit/injector": "^1.0.1-alpha.155",
+    "@deepkit/logger": "^1.0.1-alpha.155",
+    "@deepkit/stopwatch": "^1.0.1-alpha.155",
+    "@deepkit/type": "^1.0.1-alpha.155",
     "@types/sqlstring": "^2.2.1",
     "conditional-type-checks": "^1.0.5"
   },
   "jest": {
     "testEnvironment": "node",
     "transform": {
-      "^.+\\.(ts|tsx)$": "ts-jest"
+      "^.+\\.(ts|tsx)$": [
+        "ts-jest",
+        {
+          "tsconfig": "<rootDir>/tsconfig.spec.json"
+        }
+      ]
     },
     "moduleNameMapper": {
       "(.+)\\.js": "$1"

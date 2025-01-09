@@ -13,30 +13,37 @@ import {
     Database,
     DatabaseEntity,
     DebugControllerInterface,
+    DebugRequest,
+    decodeFrameData,
+    decodeFrames,
+    deserializeFrameData,
     Event,
+    Filesystem,
     ModuleApi,
     ModuleImportedService,
     ModuleService,
     Route,
     RpcAction,
     RpcActionParameter,
-    Workflow
+    Workflow,
 } from '@deepkit/framework-debug-api';
 import { rpc, rpcClass } from '@deepkit/rpc';
-import { parseRouteControllerAction, HttpRouter } from '@deepkit/http';
+import { HttpRouter, parseRouteControllerAction } from '@deepkit/http';
 import { changeClass, ClassType, getClassName, isClass } from '@deepkit/core';
 import { EventDispatcher, isEventListenerContainerEntryService } from '@deepkit/event';
 import { DatabaseAdapter, DatabaseRegistry } from '@deepkit/orm';
-import { readFileSync, statSync, truncateSync } from 'fs';
+import { existsSync, readFileSync, statSync, truncateSync } from 'fs';
 import { join } from 'path';
-import { FrameworkConfig } from '../module.config';
-import { FileStopwatchStore } from './stopwatch/store';
+import { FrameworkConfig } from '../module.config.js';
+import { FileStopwatchStore } from './stopwatch/store.js';
 import { Subject } from 'rxjs';
 import { unlink } from 'fs/promises';
 import { getScope, resolveToken, Token } from '@deepkit/injector';
 import { AppModule, ServiceContainer } from '@deepkit/app';
-import { RpcControllers } from '../rpc';
-import { ReflectionClass, serializeType, stringifyType } from '@deepkit/type';
+import { RpcControllers } from '../rpc.js';
+import { isType, ReflectionClass, serializeType, stringifyType } from '@deepkit/type';
+import { FilesystemRegistry } from '../filesystem.js';
+import { FrameCategory, FrameCategoryData, FrameType } from '@deepkit/stopwatch';
 
 @rpc.controller(DebugControllerInterface)
 export class DebugController implements DebugControllerInterface {
@@ -50,6 +57,7 @@ export class DebugController implements DebugControllerInterface {
         protected config: Pick<FrameworkConfig, 'varPath' | 'debugStorePath'>,
         protected rpcControllers: RpcControllers,
         protected databaseRegistry: DatabaseRegistry,
+        protected filesystemRegistry: FilesystemRegistry,
         protected stopwatchStore?: FileStopwatchStore,
         // protected liveDatabase: LiveDatabase,
     ) {
@@ -57,28 +65,28 @@ export class DebugController implements DebugControllerInterface {
 
     @rpc.action()
     async subscribeStopwatchFramesData(): Promise<Subject<Uint8Array>> {
-        if (!this.stopwatchStore) throw new Error('not enabled');
+        if (!this.stopwatchStore || !this.stopwatchStore.frameDataChannel) throw new Error('not enabled');
 
         const subject = new Subject<Uint8Array>();
-        const sub = await this.stopwatchStore.frameDataChannel.subscribe((v) => {
+        const close = await this.stopwatchStore.frameDataChannel.subscribe((v) => {
             subject.next(v);
         });
         subject.subscribe().add(() => {
-            sub.unsubscribe();
+            close();
         });
         return subject;
     }
 
     @rpc.action()
     async subscribeStopwatchFrames(): Promise<Subject<Uint8Array>> {
-        if (!this.stopwatchStore) throw new Error('not enabled');
+        if (!this.stopwatchStore || !this.stopwatchStore.frameChannel) throw new Error('not enabled');
 
         const subject = new Subject<Uint8Array>();
-        const sub = await this.stopwatchStore.frameChannel.subscribe((v) => {
+        const close = await this.stopwatchStore.frameChannel.subscribe((v) => {
             subject.next(v);
         });
         subject.subscribe().add(() => {
-            sub.unsubscribe();
+            close();
         });
         return subject;
     }
@@ -92,19 +100,64 @@ export class DebugController implements DebugControllerInterface {
     }
 
     @rpc.action()
-    getProfilerFrames(): [Uint8Array, Uint8Array] {
+    getProfilerFrames(): [Uint8Array, Uint8Array, Uint8Array] {
         const framesPath = join(this.config.varPath, this.config.debugStorePath, 'frames.bin');
         const frameDataPath = join(this.config.varPath, this.config.debugStorePath, 'frames-data.bin');
-        const stat = statSync(framesPath);
-        if (stat.size > 1_000_000) {
-            //make sure that file is not too big
-            //todo: For the moment we simply reset the files. In the future we add a index file, and allow
-            // to operate on a huge file via fseek
-            truncateSync(framesPath);
-            truncateSync(frameDataPath);
+        const analyticsPath = join(this.config.varPath, this.config.debugStorePath, 'analytics.bin');
+
+        for (const file of [framesPath, frameDataPath, analyticsPath]) {
+            try {
+                const stat = statSync(file);
+                if (stat.size > 1_000_000) {
+                    //make sure that file is not too big
+                    truncateSync(file);
+                }
+            } catch {}
         }
 
-        return [readFileSync(framesPath), readFileSync(frameDataPath)];
+        return [
+            existsSync(framesPath)  ? readFileSync(framesPath) : new Uint8Array(),
+            existsSync(frameDataPath)  ? readFileSync(frameDataPath) : new Uint8Array(),
+            existsSync(frameDataPath)  ? readFileSync(frameDataPath) : new Uint8Array(),
+        ];
+    }
+
+    protected getFrames() {
+        const framesPath = join(this.config.varPath, this.config.debugStorePath, 'frames.bin');
+        return readFileSync(framesPath);
+    }
+
+    protected getFramesData() {
+        const frameDataPath = join(this.config.varPath, this.config.debugStorePath, 'frames-data.bin');
+        return readFileSync(frameDataPath);
+    }
+
+    @rpc.action()
+    httpRequests(): DebugRequest[] {
+        const requests: { [cid: number]: DebugRequest } = {};
+
+        decodeFrames(this.getFrames(), (frame) => {
+            if (frame.type === FrameType.start) {
+                if (frame.category !== FrameCategory.http) return;
+                requests[frame.cid] = new DebugRequest(frame.cid, frame.timestamp, '', '', '');
+            } else if (frame.type === FrameType.end) {
+                const r = requests[frame.cid];
+                if (!r) return;
+                r.ended = frame.timestamp;
+            }
+        });
+
+        decodeFrameData(this.getFramesData(), (frame) => {
+            const r = requests[frame.cid];
+            if (!r) return;
+            const data = deserializeFrameData(frame) as FrameCategoryData[FrameCategory.http];
+            if (data.clientIp) r.clientIp = data.clientIp;
+            if (data.method) r.method = data.method;
+            if (data.url) r.url = data.url;
+            if (data.responseStatus) r.statusCode = data.responseStatus;
+        });
+
+        return Object.values(requests);
     }
 
     @rpc.action()
@@ -115,13 +168,24 @@ export class DebugController implements DebugControllerInterface {
 
         for (const db of this.databaseRegistry.getDatabases()) {
             const entities: DatabaseEntity[] = [];
-            for (const classSchema of db.entityRegistry.entities) {
+            for (const classSchema of db.entityRegistry.all()) {
                 entities.push({ name: classSchema.name, className: classSchema.getClassName() });
             }
             databases.push({ name: db.name, entities, adapter: (db.adapter as DatabaseAdapter).getName() });
         }
 
         return databases;
+    }
+
+    @rpc.action()
+    filesystems(): Filesystem[] {
+        const filesystems: Filesystem[] = [];
+
+        for (const fs of this.filesystemRegistry.getFilesystems()) {
+            filesystems.push({ name: getClassName(fs), adapter: getClassName(fs.adapter), options: {} });
+        }
+
+        return filesystems;
     }
 
     @rpc.action()
@@ -291,6 +355,7 @@ export class DebugController implements DebugControllerInterface {
 
         function getTokenLabel(token: Token): string {
             if (isClass(token)) return getClassName(token);
+            if (isType(token)) return stringifyType(token);
 
             return String(token);
         }

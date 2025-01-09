@@ -10,6 +10,7 @@
 
 import {
     AfterViewInit,
+    ApplicationRef,
     ChangeDetectionStrategy,
     ChangeDetectorRef,
     Component,
@@ -20,6 +21,7 @@ import {
     EventEmitter,
     HostBinding,
     HostListener,
+    inject,
     Input,
     NgZone,
     OnChanges,
@@ -33,13 +35,12 @@ import {
     ViewChild,
     ViewChildren,
 } from '@angular/core';
-import { arrayClear, arrayHasItem, arrayRemoveItem, eachPair, empty, first, indexOf, isArray, isNumber } from '@deepkit/core';
-import Hammer from 'hammerjs';
+import { arrayClear, arrayHasItem, arrayRemoveItem, eachPair, empty, first, getPathValue, indexOf, isArray, isNumber, nextTick } from '@deepkit/core';
 import { isObservable, Observable } from 'rxjs';
 import { CdkVirtualScrollViewport } from '@angular/cdk/scrolling';
 import { DropdownComponent } from '../button';
 import { detectChangesNextFrame } from '../app/utils';
-import { findParentWithClass } from '../../core/utils';
+import { findParentWithClass, getHammer } from '../../core/utils';
 
 /**
  * Directive to allow dynamic content in a cell.
@@ -192,38 +193,40 @@ export class TableColumnDirective {
     template: `
         <dui-dropdown #headerDropdown>
             <dui-dropdown-item
-                    *ngFor="let column of sortedColumnDefs; trackBy: trackByColumn"
-                    [selected]="!column.isHidden()"
-                    (mousedown)="column.toggleHidden(); storePreference(); sortColumnDefs(); headerDropdown.close()"
+                *ngFor="let column of sortedColumnDefs; trackBy: trackByColumn"
+                [selected]="!column.isHidden()"
+                (mousedown)="column.toggleHidden(); storePreference(); sortColumnDefs(); headerDropdown.close()"
             >
                 <div *ngIf="column.hideable">
                     <ng-container *ngIf="column.name !== undefined && !column.headerDirective">
                         {{column.header || column.name}}
                     </ng-container>
                     <ng-container
-                            *ngIf="column.name !== undefined && column.headerDirective"
-                            [ngTemplateOutlet]="column.headerDirective.template"
-                            [ngTemplateOutletContext]="{$implicit: column}"></ng-container>
+                        *ngIf="column.name !== undefined && column.headerDirective"
+                        [ngTemplateOutlet]="column.headerDirective.template"
+                        [ngTemplateOutletContext]="{$implicit: column}"></ng-container>
                 </div>
             </dui-dropdown-item>
             <dui-dropdown-separator></dui-dropdown-separator>
             <dui-dropdown-item (click)="resetAll()">Reset all</dui-dropdown-item>
         </dui-dropdown>
 
-        <div [style.height]="autoHeight !== false ? height + 'px' : '100%'" [style.minHeight.px]="itemHeight">
+        <div class="frame" [style.minHeight.px]="itemHeight">
             <div class="header" *ngIf="showHeader" #header
                  [contextDropdown]="customHeaderDropdown ? customHeaderDropdown.dropdown : headerDropdown">
                 <div class="th"
-                     *ngFor="let column of visibleColumns(sortedColumnDefs); trackBy: trackByColumn"
+                     *ngFor="let column of visibleColumns; trackBy: trackByColumn; let columnIndex = index;"
                      [style.width]="column.getWidth()"
-                     (mousedown)="sortBy(column.name || '', $event)"
+                     (mouseup)="sortBy(column.name || '', $event)"
+                     [class.freeze]="columnIndex < freezeColumns"
+                     [style.left.px]="columnIndex < freezeColumns ? freezeLeft(visibleColumns, columnIndex) : undefined"
                      [attr.name]="column.name"
                      [style.top]="scrollTop + 'px'"
                      #th>
                     <ng-container
-                            *ngIf="column.headerDirective"
-                            [ngTemplateOutlet]="column.headerDirective.template"
-                            [ngTemplateOutletContext]="{$implicit: column}"></ng-container>
+                        *ngIf="column.headerDirective"
+                        [ngTemplateOutlet]="column.headerDirective.template"
+                        [ngTemplateOutletContext]="{$implicit: column}"></ng-container>
 
                     <ng-container *ngIf="column.name !== undefined && !column.headerDirective">
                         {{column.header || column.name}}
@@ -239,39 +242,75 @@ export class TableColumnDirective {
                 </div>
             </div>
 
-            <div class="body" [class.with-header]="showHeader" (click)="clickCell($event)"
-                 (dblclick)="dblClickCell($event)">
+            <div class="body" [class.with-header]="showHeader" (click)="clickCell($event)" (dblclick)="dblClickCell($event)">
+                <ng-container *ngIf="autoHeight">
+                    <div class="table-row {{rowClass ? rowClass(row) : ''}}"
+                         *ngFor="let row of filterSorted(sorted); trackBy: trackByFn; let i = index; odd as isOdd"
+                         [contextDropdown]="customRowDropdown ? customRowDropdown.dropdown : undefined"
+                         [class.selected]="selectedMap.has(row)"
+                         [class.odd]="isOdd"
+                         [style.height.px]="itemHeight"
+                         (mousedown)="select(row, $event)"
+                         (contextmenu)="select(row, $event)"
+                         (dblclick)="dbclick.emit(row)"
+                    >
+                        <div class="table-cell"
+                             *ngFor="let column of visibleColumns; trackBy: trackByColumn; let columnIndex = index"
+                             [class]="column.class + (cellClass ?  ' ' + cellClass(row, column.name) : '')"
+                             [attr.row-column]="column.name"
+                             [class.freeze]="columnIndex < freezeColumns"
+                             [style.left.px]="columnIndex < freezeColumns ? freezeLeft(visibleColumns, columnIndex) : undefined"
+                             [class.freeze-last]="columnIndex === freezeColumns - 1"
+                             [attr.row-i]="i"
+                             [style.width]="column.getWidth()"
+                        >
+                            <ng-container *ngIf="column.cell">
+                                <ng-container [ngTemplateOutlet]="column.cell!.template"
+                                              [ngTemplateOutletContext]="{ $implicit: row }"></ng-container>
+                            </ng-container>
+                            <ng-container *ngIf="!column.cell">
+                                {{ column.name ? valueFetcher(row, column.name) : '' }}
+                            </ng-container>
+                        </div>
+                    </div>
+                </ng-container>
+
                 <cdk-virtual-scroll-viewport #viewportElement
                                              class="overlay-scrollbar-small"
                                              [itemSize]="itemHeight"
                 >
-                    <ng-container
+                    <ng-container *ngIf="!autoHeight">
+                        <ng-container
                             *cdkVirtualFor="let row of filterSorted(sorted); trackBy: trackByFn; let i = index; odd as isOdd">
-                        <div class="table-row {{rowClass ? rowClass(row) : ''}}"
-                             [contextDropdown]="customRowDropdown ? customRowDropdown.dropdown : undefined"
-                             [class.selected]="selectedMap.has(row)"
-                             [class.odd]="isOdd"
-                             [style.height.px]="itemHeight"
-                             (mousedown)="select(row, $event)"
-                             (contextmenu)="select(row, $event)"
-                             (dblclick)="dbclick.emit(row)"
-                        >
-                            <div class="table-cell"
-                                 *ngFor="let column of visibleColumns(sortedColumnDefs); trackBy: trackByColumn"
-                                 [class]="column.class + (cellClass ?  ' ' + cellClass(row, column.name) : '')"
-                                 [attr.row-column]="column.name"
-                                 [attr.row-i]="i"
-                                 [style.width]="column.getWidth()"
+                            <div class="table-row {{rowClass ? rowClass(row) : ''}}"
+                                 [contextDropdown]="customRowDropdown ? customRowDropdown.dropdown : undefined"
+                                 [class.selected]="selectedMap.has(row)"
+                                 [class.odd]="isOdd"
+                                 [style.height.px]="itemHeight"
+                                 (mousedown)="select(row, $event)"
+                                 (contextmenu)="select(row, $event)"
+                                 (dblclick)="dbclick.emit(row)"
                             >
-                                <ng-container *ngIf="column.cell">
-                                    <ng-container [ngTemplateOutlet]="column.cell!.template"
-                                                  [ngTemplateOutletContext]="{ $implicit: row }"></ng-container>
-                                </ng-container>
-                                <ng-container *ngIf="!column.cell">
-                                    {{ column.name ? valueFetcher(row, column.name) : '' }}
-                                </ng-container>
+                                <div class="table-cell"
+                                     *ngFor="let column of visibleColumns; trackBy: trackByColumn; let columnIndex = index"
+                                     [class]="column.class + (cellClass ?  ' ' + cellClass(row, column.name) : '')"
+                                     [attr.row-column]="column.name"
+                                     [class.freeze]="columnIndex < freezeColumns"
+                                     [style.left.px]="columnIndex < freezeColumns ? freezeLeft(visibleColumns, columnIndex) : undefined"
+                                     [class.freeze-last]="columnIndex === freezeColumns - 1"
+                                     [attr.row-i]="i"
+                                     [style.width]="column.getWidth()"
+                                >
+                                    <ng-container *ngIf="column.cell">
+                                        <ng-container [ngTemplateOutlet]="column.cell!.template"
+                                                      [ngTemplateOutletContext]="{ $implicit: row }"></ng-container>
+                                    </ng-container>
+                                    <ng-container *ngIf="!column.cell">
+                                        {{ column.name ? valueFetcher(row, column.name) : '' }}
+                                    </ng-container>
+                                </div>
                             </div>
-                        </div>
+                        </ng-container>
                     </ng-container>
                 </cdk-virtual-scroll-viewport>
             </div>
@@ -282,10 +321,13 @@ export class TableColumnDirective {
         '[class.no-focus-outline]': 'noFocusOutline !== false',
         '[class.borderless]': 'borderless !== false',
         '[class.overlay-scrollbar]': 'true',
+        '[class.with-hover]': 'hover !== false',
         '[class.auto-height]': 'autoHeight !== false',
     },
 })
 export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDestroy {
+    protected app = inject(ApplicationRef);
+
     /**
      * @hidden
      */
@@ -305,9 +347,14 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
     @Input() public itemHeight: number = 25;
 
     /**
-     * Whether the table height is calculated based on current item count and [itemHeight].
+     * Whether the table height just prints all rows, or if virtual scrolling is enabled.
      */
     @Input() public autoHeight: boolean = false;
+
+    /**
+     * Whether the table row should have a hover effect.
+     */
+    @Input() public hover: boolean | '' = false;
 
     /**
      * Current calculated height, used only when autoHeight is given.
@@ -318,6 +365,11 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
      * Whether the header should be shown.
      */
     @Input() public showHeader: boolean = true;
+
+    /**
+     * How many columns (from the left) are frozen (stay visible even if user scrolls horizontally).
+     */
+    @Input() public freezeColumns: number = 0;
 
     /**
      * Default field of T for sorting.
@@ -385,9 +437,7 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
      * Alternate object value fetcher, important for sorting and filtering.
      */
     @Input() public valueFetcher = (object: any, path: string): any => {
-        const dot = path.indexOf('.');
-        if (dot === -1) return object[path];
-        return object[path.substr(0, dot)][path.substr(dot + 1)];
+        return getPathValue(object, path);
     };
 
     /**
@@ -423,6 +473,8 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
 
     @Output() public sortedChange: EventEmitter<T[]> = new EventEmitter();
 
+    @Output() public cellSelect: EventEmitter<{ item: T, cell: string } | undefined> = new EventEmitter();
+
     /**
      * When a row gets double clicked.
      */
@@ -445,6 +497,8 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
     @ViewChild('viewportElement', { static: true, read: ElementRef }) viewportElement!: ElementRef;
 
     public sortedColumnDefs: TableColumnDirective[] = [];
+
+    visibleColumns: TableColumnDirective[] = [];
 
     columnMap: { [name: string]: TableColumnDirective } = {};
 
@@ -478,9 +532,19 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
 
     }
 
+    freezeLeft(columns: TableColumnDirective[], untilIndex: number): number {
+        let left = 0;
+        for (let i = 0; i < untilIndex; i++) {
+            const width = columns[i].width;
+            if (width === undefined) continue;
+            left += 'number' === typeof width ? width : parseInt(width);
+        }
+        return left;
+    }
+
     @HostListener('window:resize')
     onResize() {
-        requestAnimationFrame(() => {
+        nextTick(() => {
             this.viewport.checkViewportSize();
         });
     }
@@ -493,9 +557,11 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
             column.hidden = false;
             column.overwrittenPosition = undefined;
         }
+        this.visibleColumns = this.getVisibleColumns(this.sortedColumnDefs);
     }
 
     storePreference() {
+        if ('undefined' === typeof localStorage) return;
         const preferences: { [name: string]: { hidden: boolean | '', width?: number | string, order?: number } } = {};
         if (!this.columnDefs) return;
 
@@ -506,10 +572,13 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
                 hidden: column.hidden
             };
         }
+        this.visibleColumns = this.getVisibleColumns(this.sortedColumnDefs);
         localStorage.setItem('@dui/table/preferences-' + this.preferenceKey, JSON.stringify(preferences));
     }
 
     loadPreference() {
+        if ('undefined' === typeof localStorage) return;
+
         const preferencesJSON = localStorage.getItem('@dui/table/preferences-' + this.preferenceKey);
         if (!preferencesJSON) return;
         const preferences = JSON.parse(preferencesJSON);
@@ -559,7 +628,7 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
         if ($event && $event.button === 2) return;
 
         //only when shift is pressed do we activate multi-column sort
-        if (!$event || ! $event.shiftKey) {
+        if (!$event || !$event.shiftKey) {
             for (const member in this.sort) if (member !== name) delete this.sort[member];
         }
 
@@ -610,8 +679,11 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
         return items;
     }
 
-    protected initHeaderMovement() {
-        if (this.header && this.ths) {
+    async initHeaderMovement() {
+        if ('undefined' !== typeof window && this.header && this.ths) {
+            const Hammer = await getHammer();
+            if (!Hammer) return;
+
             const mc = new Hammer(this.header!.nativeElement);
             mc.add(new Hammer.Pan({ direction: Hammer.DIRECTION_ALL, threshold: 1 }));
 
@@ -685,9 +757,9 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
                 }
 
                 if (element) {
-                    element.style.left = '0px';
-                    element.style.zIndex = '1';
-                    element.style.opacity = '1';
+                    element.style.left = '';
+                    element.style.zIndex = '';
+                    element.style.opacity = '';
 
                     for (const t of rowCells) {
                         for (const cell of t.cells) {
@@ -730,7 +802,7 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
                     cancelAnimationFrame(animationFrame);
                 }
 
-                animationFrame = requestAnimationFrame(() => {
+                animationFrame = nextTick(() => {
                     if (element) {
                         element!.style.left = (event.deltaX) + 'px';
                         const offsetLeft = startOffsetLeft + event.deltaX;
@@ -829,7 +901,7 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
         }
     }
 
-    visibleColumns(t: TableColumnDirective[]): TableColumnDirective[] {
+    getVisibleColumns(t: TableColumnDirective[]): TableColumnDirective[] {
         return t.filter(v => !v.isHidden());
     }
 
@@ -858,6 +930,7 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
         }
 
         if (changes.items) {
+
             if (isObservable(this.items)) {
                 this.items.subscribe((items: T[]) => {
                     this.rawItems = items;
@@ -886,12 +959,18 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
                 }
             }
         }
+
+        this.visibleColumns = this.getVisibleColumns(this.sortedColumnDefs);
+        setTimeout(() => {
+            this.viewport.checkViewportSize();
+        });
     }
 
     private updateDisplayColumns() {
         this.displayedColumns = [];
         this.columnMap = {};
 
+        this.sortColumnDefs();
         if (this.columnDefs) {
             for (const column of this.columnDefs.toArray()) {
                 this.displayedColumns.push(column.name!);
@@ -900,6 +979,7 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
 
             this.doSort();
         }
+        this.visibleColumns = this.getVisibleColumns(this.sortedColumnDefs);
     }
 
     private doSort() {
@@ -1027,6 +1107,22 @@ export class TableComponent<T> implements AfterViewInit, OnInit, OnChanges, OnDe
     public select(item: T, $event?: MouseEvent) {
         if (this.selectable === false) {
             return;
+        }
+
+        let cellSelectFired = false;
+        if ($event && $event.target) {
+            const cell = findParentWithClass($event.target as HTMLElement, 'table-cell');
+            if (cell) {
+                const column = cell.getAttribute('row-column') || '';
+                if (column) {
+                    this.cellSelect.emit({ item, cell: column });
+                    cellSelectFired = true;
+                }
+            }
+        }
+
+        if (!cellSelectFired) {
+            this.cellSelect.emit();
         }
 
         if (this.multiSelect === false) {

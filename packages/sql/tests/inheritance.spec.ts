@@ -1,7 +1,7 @@
-import { AutoIncrement, entity, PrimaryKey, ReflectionKind } from '@deepkit/type';
-import { SchemaParser } from '../src/reverse/schema-parser';
-import { DatabaseModel } from '../src/schema/table';
-import { DefaultPlatform } from '../src/platform/default-platform';
+import { AutoIncrement, DatabaseField, entity, PrimaryKey, ReflectionKind } from '@deepkit/type';
+import { SchemaParser } from '../src/reverse/schema-parser.js';
+import { DatabaseModel } from '../src/schema/table.js';
+import { DefaultPlatform } from '../src/platform/default-platform.js';
 import { expect, test } from '@jest/globals';
 import { DatabaseEntityRegistry } from '@deepkit/orm';
 
@@ -27,7 +27,7 @@ class Freelance extends Person {
 }
 
 class MySchemaParser extends SchemaParser {
-    parse(database: DatabaseModel, limitTableNames?: string[]): void {
+    async parse(database: DatabaseModel, limitTableNames?: string[]) {
     }
 }
 

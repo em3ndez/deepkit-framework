@@ -8,10 +8,10 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { Command } from './command';
+import { Command } from './command.js';
 
 
-export class EmptyCommand extends Command {
+export class EmptyCommand extends Command<void> {
     execute(): Promise<any> {
         return Promise.resolve(undefined);
     }

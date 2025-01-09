@@ -1,6 +1,6 @@
 {
   "name": "@deepkit/http",
-  "version": "1.0.1-alpha.71",
+  "version": "1.0.1-alpha.155",
   "description": "Deepkit HTTP server and router.",
   "type": "commonjs",
   "main": "./dist/cjs/index.js",
@@ -8,6 +8,7 @@
   "types": "./dist/cjs/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/cjs/index.d.ts",
       "require": "./dist/cjs/index.js",
       "default": "./dist/esm/index.js"
     }
@@ -33,26 +34,32 @@
     "@deepkit/workflow": "^1.0.1-alpha.13"
   },
   "dependencies": {
-    "formidable": "^1.2.2",
-    "qs": "^6.10.1",
-    "send": "^0.17.1"
+    "formidable": "^2.0.1",
+    "qs": "^6.11.0",
+    "send": "^0.18.0"
   },
   "devDependencies": {
-    "@deepkit/app": "^1.0.1-alpha.71",
-    "@deepkit/core": "^1.0.1-alpha.65",
-    "@deepkit/event": "^1.0.1-alpha.71",
-    "@deepkit/injector": "^1.0.1-alpha.71",
-    "@deepkit/logger": "^1.0.1-alpha.65",
-    "@deepkit/stopwatch": "^1.0.1-alpha.71",
-    "@deepkit/template": "^1.0.1-alpha.71",
-    "@deepkit/type": "^1.0.1-alpha.71",
-    "@deepkit/workflow": "^1.0.1-alpha.71",
-    "@types/node": "14.14.28",
+    "@deepkit/app": "^1.0.1-alpha.155",
+    "@deepkit/core": "^1.0.1-alpha.154",
+    "@deepkit/event": "^1.0.1-alpha.155",
+    "@deepkit/injector": "^1.0.1-alpha.155",
+    "@deepkit/logger": "^1.0.1-alpha.155",
+    "@deepkit/stopwatch": "^1.0.1-alpha.155",
+    "@deepkit/template": "^1.0.1-alpha.155",
+    "@deepkit/type": "^1.0.1-alpha.155",
+    "@deepkit/workflow": "^1.0.1-alpha.155",
+    "@types/node": "20.6.0",
     "@types/send": "^0.14.6"
   },
   "jest": {
+    "testEnvironment": "node",
     "transform": {
-      "^.+\\.(ts|tsx)$": "ts-jest"
+      "^.+\\.(ts|tsx)$": [
+        "ts-jest",
+        {
+          "tsconfig": "<rootDir>/tsconfig.spec.json"
+        }
+      ]
     },
     "moduleNameMapper": {
       "(.+)\\.js": "$1"

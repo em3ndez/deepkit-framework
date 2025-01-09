@@ -1,12 +1,13 @@
 {
   "name": "@deepkit/broker",
-  "version": "1.0.1-alpha.71",
+  "version": "1.0.1-alpha.155",
   "type": "commonjs",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
   "types": "./dist/cjs/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/cjs/index.d.ts",
       "require": "./dist/cjs/index.js",
       "default": "./dist/esm/index.js"
     }
@@ -20,27 +21,46 @@
   "scripts": {
     "build": "echo '{\"type\": \"module\"}' > ./dist/esm/package.json"
   },
+  "dependencies": {
+    "@lukeed/ms": "^2.0.1",
+    "js-xxhash": "3.0.1"
+  },
   "peerDependencies": {
+    "@deepkit/app": "^1.0.1-alpha.40",
     "@deepkit/bson": "^1.0.1-alpha.40",
     "@deepkit/core": "^1.0.1-alpha.39",
     "@deepkit/core-rxjs": "^1.0.1-alpha.39",
+    "@deepkit/event": "^1.0.1-alpha.40",
     "@deepkit/rpc": "^1.0.1-alpha.41",
     "@deepkit/type": "^1.0.1-alpha.40",
     "rxjs": "*"
   },
   "devDependencies": {
-    "@deepkit/bson": "^1.0.1-alpha.71",
-    "@deepkit/core": "^1.0.1-alpha.65",
-    "@deepkit/core-rxjs": "^1.0.1-alpha.65",
-    "@deepkit/rpc": "^1.0.1-alpha.71",
-    "@deepkit/type": "^1.0.1-alpha.71"
+    "@deepkit/bson": "^1.0.1-alpha.155",
+    "@deepkit/core": "^1.0.1-alpha.154",
+    "@deepkit/core-rxjs": "^1.0.1-alpha.154",
+    "@deepkit/event": "^1.0.1-alpha.155",
+    "@deepkit/rpc": "^1.0.1-alpha.155",
+    "@deepkit/type": "^1.0.1-alpha.155"
   },
   "jest": {
+    "testEnvironment": "node",
     "transform": {
-      "^.+\\.(ts|tsx)$": "ts-jest"
+      "^.+\\.(ts|tsx)$": [
+        "ts-jest",
+        {
+          "tsconfig": "<rootDir>/tsconfig.spec.json"
+        }
+      ]
+    },
+    "moduleNameMapper": {
+      "(.+)\\.js": "$1"
     },
     "testMatch": [
       "**/tests/**/*.spec.ts"
+    ],
+    "setupFiles": [
+      "<rootDir>/../../jest-setup-runtime.js"
     ]
   },
   "gitHead": "56081823b559bb68b77a8781957af5d9c2e019a7"

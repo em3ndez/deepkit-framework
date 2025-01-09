@@ -8,21 +8,19 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { Changes, ReflectionClass } from '@deepkit/type';
-import { OrmEntity } from './type';
+import { Changes, getSerializeFunction, PrimaryKeyFields, ReflectionClass, TemplateRegistry } from '@deepkit/type';
+import { OrmEntity } from './type.js';
 import sift from 'sift';
-import { FilterQuery } from './query';
-import { getInstanceStateFromItem } from './identity-map';
-import { getClassTypeFromInstance } from '@deepkit/core';
+import { FilterQuery } from './query.js';
+import { getInstanceStateFromItem } from './identity-map.js';
 
 export type FlattenIfArray<T> = T extends Array<any> ? T[0] : T;
 export type FieldName<T> = keyof T & string;
 
-export function getClassSchemaInstancePairs<T extends OrmEntity>(items: Iterable<T>): Map<ReflectionClass<any>, T[]> {
+export function getClassSchemaInstancePairs<T extends OrmEntity>(items: Iterable<[ReflectionClass<any>, T]>): Map<ReflectionClass<any>, T[]> {
     const map = new Map<ReflectionClass<any>, T[]>();
 
-    for (const item of items) {
-        const classSchema = ReflectionClass.from(getClassTypeFromInstance(item));
+    for (const [classSchema, item] of items) {
         let items = map.get(classSchema);
         if (!items) {
             items = [];
@@ -54,4 +52,16 @@ export function buildChangesFromInstance<T extends object>(item: T): Changes<T> 
     const lastSnapshot = state.getSnapshot();
     const currentSnapshot = state.classState.snapshot(item);
     return state.classState.changeDetector(lastSnapshot, currentSnapshot, item) || new Changes;
+}
+
+/**
+ * Converts a scala value to a primary key fields object.
+ */
+export function primaryKeyObjectConverter(classSchema: ReflectionClass<any>, templateRegistry: TemplateRegistry): (data: any) => PrimaryKeyFields<any> {
+    const primary = classSchema.getPrimary();
+    const primaryKeyConverted = getSerializeFunction(primary.property, templateRegistry);
+
+    return (data) => {
+        return { [primary.name]: primaryKeyConverted(data) };
+    };
 }

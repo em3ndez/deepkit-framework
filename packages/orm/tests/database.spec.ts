@@ -1,6 +1,6 @@
 import { expect, test } from '@jest/globals';
-import { MemoryDatabaseAdapter } from '../src/memory-db';
-import { Database } from '../src/database';
+import { MemoryDatabaseAdapter } from '../src/memory-db.js';
+import { Database } from '../src/database.js';
 import { deserialize, entity, PrimaryKey, t, validate, ValidatorError } from '@deepkit/type';
 
 test('memory-db', async () => {
@@ -24,7 +24,7 @@ test('memory-db', async () => {
 
     {
         const item = deserialize<s>({ id: 2, username: '1234' });
-        expect(validate<s>(item)).toEqual([{ code: 'length', message: 'Min length is 5', path: 'username' }]);
+        expect(validate<s>(item)).toEqual([{ code: 'length', message: 'Min length is 5', path: 'username', value: '1234' }]);
     }
 
     const database = new Database(new MemoryDatabaseAdapter());
@@ -47,4 +47,33 @@ test('memory-db', async () => {
 
     await database.query(s).deleteMany();
     expect(await (await database.query(s).find()).length).toBe(0);
+});
+
+test('persistAs', async () => {
+    interface X {
+        id: number & PrimaryKey;
+        name: string;
+    }
+
+    interface Y {
+        id: number & PrimaryKey;
+        name: string;
+    }
+
+    const database = new Database(new MemoryDatabaseAdapter());
+    database.register<X>({ name: 'x' });
+    database.register<Y>({ name: 'y' });
+
+    await database.persistAs<X>([{ id: 1, name: 'Peter' }, { id: 2, name: 'Peter2' }]);
+    await database.persistAs<X>([{ id: 3, name: 'Peter3' }]);
+    await database.persistAs<Y>([{ id: 1, name: 'John' }]);
+
+    expect(await database.query<X>().count()).toBe(3);
+    expect(await database.query<Y>().count()).toBe(1);
+
+    await database.removeAs<X>([{ id: 1, name: 'Peter' }]);
+    expect(await database.query<X>().count()).toBe(2);
+
+    await database.removeAs<Y>([{ id: 1, name: 'John' }]);
+    expect(await database.query<Y>().count()).toBe(0);
 });

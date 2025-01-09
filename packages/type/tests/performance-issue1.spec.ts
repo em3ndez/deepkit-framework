@@ -9,14 +9,14 @@
  */
 import { test } from '@jest/globals';
 import { AbstractClassType, arrayRemoveItem, ClassType, CompilerContext, CustomError, getClassName, isClass, isFunction, urlJoin } from '@deepkit/core';
-import { isExtendable } from '../src/reflection/extends';
-import { ReceiveType, reflect, resolveReceiveType } from '../src/reflection/reflection';
-import { isType, metaAnnotation, ReflectionKind, Type } from '../src/reflection/type';
+import { isExtendable } from '../src/reflection/extends.js';
+import { ReceiveType, reflect, resolveReceiveType } from '../src/reflection/reflection.js';
+import { isType, metaAnnotation, ReflectionKind, Type } from '../src/reflection/type.js';
 import { IncomingMessage, ServerResponse } from 'http';
 import { Writable } from 'stream';
 import querystring from 'querystring';
-import { entity } from '../src/decorator';
-import { SerializationOptions, Serializer } from '../src/serializer';
+import { entity } from '../src/decorator.js';
+import { SerializationOptions, Serializer } from '../src/serializer.js';
 
 export interface ProviderBase {
     /**
@@ -1001,9 +1001,9 @@ export class HttpResponse extends ServerResponse {
 export type HttpRequestQuery = { [name: string]: string };
 export type HttpRequestResolvedParameters = { [name: string]: any };
 
-export type HttpBody<T> = T & { __meta?: ['httpBody'] };
-export type HttpQuery<T, Options extends {name?: string} = {}> = T & { __meta?: ['httpQuery', Options] };
-export type HttpQueries<T, Options extends {name?: string} = {}> = T & { __meta?: ['httpQueries', Options] };
+export type HttpBody<T> = T & { __meta?: never & ['httpBody'] };
+export type HttpQuery<T, Options extends {name?: string} = {}> = T & { __meta?: never & ['httpQuery', Options] };
+export type HttpQueries<T, Options extends {name?: string} = {}> = T & { __meta?: never & ['httpQueries', Options] };
 
 export class RequestBuilder {
     protected contentBuffer: Buffer = Buffer.alloc(0);
