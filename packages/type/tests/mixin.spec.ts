@@ -1,9 +1,9 @@
 import { expect, test } from '@jest/globals';
-import { mixin } from '../src/mixin';
-import { assertType, AutoIncrement, PrimaryKey, ReflectionKind, resolveTypeMembers } from '../src/reflection/type';
-import { MinLength } from '../src/validator';
-import { reflect, ReflectionClass } from '../src/reflection/reflection';
-import { deserialize } from '../src/serializer-facade';
+import { mixin } from '../src/mixin.js';
+import { assertType, AutoIncrement, PrimaryKey, ReflectionKind, resolveTypeMembers } from '../src/reflection/type.js';
+import { MinLength } from '../src/validator.js';
+import { reflect, ReflectionClass } from '../src/reflection/reflection.js';
+import { deserialize } from '../src/serializer-facade.js';
 
 test('mixin base', () => {
     class Timestampable {
@@ -37,8 +37,8 @@ test('mixin base', () => {
 
     const type = reflect(User);
     assertType(type, ReflectionKind.class);
-    expect(type.types.length).toBe(3); //id, username, constructor
-    expect(resolveTypeMembers(type).length).toBe(7); //id, username, constructor, + 4
+    expect(type.types.length).toBe(7); //id, username, constructor , +2 SoftDeleted, +2 Timestampable
+    expect(resolveTypeMembers(type).length).toBe(7);
 
     {
         const user = ReflectionClass.from(User);

@@ -9,22 +9,57 @@
  */
 
 import { arrayRemoveItem, ProcessLock, ProcessLocker } from '@deepkit/core';
-import { createRpcMessage, RpcConnectionWriter, RpcKernel, RpcKernelBaseConnection, RpcKernelConnections, RpcMessage, RpcMessageBuilder, RpcMessageRouteType } from '@deepkit/rpc';
 import {
+    createRpcMessage,
+    RpcKernel,
+    RpcKernelBaseConnection,
+    RpcKernelConnections,
+    RpcMessage,
+    RpcMessageBuilder,
+    RpcMessageRouteType,
+    TransportConnection,
+} from '@deepkit/rpc';
+import { Logger } from '@deepkit/logger';
+import {
+    brokerBusPublish,
+    brokerBusResponseHandleMessage,
+    brokerBusSubscribe,
     brokerDelete,
     brokerEntityFields,
     brokerGet,
+    brokerGetCache,
     brokerIncrement,
+    brokerInvalidateCacheMessage,
     brokerLock,
     brokerLockId,
-    brokerPublish,
+    BrokerQueueMessageHandled,
+    BrokerQueuePublish,
+    BrokerQueueResponseHandleMessage,
+    BrokerQueueSubscribe,
+    brokerResponseGet,
+    brokerResponseGetCache,
+    brokerResponseGetCacheMeta,
     brokerResponseIncrement,
     brokerResponseIsLock,
-    brokerResponseSubscribeMessage,
     brokerSet,
-    brokerSubscribe,
-    BrokerType
-} from './model';
+    brokerSetCache,
+    BrokerType,
+    QueueMessage,
+    QueueMessageProcessing,
+    QueueMessageState,
+} from './model.js';
+import cluster from 'cluster';
+import { closeSync, openSync, renameSync, writeSync } from 'fs';
+import { snapshotState } from './snapshot.js';
+import { handleMessageDeduplication } from './utils.js';
+
+export interface Queue {
+    currentId: number;
+    name: string;
+    deduplicateMessageHashes: Set<string | number>;
+    messages: QueueMessage[];
+    consumers: { con: BrokerConnection, handling: Map<number, QueueMessage>, maxMessagesInParallel: number }[];
+}
 
 export class BrokerConnection extends RpcKernelBaseConnection {
     protected subscribedChannels: string[] = [];
@@ -32,11 +67,12 @@ export class BrokerConnection extends RpcKernelBaseConnection {
     protected replies = new Map<number, ((message: RpcMessage) => void)>();
 
     constructor(
-        transportWriter: RpcConnectionWriter,
+        logger: Logger,
+        transportConnection: TransportConnection,
         protected connections: RpcKernelConnections,
         protected state: BrokerState,
     ) {
-        super(transportWriter, connections);
+        super(logger, transportConnection, connections);
     }
 
     public close(): void {
@@ -45,10 +81,11 @@ export class BrokerConnection extends RpcKernelBaseConnection {
         for (const c of this.subscribedChannels) {
             this.state.unsubscribe(c, this);
         }
+        arrayRemoveItem(this.state.invalidationCacheMessageConnections, this);
+
         for (const lock of this.locks.values()) {
             lock.unlock();
         }
-
     }
 
     protected async sendEntityFields(name: string) {
@@ -57,7 +94,10 @@ export class BrokerConnection extends RpcKernelBaseConnection {
 
         for (const connection of this.connections.connections) {
             if (connection === this) continue;
-            promises.push(connection.sendMessage<brokerEntityFields>(BrokerType.EntityFields, { name, fields }).ackThenClose());
+            promises.push(connection.sendMessage<brokerEntityFields>(BrokerType.EntityFields, {
+                name,
+                fields,
+            }).ackThenClose());
         }
 
         await Promise.all(promises);
@@ -73,7 +113,7 @@ export class BrokerConnection extends RpcKernelBaseConnection {
                 }
                 response.reply<brokerEntityFields>(
                     BrokerType.EntityFields,
-                    { name: body.name, fields: this.state.getEntityFields(body.name) }
+                    { name: body.name, fields: this.state.getEntityFields(body.name) },
                 );
                 break;
             }
@@ -85,14 +125,17 @@ export class BrokerConnection extends RpcKernelBaseConnection {
                 }
                 response.reply<brokerEntityFields>(
                     BrokerType.EntityFields,
-                    { name: body.name, fields: this.state.getEntityFields(body.name) }
+                    { name: body.name, fields: this.state.getEntityFields(body.name) },
                 );
                 break;
             }
             case BrokerType.AllEntityFields: {
                 const composite = response.composite(BrokerType.AllEntityFields);
                 for (const name of this.state.entityFields.keys()) {
-                    composite.add<brokerEntityFields>(BrokerType.EntityFields, { name, fields: this.state.getEntityFields(name) });
+                    composite.add<brokerEntityFields>(BrokerType.EntityFields, {
+                        name,
+                        fields: this.state.getEntityFields(name),
+                    });
                 }
                 composite.send();
                 break;
@@ -135,29 +178,63 @@ export class BrokerConnection extends RpcKernelBaseConnection {
                 });
                 break;
             }
+            case BrokerType.QueuePublish: {
+                const body = message.parseBody<BrokerQueuePublish>();
+                this.state.queuePublish(body);
+                response.ack();
+                break;
+            }
+            case BrokerType.QueueSubscribe: {
+                const body = message.parseBody<BrokerQueueSubscribe>();
+                this.state.queueSubscribe(body.c, this, body.maxParallel);
+                response.ack();
+                break;
+            }
+            case BrokerType.QueueUnsubscribe: {
+                const body = message.parseBody<BrokerQueueSubscribe>();
+                this.state.queueUnsubscribe(body.c, this);
+                response.ack();
+                break;
+            }
+            case BrokerType.QueueMessageHandled: {
+                const body = message.parseBody<BrokerQueueMessageHandled>();
+                this.state.queueMessageHandled(body.c, this, body.id, {
+                    error: body.error,
+                    success: body.success,
+                    delay: body.delay,
+                });
+                response.ack();
+                break;
+            }
             case BrokerType.Subscribe: {
-                const body = message.parseBody<brokerSubscribe>();
+                const body = message.parseBody<brokerBusSubscribe>();
                 this.state.subscribe(body.c, this);
                 this.subscribedChannels.push(body.c);
                 response.ack();
                 break;
             }
             case BrokerType.Unsubscribe: {
-                const body = message.parseBody<brokerSubscribe>();
+                const body = message.parseBody<brokerBusSubscribe>();
                 this.state.unsubscribe(body.c, this);
                 arrayRemoveItem(this.subscribedChannels, body.c);
                 response.ack();
                 break;
             }
             case BrokerType.Publish: {
-                const body = message.parseBody<brokerPublish>();
+                const body = message.parseBody<brokerBusPublish>();
                 this.state.publish(body.c, body.v);
+                response.ack();
+                break;
+            }
+            case BrokerType.SetCache: {
+                const body = message.parseBody<brokerSetCache>();
+                this.state.setCache(body.n, body.v, body.ttl);
                 response.ack();
                 break;
             }
             case BrokerType.Set: {
                 const body = message.parseBody<brokerSet>();
-                this.state.set(body.n, body.v);
+                this.state.setKey(body.n, body.v, body.ttl);
                 response.ack();
                 break;
             }
@@ -169,13 +246,55 @@ export class BrokerConnection extends RpcKernelBaseConnection {
             }
             case BrokerType.Delete: {
                 const body = message.parseBody<brokerDelete>();
-                this.state.delete(body.n);
+                this.state.deleteKey(body.n);
                 response.ack();
+                break;
+            }
+            case BrokerType.InvalidateCache: {
+                const body = message.parseBody<brokerDelete>();
+                const entry = this.state.getCache(body.n);
+                if (entry && this.state.invalidationCacheMessageConnections.length) {
+                    this.state.deleteCache(body.n);
+                    const message = createRpcMessage<brokerInvalidateCacheMessage>(
+                        0, BrokerType.ResponseInvalidationCache,
+                        { key: body.n, ttl: entry.ttl },
+                        RpcMessageRouteType.server,
+                    );
+
+                    for (const connection of this.state.invalidationCacheMessageConnections) {
+                        connection.write(message);
+                    }
+                }
+                response.ack();
+                break;
+            }
+            case BrokerType.DeleteCache: {
+                const body = message.parseBody<brokerDelete>();
+                this.state.deleteCache(body.n);
+                response.ack();
+                break;
+            }
+            case BrokerType.GetCache: {
+                const body = message.parseBody<brokerGetCache>();
+                const v = this.state.getCache(body.n);
+                response.reply<brokerResponseGetCache>(BrokerType.ResponseGetCache, v || {});
+                break;
+            }
+            case BrokerType.GetCacheMeta: {
+                const body = message.parseBody<brokerGetCache>();
+                const v = this.state.getCache(body.n);
+                response.reply<brokerResponseGetCacheMeta>(BrokerType.ResponseGetCacheMeta, v ? { ttl: v.ttl } : { missing: true });
                 break;
             }
             case BrokerType.Get: {
                 const body = message.parseBody<brokerGet>();
-                response.replyBinary(BrokerType.ResponseGet, this.state.get(body.n));
+                const v = this.state.getKey(body.n);
+                response.reply<brokerResponseGet>(BrokerType.ResponseGet, { v });
+                break;
+            }
+            case BrokerType.EnableInvalidationCacheMessages: {
+                this.state.invalidationCacheMessageConnections.push(this);
+                response.ack();
                 break;
             }
         }
@@ -183,11 +302,57 @@ export class BrokerConnection extends RpcKernelBaseConnection {
 }
 
 export class BrokerState {
-    public setStore = new Map<string, Uint8Array>();
+    /**
+     * Simple key/value store.
+     */
+    public keyStore = new Map<string, Uint8Array>();
+
+    /**
+     * Cache store.
+     */
+    public cacheStore = new Map<string, { data: Uint8Array, ttl: number }>();
+
     public subscriptions = new Map<string, BrokerConnection[]>();
     public entityFields = new Map<string, Map<string, number>>();
 
+    public queues = new Map<string, Queue>();
+
     public locker = new ProcessLocker();
+
+    public enableSnapshot = false;
+    public snapshotInterval = 15;
+    public snapshotPath = './broker-snapshot.bson';
+    public snapshotting = false;
+
+    /**
+     * All connections in this list are notified about cache invalidations.
+     */
+    public invalidationCacheMessageConnections: BrokerConnection[] = [];
+
+    protected lastSnapshotTimeout?: any;
+
+    protected snapshot() {
+        if (cluster.isMaster) {
+            this.snapshotting = true;
+            cluster.fork();
+
+            cluster.on('exit', (worker: any) => {
+                this.snapshotting = false;
+            });
+            return;
+        }
+
+        //we are in the worker now
+
+        const snapshotTempPath = this.snapshotPath + '.tmp';
+        //open file for writing, create if not exists, truncate if exists
+        const file = openSync(snapshotTempPath, 'w+');
+        snapshotState(this, (v) => writeSync(file, v));
+        closeSync(file);
+
+        //rename temp file to final file
+        renameSync(snapshotTempPath, this.snapshotPath);
+    }
 
     public getEntityFields(name: string): string[] {
         return Array.from(this.entityFields.get(name)?.keys() || []);
@@ -213,7 +378,7 @@ export class BrokerState {
     }
 
     public unsubscribeEntityFields(name: string, fields: string[]) {
-        let store = this.entityFields.get(name);
+        const store = this.entityFields.get(name);
         if (!store) return;
         let changed = false;
         for (const field of fields) {
@@ -260,41 +425,151 @@ export class BrokerState {
     public publish(channel: string, v: Uint8Array) {
         const subscriptions = this.subscriptions.get(channel);
         if (!subscriptions) return;
-        const message = createRpcMessage<brokerResponseSubscribeMessage>(
+        const message = createRpcMessage<brokerBusResponseHandleMessage>(
             0, BrokerType.ResponseSubscribeMessage,
-            { c: channel, v: v }, RpcMessageRouteType.server
+            { c: channel, v: v }, RpcMessageRouteType.server,
         );
 
         for (const connection of subscriptions) {
-            connection.writer.write(message);
+            connection.write(message);
         }
     }
 
-    public set(id: string, data: Uint8Array) {
-        this.setStore.set(id, data);
+    protected getQueue(queueName: string) {
+        let queue = this.queues.get(queueName);
+        if (!queue) {
+            queue = { currentId: 0, name: queueName, deduplicateMessageHashes: new Set(), messages: [], consumers: [] };
+            this.queues.set(queueName, queue);
+        }
+        return queue;
+    }
+
+    public queueSubscribe(queueName: string, connection: BrokerConnection, maxParallel: number) {
+        const queue = this.getQueue(queueName);
+        queue.consumers.push({ con: connection, handling: new Map(), maxMessagesInParallel: 1 });
+    }
+
+    public queueUnsubscribe(queueName: string, connection: BrokerConnection) {
+        const queue = this.getQueue(queueName);
+        const index = queue.consumers.findIndex(v => v.con === connection);
+        if (index === -1) return;
+        queue.consumers.splice(index, 1);
+    }
+
+    public queuePublish(body: BrokerQueuePublish) {
+        const queue = this.getQueue(body.c);
+
+        const m: QueueMessage = {
+            id: queue.currentId++,
+            process: body.process,
+            hash: body.hash,
+            state: QueueMessageState.pending,
+            tries: 0,
+            v: body.v,
+            delay: body.delay || 0,
+            priority: body.priority,
+        };
+
+        if (body.process === QueueMessageProcessing.exactlyOnce) {
+            if (!body.deduplicationInterval) {
+                throw new Error('Missing message deduplication interval');
+            }
+            if (!body.hash) {
+                throw new Error('Missing message hash');
+            }
+            if (handleMessageDeduplication(body.hash, queue, body.v, body.deduplicationInterval)) return;
+            m.ttl = Date.now() + body.deduplicationInterval;
+        }
+
+        if (m.delay > Date.now()) {
+            // todo: how to handle delay? many timeouts or one timeout?
+            return;
+        }
+
+        for (const consumer of queue.consumers) {
+            if (consumer.handling.size >= consumer.maxMessagesInParallel) continue;
+            consumer.handling.set(m.id, m);
+            m.tries++;
+            m.state = QueueMessageState.inFlight;
+            m.lastError = undefined;
+            consumer.con.write(createRpcMessage<BrokerQueueResponseHandleMessage>(
+                0, BrokerType.QueueResponseHandleMessage,
+                { c: body.c, v: body.v, id: m.id }, RpcMessageRouteType.server,
+            ));
+        }
+
+        //todo: handle queues messages and sending when new consumer connects
+    }
+
+    /**
+     * When a queue message has been sent to a consumer and the consumer answers.
+     */
+    public queueMessageHandled(queueName: string, connection: BrokerConnection, id: number, answer: {
+        error?: string,
+        success: boolean,
+        delay?: number
+    }) {
+        const queue = this.queues.get(queueName);
+        if (!queue) return;
+        const consumer = queue.consumers.find(v => v.con === connection);
+        if (!consumer) return;
+        const message = consumer.handling.get(id);
+        if (!message) return;
+        consumer.handling.delete(id);
+
+        if (answer.error) {
+            message.state = QueueMessageState.error;
+        } else if (answer.success) {
+            message.state = QueueMessageState.done;
+        } else if (answer.delay) {
+            message.delay = Date.now() + answer.delay;
+        }
+
+        //todo: handle delays and retries
+    }
+
+    public setCache(id: string, data: Uint8Array, ttl: number) {
+        this.cacheStore.set(id, { data, ttl });
+    }
+
+    public getCache(id: string): { data: Uint8Array, ttl: number } | undefined {
+        return this.cacheStore.get(id);
+    }
+
+    public deleteCache(id: string) {
+        this.cacheStore.delete(id);
     }
 
     public increment(id: string, v?: number): number {
-        const buffer = this.setStore.get(id);
+        const buffer = this.keyStore.get(id);
         const float64 = buffer ? new Float64Array(buffer.buffer, buffer.byteOffset) : new Float64Array(1);
-        float64[0] += v || 1;
-        if (!buffer) this.setStore.set(id, new Uint8Array(float64.buffer));
+        float64[0] += v || 0;
+        if (!buffer) this.keyStore.set(id, new Uint8Array(float64.buffer));
         return float64[0];
     }
 
-    public get(id: string): Uint8Array | undefined {
-        return this.setStore.get(id);
+    public setKey(id: string, data: Uint8Array, ttl: number) {
+        this.keyStore.set(id, data);
+        if (ttl > 0) {
+            setTimeout(() => {
+                this.keyStore.delete(id);
+            }, ttl);
+        }
     }
 
-    public delete(id: string) {
-        this.setStore.delete(id);
+    public getKey(id: string): Uint8Array | undefined {
+        return this.keyStore.get(id);
+    }
+
+    public deleteKey(id: string) {
+        this.keyStore.delete(id);
     }
 }
 
 export class BrokerKernel extends RpcKernel {
     protected state: BrokerState = new BrokerState;
 
-    createConnection(writer: RpcConnectionWriter): BrokerConnection {
-        return new BrokerConnection(writer, this.connections, this.state);
+    createConnection(transport: TransportConnection): BrokerConnection {
+        return new BrokerConnection(this.logger, transport, this.connections, this.state);
     }
 }

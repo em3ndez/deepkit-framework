@@ -8,7 +8,7 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { BaseResponse, Command } from './command';
+import { BaseResponse, Command } from './command.js';
 import { ReflectionClass, UUID } from '@deepkit/type';
 
 interface UpdateResponse extends BaseResponse {
@@ -30,7 +30,7 @@ interface UpdateSchema {
     startTransaction?: boolean;
 }
 
-export class UpdateCommand<T extends ReflectionClass<any>> extends Command {
+export class UpdateCommand<T extends ReflectionClass<any>> extends Command<number> {
     constructor(
         public schema: T,
         public updates: { q: any, u: any, multi: boolean }[] = [],
@@ -40,7 +40,7 @@ export class UpdateCommand<T extends ReflectionClass<any>> extends Command {
 
     async execute(config, host, transaction): Promise<number> {
         const cmd = {
-            update: this.schema.collectionName || this.schema.name || 'unknown',
+            update: this.schema.getCollectionName() || 'unknown',
             $db: this.schema.databaseSchemaName || config.defaultDb || 'admin',
             updates: this.updates
         };
@@ -51,6 +51,6 @@ export class UpdateCommand<T extends ReflectionClass<any>> extends Command {
     }
 
     needsWritableHost(): boolean {
-        return false;
+        return true;
     }
 }

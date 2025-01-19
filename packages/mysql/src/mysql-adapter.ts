@@ -10,7 +10,12 @@
 
 import { createPool, Pool, PoolConfig, PoolConnection, UpsertResult } from 'mariadb';
 import {
+    asAliasName,
     DefaultPlatform,
+    getPreparedEntity,
+    prepareBatchUpdate,
+    PreparedEntity,
+    splitDotPath,
     SqlBuilder,
     SQLConnection,
     SQLConnectionPool,
@@ -20,20 +25,54 @@ import {
     SQLPersistence,
     SQLQueryModel,
     SQLQueryResolver,
-    SQLStatement
+    SQLStatement,
 } from '@deepkit/sql';
-import { DatabaseLogger, DatabasePersistenceChangeSet, DatabaseSession, DatabaseTransaction, DeleteResult, OrmEntity, PatchResult, UniqueConstraintFailure } from '@deepkit/orm';
-import { MySQLPlatform } from './mysql-platform';
-import { Changes, getPartialSerializeFunction, getSerializeFunction, ReceiveType, ReflectionClass, resolvePath, resolveReceiveType } from '@deepkit/type';
+import {
+    DatabaseDeleteError,
+    DatabaseLogger,
+    DatabasePatchError,
+    DatabasePersistenceChangeSet,
+    DatabaseSession,
+    DatabaseTransaction,
+    DatabaseUpdateError,
+    DeleteResult,
+    ensureDatabaseError,
+    OrmEntity,
+    PatchResult,
+    primaryKeyObjectConverter,
+    UniqueConstraintFailure,
+} from '@deepkit/orm';
+import { MySQLPlatform } from './mysql-platform.js';
+import {
+    Changes,
+    getPatchSerializeFunction,
+    getSerializeFunction,
+    ReceiveType,
+    ReflectionClass,
+    resolvePath,
+} from '@deepkit/type';
 import { AbstractClassType, asyncOperation, ClassType, empty, isArray } from '@deepkit/core';
 import { FrameCategory, Stopwatch } from '@deepkit/stopwatch';
+import { parseConnectionString } from './config.js';
 
-function handleError(error: Error | string): void {
-    const message = 'string' === typeof error ? error : error.message;
-    if (message.includes('Duplicate entry')) {
-        //todo: extract table name, column name, and find ClassSchema
-        throw new UniqueConstraintFailure();
+/**
+ * Converts a specific database error to a more specific error, if possible.
+ */
+function handleSpecificError(session: DatabaseSession, error: Error): Error {
+    let cause: any = error;
+    while (cause) {
+        if (cause instanceof Error) {
+            if (cause.message.includes('Duplicate entry ')
+            ) {
+                // Some database drivers contain the SQL, some not. We try to exclude the SQL from the message.
+                // Cause is attached to the error, so we don't lose information.
+                return new UniqueConstraintFailure(`${cause.message.split('\n')[0]}`, { cause: error });
+            }
+            cause = cause.cause;
+        }
     }
+
+    return error;
 }
 
 export class MySQLStatement extends SQLStatement {
@@ -53,7 +92,7 @@ export class MySQLStatement extends SQLStatement {
             this.logger.logQuery(this.sql, params);
             return rows[0];
         } catch (error: any) {
-            handleError(error);
+            error = ensureDatabaseError(error);
             this.logger.failedQuery(error, this.sql, params);
             throw error;
         } finally {
@@ -73,7 +112,7 @@ export class MySQLStatement extends SQLStatement {
             this.logger.logQuery(this.sql, params);
             return rows;
         } catch (error: any) {
-            handleError(error);
+            error = ensureDatabaseError(error);
             this.logger.failedQuery(error, this.sql, params);
             throw error;
         } finally {
@@ -113,7 +152,7 @@ export class MySQLConnection extends SQLConnection {
             this.logger.logQuery(sql, params);
             this.lastExecResult = isArray(res) ? res : [res];
         } catch (error: any) {
-            handleError(error);
+            error = ensureDatabaseError(error);
             this.logger.failedQuery(error, sql, params);
             throw error;
         } finally {
@@ -222,114 +261,70 @@ export class MySQLPersistence extends SQLPersistence {
         super(platform, connectionPool, session);
     }
 
-    async batchUpdate<T extends OrmEntity>(classSchema: ReflectionClass<T>, changeSets: DatabasePersistenceChangeSet<T>[]): Promise<void> {
-        const partialSerialize = getPartialSerializeFunction(classSchema.type, this.platform.serializer.serializeRegistry);
-        const tableName = this.platform.getTableIdentifier(classSchema);
-        const pkName = classSchema.getPrimary().name;
-        const pkField = this.platform.quoteIdentifier(pkName);
+    override handleSpecificError(error: Error): Error {
+        return handleSpecificError(this.session, error);
+    }
 
-        const values: { [name: string]: any[] } = {};
-        const setNames: string[] = [];
-        const aggregateSelects: { [name: string]: { id: any, sql: string }[] } = {};
-        const requiredFields: { [name: string]: 1 } = {};
+    async batchUpdate<T extends OrmEntity>(entity: PreparedEntity, changeSets: DatabasePersistenceChangeSet<T>[]): Promise<void> {
+        const prepared = prepareBatchUpdate(this.platform, entity, changeSets, { setNamesWithTableName: true });
+        if (!prepared) return;
+        const placeholder = new this.platform.placeholderStrategy;
 
-        const assignReturning: { [name: string]: { item: any, names: string[] } } = {};
-        const setReturning: { [name: string]: 1 } = {};
-
-        for (const changeSet of changeSets) {
-            const where: string[] = [];
-
-            const pk = partialSerialize(changeSet.primaryKey);
-            for (const i in pk) {
-                if (!pk.hasOwnProperty(i)) continue;
-                where.push(`${this.platform.quoteIdentifier(i)} = ${this.platform.quoteValue(pk[i])}`);
-                requiredFields[i] = 1;
-            }
-
-            if (!values[pkName]) values[pkName] = [];
-            values[pkName].push(this.platform.quoteValue(changeSet.primaryKey[pkName]));
-
-            const fieldAddedToValues: { [name: string]: 1 } = {};
-            const id = changeSet.primaryKey[pkName];
-
-            if (changeSet.changes.$set) {
-                const value = partialSerialize(changeSet.changes.$set);
-                for (const i in value) {
-                    if (!value.hasOwnProperty(i)) continue;
-                    if (!values[i]) {
-                        values[i] = [];
-                        setNames.push(`${tableName}.${this.platform.quoteIdentifier(i)} = _b.${this.platform.quoteIdentifier(i)}`);
-                    }
-                    requiredFields[i] = 1;
-                    fieldAddedToValues[i] = 1;
-                    values[i].push(this.platform.quoteValue(value[i]));
-                }
-            }
-
-            if (changeSet.changes.$inc) {
-                for (const i in changeSet.changes.$inc) {
-                    if (!changeSet.changes.$inc.hasOwnProperty(i)) continue;
-                    const value = changeSet.changes.$inc[i];
-                    if (!aggregateSelects[i]) aggregateSelects[i] = [];
-
-                    if (!values[i]) {
-                        values[i] = [];
-                        setNames.push(`${tableName}.${this.platform.quoteIdentifier(i)} = _b.${this.platform.quoteIdentifier(i)}`);
-                    }
-
-                    if (!assignReturning[id]) {
-                        assignReturning[id] = { item: changeSet.item, names: [] };
-                    }
-
-                    assignReturning[id].names.push(i);
-                    setReturning[i] = 1;
-
-                    aggregateSelects[i].push({
-                        id: changeSet.primaryKey[pkName],
-                        sql: `_origin.${this.platform.quoteIdentifier(i)} + ${this.platform.quoteValue(value)}`
-                    });
-                    requiredFields[i] = 1;
-                    if (!fieldAddedToValues[i]) {
-                        fieldAddedToValues[i] = 1;
-                        values[i].push(this.platform.quoteValue(null));
-                    }
-                }
-            }
-        }
-
+        const params: any[] = [];
         const selects: string[] = [];
         const valuesValues: string[] = [];
+        const valuesSetValues: string[] = [];
         const valuesNames: string[] = [];
-        for (const i in values) {
-            valuesNames.push(i);
+        const valuesSetNames: string[] = [];
+        for (const fieldName of prepared.changedFields) {
+            valuesNames.push(entity.fieldMap[fieldName].columnNameEscaped);
+            valuesSetNames.push('_changed_' + fieldName);
         }
 
-        for (let i = 0; i < values[pkName].length; i++) {
-            valuesValues.push('ROW(' + valuesNames.map(name => values[name][i]).join(',') + ')');
+        for (let i = 0; i < changeSets.length; i++) {
+            params.push(prepared.primaryKeys[i]);
+            let pkValue = entity.primaryKey.sqlTypeCast(placeholder.getPlaceholder());
+            valuesValues.push('ROW(' + pkValue + ',' + prepared.changedProperties.map(property => {
+                params.push(prepared.values[property.name][i]);
+                return property.sqlTypeCast(placeholder.getPlaceholder());
+            }).join(',') + ')');
         }
 
-        for (const i in requiredFields) {
-            if (aggregateSelects[i]) {
+        for (let i = 0; i < changeSets.length; i++) {
+            params.push(prepared.primaryKeys[i]);
+            let valuesSetValueSql = entity.primaryKey.sqlTypeCast(placeholder.getPlaceholder());
+            for (const fieldName of prepared.changedFields) {
+                valuesSetValueSql += ', ' + prepared.valuesSet[fieldName][i];
+            }
+            valuesSetValues.push('ROW(' + valuesSetValueSql + ')');
+        }
+
+        for (const i of prepared.changedFields) {
+            const col = entity.fieldMap[i].columnNameEscaped;
+            const colChanged = this.platform.quoteIdentifier('_changed_' + i);
+            if (prepared.aggregateSelects[i]) {
                 const select: string[] = [];
                 select.push('CASE');
-                for (const item of aggregateSelects[i]) {
-                    select.push(`WHEN _.${pkField} = ${item.id} THEN ${item.sql}`);
+                for (const item of prepared.aggregateSelects[i]) {
+                    select.push(`WHEN _.${prepared.originPkField} = ${item.id} THEN ${item.sql}`);
                 }
-                select.push(`ELSE _.${this.platform.quoteIdentifier(i)} END as ${this.platform.quoteIdentifier(i)}`);
+
+                select.push(`ELSE IF(_set.${colChanged} = 0, _origin.${col}, _.${col}) END as ${col}`);
                 selects.push(select.join(' '));
             } else {
-                selects.push('_.' + i);
+                selects.push(`IF(_set.${colChanged} = 0, _origin.${col}, _.${col}) as ${col}`);
             }
         }
 
         let setVars = '';
         let endSelect = '';
-        if (!empty(setReturning)) {
+        if (!empty(prepared.setReturning)) {
             const vars: string[] = [];
             const endSelectVars: string[] = [];
-            vars.push(`@_pk := JSON_ARRAYAGG(${pkField})`);
+            vars.push(`@_pk := JSON_ARRAYAGG(${prepared.originPkField})`);
             endSelectVars.push('@_pk');
-            for (const i in setReturning) {
+            for (let i in prepared.setReturning) {
+                i = asAliasName(i);
                 endSelectVars.push(`@_f_${i}`);
                 vars.push(`@_f_${i} := JSON_ARRAYAGG(${this.platform.quoteIdentifier(i)})`);
             }
@@ -340,39 +335,51 @@ export class MySQLPersistence extends SQLPersistence {
         }
 
         const sql = `
-              WITH _tmp(${valuesNames.join(', ')}) AS (
-                SELECT ${selects.join(', ')} FROM
-                    (VALUES ${valuesValues.join(', ')}) as _(${valuesNames.join(', ')})
-                    INNER JOIN ${tableName} as _origin ON (_origin.${pkField} = _.${pkField})
+              WITH _tmp(${prepared.originPkField}, ${valuesNames.join(', ')}) AS (
+                SELECT _.${prepared.originPkField}, ${selects.join(', ')} FROM
+                    (VALUES ${valuesValues.join(', ')}) as _(${prepared.originPkField}, ${valuesNames.join(', ')})
+                    INNER JOIN (VALUES ${valuesSetValues.join(', ')}) as _set(${prepared.pkField}, ${valuesSetNames.join(', ')}) ON (_.${prepared.originPkField} = _set.${prepared.pkField})
+                    INNER JOIN ${prepared.tableName} as _origin ON (_origin.${prepared.pkField} = _.${prepared.originPkField})
               )
               UPDATE
-                ${tableName}, _tmp as _b ${setVars}
+                ${prepared.tableName}, _tmp as _b ${setVars}
 
-              SET ${setNames.join(', ')}
-              WHERE ${tableName}.${pkField} = _b.${pkField};
+              SET ${prepared.setNames.join(', ')}
+              WHERE ${prepared.tableName}.${prepared.pkField} = _b.${prepared.originPkField};
               ${endSelect}
         `;
 
-        const connection = await this.getConnection(); //will automatically be released in SQLPersistence
-        const result = await connection.execAndReturnAll(sql);
+        try {
+            const connection = await this.getConnection(); //will automatically be released in SQLPersistence
+            const result = await connection.execAndReturnAll(sql, params);
 
-        if (!empty(setReturning)) {
-            const returning = result[1][0];
-            const ids = JSON.parse(returning['@_pk']) as (number | string)[];
-            const parsedReturning: { [name: string]: any[] } = {};
-            for (const i in setReturning) {
-                parsedReturning[i] = JSON.parse(returning['@_f_' + i]) as any[];
-            }
+            if (!empty(prepared.setReturning)) {
+                const returning = result[1][0];
+                const ids = JSON.parse(returning['@_pk']) as (number | string)[];
+                const parsedReturning: { [name: string]: any[] } = {};
+                for (const i in prepared.setReturning) {
+                    parsedReturning[i] = JSON.parse(returning['@_f_' + i]) as any[];
+                }
 
-            for (let i = 0; i < ids.length; i++) {
-                const id = ids[i];
-                const r = assignReturning[id];
-                if (!r) continue;
+                for (let i = 0; i < ids.length; i++) {
+                    const id = ids[i];
+                    const r = prepared.assignReturning[id];
+                    if (!r) continue;
 
-                for (const name of r.names) {
-                    r.item[name] = parsedReturning[name][i];
+                    for (const name of r.names) {
+                        r.item[name] = parsedReturning[name][i];
+                    }
                 }
             }
+        } catch (error: any) {
+            const reflection = ReflectionClass.from(entity.type);
+            error = new DatabaseUpdateError(
+                reflection,
+                changeSets,
+                `Could not update ${reflection.getClassName()} in database`,
+                { cause: error },
+            );
+            throw this.handleSpecificError(error);
         }
     }
 
@@ -396,12 +403,16 @@ export class MySQLPersistence extends SQLPersistence {
 }
 
 export class MySQLQueryResolver<T extends OrmEntity> extends SQLQueryResolver<T> {
+    override handleSpecificError(error: Error): Error {
+        return handleSpecificError(this.session, error);
+    }
+
     async delete(model: SQLQueryModel<T>, deleteResult: DeleteResult<T>): Promise<void> {
         const primaryKey = this.classSchema.getPrimary();
         const pkField = this.platform.quoteIdentifier(primaryKey.name);
-        const primaryKeyConverted = getSerializeFunction(primaryKey.property, this.platform.serializer.deserializeRegistry);
+        const primaryKeyConverted = primaryKeyObjectConverter(this.classSchema, this.platform.serializer.deserializeRegistry);
 
-        const sqlBuilder = new SqlBuilder(this.platform);
+        const sqlBuilder = new SqlBuilder(this.adapter);
         const tableName = this.platform.getTableIdentifier(this.classSchema);
         const select = sqlBuilder.select(this.classSchema, model, { select: [`${tableName}.${pkField}`] });
 
@@ -420,6 +431,10 @@ export class MySQLQueryResolver<T extends OrmEntity> extends SQLQueryResolver<T>
             const pk = returning[0]['@_pk'];
             if (pk) deleteResult.primaryKeys = JSON.parse(pk).map(primaryKeyConverted);
             deleteResult.modified = deleteResult.primaryKeys.length;
+        } catch (error: any) {
+            error = new DatabaseDeleteError(this.classSchema, 'Could not delete in database', { cause: error });
+            error.query = model;
+            throw this.handleSpecificError(error);
         } finally {
             connection.release();
         }
@@ -428,44 +443,53 @@ export class MySQLQueryResolver<T extends OrmEntity> extends SQLQueryResolver<T>
     async patch(model: SQLQueryModel<T>, changes: Changes<T>, patchResult: PatchResult<T>): Promise<void> {
         const select: string[] = [];
         const selectParams: any[] = [];
-        const tableName = this.platform.getTableIdentifier(this.classSchema);
-        const primaryKey = this.classSchema.getPrimary();
-        const primaryKeyConverted = getSerializeFunction(primaryKey.property, this.platform.serializer.deserializeRegistry);
+        const entity = getPreparedEntity(this.session.adapter as SQLDatabaseAdapter, this.classSchema);
+        const tableName = entity.tableNameEscaped;
+        const primaryKey = entity.primaryKey;
+        const primaryKeyConverted = primaryKeyObjectConverter(this.classSchema, this.platform.serializer.deserializeRegistry);
 
         const fieldsSet: { [name: string]: 1 } = {};
         const aggregateFields: { [name: string]: { converted: (v: any) => any } } = {};
 
-        const partialSerialize = getPartialSerializeFunction(this.classSchema.type, this.platform.serializer.serializeRegistry);
-        const $set = changes.$set ? partialSerialize(changes.$set) : undefined;
+        const patchSerialize = getPatchSerializeFunction(this.classSchema.type, this.platform.serializer.serializeRegistry);
+        const $set = changes.$set ? patchSerialize(changes.$set, undefined, { normalizeArrayIndex: true }) : undefined;
 
         if ($set) for (const i in $set) {
             if (!$set.hasOwnProperty(i)) continue;
             fieldsSet[i] = 1;
-            select.push(`? as ${this.platform.quoteIdentifier(i)}`);
+            select.push(`? as ${this.platform.quoteIdentifier(asAliasName(i))}`);
             selectParams.push($set[i]);
         }
 
         if (changes.$unset) for (const i in changes.$unset) {
             if (!changes.$unset.hasOwnProperty(i)) continue;
             fieldsSet[i] = 1;
-            select.push(`NULL as ${this.platform.quoteIdentifier(i)}`);
+            select.push(`NULL as ${this.platform.quoteIdentifier(asAliasName(i))}`);
         }
 
         for (const i of model.returning) {
             aggregateFields[i] = { converted: getSerializeFunction(resolvePath(i, this.classSchema.type), this.platform.serializer.deserializeRegistry) };
-            select.push(`(${this.platform.quoteIdentifier(i)} ) as ${this.platform.quoteIdentifier(i)}`);
+            select.push(`(${this.platform.quoteIdentifier(i)} ) as ${this.platform.quoteIdentifier(asAliasName(i))}`);
         }
 
         if (changes.$inc) for (const i in changes.$inc) {
             if (!changes.$inc.hasOwnProperty(i)) continue;
             fieldsSet[i] = 1;
             aggregateFields[i] = { converted: getSerializeFunction(resolvePath(i, this.classSchema.type), this.platform.serializer.serializeRegistry) };
-            select.push(`(${this.platform.quoteIdentifier(i)} + ${this.platform.quoteValue(changes.$inc[i])}) as ${this.platform.quoteIdentifier(i)}`);
+            select.push(`(${this.platform.getColumnAccessor('', i)} + ${this.platform.quoteValue(changes.$inc[i])}) as ${this.platform.quoteIdentifier(asAliasName(i))}`);
         }
 
         const set: string[] = [];
         for (const i in fieldsSet) {
-            set.push(`_target.${this.platform.quoteIdentifier(i)} = b.${this.platform.quoteIdentifier(i)}`);
+            if (i.includes('.')) {
+                let [firstPart, secondPart] = splitDotPath(i);
+                if (!secondPart.startsWith('[')) secondPart = '.' + secondPart;
+                set.push(`_target.${this.platform.quoteIdentifier(firstPart)} = json_set(${this.platform.quoteIdentifier(firstPart)}, '$${secondPart}', b.${this.platform.quoteIdentifier(asAliasName(i))})`);
+            } else {
+                const property = entity.fieldMap[i];
+                const ref = 'b.' + this.platform.quoteIdentifier(asAliasName(i));
+                set.push(`_target.${this.platform.quoteIdentifier(i)} = ${property.sqlTypeCast(ref)}`);
+            }
         }
 
         const extractSelect: string[] = [];
@@ -482,7 +506,8 @@ export class MySQLQueryResolver<T extends OrmEntity> extends SQLQueryResolver<T>
         extractSelect.push(`@_pk := JSON_ARRAYAGG(${this.platform.quoteIdentifier(primaryKey.name)})`);
         selectVars.push(`@_pk`);
         if (!empty(aggregateFields)) {
-            for (const i in aggregateFields) {
+            for (let i in aggregateFields) {
+                i = asAliasName(i);
                 extractSelect.push(`@_f_${i} := JSON_ARRAYAGG(${this.platform.quoteIdentifier(i)})`);
                 selectVars.push(`@_f_${i}`);
             }
@@ -492,7 +517,7 @@ export class MySQLQueryResolver<T extends OrmEntity> extends SQLQueryResolver<T>
             `;
         const selectVarsSQL = `SELECT ${selectVars.join(', ')};`;
 
-        const sqlBuilder = new SqlBuilder(this.platform, selectParams);
+        const sqlBuilder = new SqlBuilder(this.adapter, selectParams);
         const selectSQL = sqlBuilder.select(this.classSchema, model, { select });
 
         const params = selectSQL.params;
@@ -512,38 +537,60 @@ export class MySQLQueryResolver<T extends OrmEntity> extends SQLQueryResolver<T>
             const packet = result[0];
             patchResult.modified = packet.affectedRows;
             const returning = result[1][0];
-            patchResult.primaryKeys = (JSON.parse(returning['@_pk']) as any[]).map(primaryKeyConverted as any);
-
-            for (const i in aggregateFields) {
-                patchResult.returning[i] = (JSON.parse(returning['@_f_' + i]) as any[]).map(aggregateFields[i].converted);
+            if (patchResult.modified > 0) {
+                patchResult.primaryKeys = (JSON.parse(returning['@_pk']) as any[]).map(primaryKeyConverted as any);
             }
 
+            for (const i in aggregateFields) {
+                patchResult.returning[i] = (JSON.parse(returning['@_f_' + asAliasName(i)]) as any[]).map(aggregateFields[i].converted);
+            }
+        } catch (error: any) {
+            error = new DatabasePatchError(this.classSchema, model, changes, `Could not patch ${this.classSchema.getClassName()} in database`, { cause: error });
+            throw this.handleSpecificError(error);
         } finally {
             connection.release();
         }
     }
 }
 
-export class MySQLDatabaseQuery<T> extends SQLDatabaseQuery<T> {
+export class MySQLDatabaseQuery<T extends OrmEntity> extends SQLDatabaseQuery<T> {
 }
 
 export class MySQLDatabaseQueryFactory extends SQLDatabaseQueryFactory {
     createQuery<T extends OrmEntity>(type?: ReceiveType<T> | ClassType<T> | AbstractClassType<T> | ReflectionClass<T>): MySQLDatabaseQuery<T> {
         return new MySQLDatabaseQuery<T>(ReflectionClass.from(type), this.databaseSession,
-            new MySQLQueryResolver<T>(this.connectionPool, this.platform, ReflectionClass.from(type), this.databaseSession)
+            new MySQLQueryResolver<T>(this.connectionPool, this.platform, ReflectionClass.from(type), this.databaseSession.adapter, this.databaseSession),
         );
     }
 }
 
 export class MySQLDatabaseAdapter extends SQLDatabaseAdapter {
-    protected pool = createPool({ multipleStatements: true, maxAllowedPacket: 16_000_000, ...this.options });
-    public connectionPool = new MySQLConnectionPool(this.pool);
-    public platform = new MySQLPlatform(this.pool);
+    protected options: PoolConfig;
+    protected pool: Pool;
+    public connectionPool: MySQLConnectionPool;
+    public platform: MySQLPlatform;
 
     constructor(
-        protected options: PoolConfig = {}
+        options: PoolConfig | string = {},
+        additional: Partial<PoolConfig> = {},
     ) {
         super();
+
+        const defaults: PoolConfig = {
+            multipleStatements: true,
+            maxAllowedPacket: 16_000_000,
+            // https://github.com/mariadb-corporation/mariadb-connector-nodejs/blob/master/documentation/callback-api.md#migrating-from-2x-or-mysqlmysql2-to-3x
+            insertIdAsNumber: true,
+            decimalAsNumber: true,
+            bigIntAsNumber: true,
+        }
+
+        options = typeof options === 'string' ? parseConnectionString(options) : options;
+        this.options = Object.assign(defaults, options, additional);
+
+        this.pool = createPool(this.options);
+        this.connectionPool = new MySQLConnectionPool(this.pool);
+        this.platform = new MySQLPlatform(this.pool);
     }
 
     getName(): string {

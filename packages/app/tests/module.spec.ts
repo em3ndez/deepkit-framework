@@ -1,9 +1,9 @@
 import { expect, test } from '@jest/globals';
 import { Minimum, MinLength } from '@deepkit/type';
-import { injectorReference } from '@deepkit/injector';
-import { ServiceContainer } from '../src/service-container';
+import { provide } from '@deepkit/injector';
+import { ServiceContainer } from '../src/service-container.js';
 import { ClassType } from '@deepkit/core';
-import { AppModule, createModule } from '../src/module';
+import { AppModule, createModule } from '../src/module.js';
 
 class MyModuleConfig {
     param1!: string & MinLength<5>;
@@ -30,7 +30,7 @@ class AppModuleConfig {
     myModule?: Partial<{
         param1: string;
         param2: number;
-    }>
+    }>;
 }
 
 type MyServiceConfig = Pick<AppModuleConfig, 'debug'>;
@@ -151,6 +151,7 @@ test('configured provider', () => {
 
         addTransport(transport: any) {
             this.transporter.push(transport);
+            return this;
         }
     }
 
@@ -164,7 +165,7 @@ test('configured provider', () => {
     {
         const module = new AppModule();
         const logger = new ServiceContainer(module.setup((module) => {
-            module.setupProvider<Logger>().addTransport('first').addTransport('second');
+            module.configureProvider<Logger>(v => v.addTransport('first').addTransport('second'));
         })).getInjector(module).get(Logger);
         expect(logger.transporter).toEqual(['first', 'second']);
     }
@@ -172,7 +173,7 @@ test('configured provider', () => {
     {
         const module = new AppModule();
         const logger = new ServiceContainer(module.setup((module) => {
-            module.setupProvider<Logger>().transporter = ['first', 'second', 'third'];
+            module.configureProvider<Logger>(v => v.transporter = ['first', 'second', 'third']);
         })).getInjector(module).get(Logger);
         expect(logger.transporter).toEqual(['first', 'second', 'third']);
     }
@@ -180,7 +181,7 @@ test('configured provider', () => {
     {
         const module = new AppModule();
         const logger = new ServiceContainer(module.setup((module) => {
-            module.setupProvider<Logger>().addTransport(new Transporter);
+            module.configureProvider<Logger>(v => v.addTransport(new Transporter));
         })).getInjector(module).get(Logger);
         expect(logger.transporter[0] instanceof Transporter).toBe(true);
     }
@@ -188,7 +189,7 @@ test('configured provider', () => {
     {
         const module = new AppModule();
         const logger = new ServiceContainer(module.setup((module) => {
-            module.setupProvider<Logger>().addTransport(injectorReference(Transporter));
+            module.configureProvider<Logger>((v, t: Transporter) => v.addTransport(t));
         })).getInjector(module).get(Logger);
         expect(logger.transporter[0] instanceof Transporter).toBe(true);
     }
@@ -246,6 +247,22 @@ test('same module loaded twice', () => {
         expect(serviceContainer.getInjector(a).get(Service).path).toBe('/a');
         expect(serviceContainer.getInjector(b).get(Service).path).toBe('/b');
     }
+});
+
+test('interface provider can be exported', () => {
+   interface Test {}
+
+   const TEST = {};
+
+   const Test = provide<Test>({ useValue: TEST });
+
+   const test = new AppModule({ providers: [Test], exports: [Test] });
+
+   const app = new AppModule({ imports: [test] });
+
+    const serviceContainer = new ServiceContainer(app);
+
+   expect(serviceContainer.getInjector(app).get<Test>()).toBe(TEST);
 });
 
 test('non-exported providers can not be overwritten', () => {
@@ -340,6 +357,7 @@ test('change config of a imported module dynamically', () => {
     class ApiConfig {
         debug: boolean = false;
     }
+
     class ApiModule extends createModule({
         config: ApiConfig
     }) {
@@ -378,7 +396,6 @@ test('change config of a imported module dynamically', () => {
 });
 
 test('scoped injector', () => {
-
     let created = 0;
 
     class Service {
@@ -409,5 +426,34 @@ test('scoped injector', () => {
         expect(scope.get(Service, module)).toBeInstanceOf(Service);
         expect(created).toBe(2);
     }
+});
 
+test('functional modules factory', () => {
+    const myModule = (title: string) => {
+        return (module: AppModule) => {
+            module.addProvider({ provide: 'title', useValue: title });
+            module.forRoot();
+        };
+    };
+
+    const module = new AppModule({
+        imports: [myModule('Peter')],
+    });
+    const serviceContainer = new ServiceContainer(module);
+
+    expect(serviceContainer.getInjectorContext().get('title')).toBe('Peter');
+});
+
+test('functional modules', () => {
+    const myModule = (module: AppModule) => {
+        module.addProvider({ provide: 'title', useValue: 'Peter' });
+        module.forRoot();
+    };
+
+    const module = new AppModule({
+        imports: [myModule],
+    });
+    const serviceContainer = new ServiceContainer(module);
+
+    expect(serviceContainer.getInjectorContext().get('title')).toBe('Peter');
 });

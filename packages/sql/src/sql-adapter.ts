@@ -13,36 +13,70 @@ import {
     Database,
     DatabaseAdapter,
     DatabaseAdapterQueryFactory,
+    DatabaseDeleteError,
     DatabaseEntityRegistry,
     DatabaseError,
+    DatabaseInsertError,
     DatabaseLogger,
+    DatabasePatchError,
     DatabasePersistence,
     DatabasePersistenceChangeSet,
     DatabaseQueryModel,
     DatabaseSession,
     DatabaseTransaction,
+    DatabaseUpdateError,
     DeleteResult,
     FilterQuery,
+    FindQuery,
     GenericQueryResolver,
+    ItemNotFound,
+    MigrateOptions,
     OrmEntity,
     PatchResult,
     Query,
     RawFactory,
     Replace,
     Resolve,
-    SORT_ORDER
+    SORT_ORDER,
 } from '@deepkit/orm';
 import { AbstractClassType, ClassType, isArray, isClass } from '@deepkit/core';
-import { Changes, getPartialSerializeFunction, getSerializeFunction, ReceiveType, ReflectionClass } from '@deepkit/type';
-import { DefaultPlatform, SqlPlaceholderStrategy } from './platform/default-platform';
-import { SqlBuilder } from './sql-builder';
-import { SqlFormatter } from './sql-formatter';
-import { sqlSerializer } from './serializer/sql-serializer';
-import { DatabaseComparator, DatabaseModel } from './schema/table';
+import {
+    castFunction,
+    Changes,
+    entity,
+    getPartialSerializeFunction,
+    getSerializeFunction,
+    PrimaryKey,
+    ReceiveType,
+    ReflectionClass,
+    ReflectionKind,
+    resolveReceiveType,
+    Type,
+} from '@deepkit/type';
+import { DefaultPlatform, SqlPlaceholderStrategy } from './platform/default-platform.js';
+import { Sql, SqlBuilder } from './sql-builder.js';
+import { SqlFormatter } from './sql-formatter.js';
+import { DatabaseComparator, DatabaseModel } from './schema/table.js';
 import { Stopwatch } from '@deepkit/stopwatch';
+import { getPreparedEntity, PreparedEntity, PreparedField } from './prepare.js';
 
 export type SORT_TYPE = SORT_ORDER | { $meta: 'textScore' };
 export type DEEP_SORT<T extends OrmEntity> = { [P in keyof T]?: SORT_TYPE } & { [P: string]: SORT_TYPE };
+
+/**
+ * user.address[0].street => [user, address[0].street]
+ * address[0].street => [address, [0].street]
+ */
+export function splitDotPath(path: string): [string, string] {
+    const first1 = path.indexOf('[');
+    const first2 = path.indexOf('.');
+    const first = first1 === -1 ? first2 : first2 === -1 ? first1 : Math.min(first1, first2);
+    return [path.substr(0, first), path.substr(first + (first === first2 ? 1 : 0))];
+}
+
+export function asAliasName(path: string): string {
+    return path.replace(/[\[\]\.]/g, '__');
+}
 
 export class SQLQueryModel<T extends OrmEntity> extends DatabaseQueryModel<T, FilterQuery<T>, DEEP_SORT<T>> {
     where?: SqlQuery;
@@ -75,7 +109,7 @@ export abstract class SQLConnection {
         protected connectionPool: SQLConnectionPool,
         public logger: DatabaseLogger = new DatabaseLogger,
         public transaction?: DatabaseTransaction,
-        public stopwatch?: Stopwatch
+        public stopwatch?: Stopwatch,
     ) {
     }
 
@@ -168,7 +202,8 @@ export class SQLQueryResolver<T extends OrmEntity> extends GenericQueryResolver<
         protected connectionPool: SQLConnectionPool,
         protected platform: DefaultPlatform,
         classSchema: ReflectionClass<T>,
-        session: DatabaseSession<DatabaseAdapter>
+        protected adapter: SQLDatabaseAdapter,
+        session: DatabaseSession<DatabaseAdapter>,
     ) {
         super(classSchema, session);
     }
@@ -176,9 +211,9 @@ export class SQLQueryResolver<T extends OrmEntity> extends GenericQueryResolver<
     protected createFormatter(withIdentityMap: boolean = false) {
         return new SqlFormatter(
             this.classSchema,
-            sqlSerializer,
+            this.platform.serializer,
             this.session.getHydrator(),
-            withIdentityMap ? this.session.identityMap : undefined
+            withIdentityMap ? this.session.identityMap : undefined,
         );
     }
 
@@ -186,9 +221,17 @@ export class SQLQueryResolver<T extends OrmEntity> extends GenericQueryResolver<
         return this.platform.getTableIdentifier(schema);
     }
 
+    /**
+     * If possible, this method should handle specific SQL errors and convert
+     * them to more specific error classes with more information, e.g. unique constraint.
+     */
+    handleSpecificError(error: Error): Error {
+        return error;
+    }
+
     async count(model: SQLQueryModel<T>): Promise<number> {
         const sqlBuilderFrame = this.session.stopwatch ? this.session.stopwatch.start('SQL Builder') : undefined;
-        const sqlBuilder = new SqlBuilder(this.platform);
+        const sqlBuilder = new SqlBuilder(this.adapter);
         const sql = sqlBuilder.build(this.classSchema, model, 'SELECT COUNT(*) as count');
         if (sqlBuilderFrame) sqlBuilderFrame.end();
 
@@ -201,6 +244,8 @@ export class SQLQueryResolver<T extends OrmEntity> extends GenericQueryResolver<
 
             //postgres has bigint as return type of COUNT, so we need to convert always
             return Number(row.count);
+        } catch (error: any) {
+            throw this.handleSpecificError(error);
         } finally {
             connection.release();
         }
@@ -210,7 +255,7 @@ export class SQLQueryResolver<T extends OrmEntity> extends GenericQueryResolver<
         if (model.hasJoins()) throw new Error('Delete with joins not supported. Fetch first the ids then delete.');
 
         const sqlBuilderFrame = this.session.stopwatch ? this.session.stopwatch.start('SQL Builder') : undefined;
-        const sqlBuilder = new SqlBuilder(this.platform);
+        const sqlBuilder = new SqlBuilder(this.adapter);
         const sql = sqlBuilder.build(this.classSchema, model, 'DELETE');
         if (sqlBuilderFrame) sqlBuilderFrame.end();
 
@@ -221,8 +266,11 @@ export class SQLQueryResolver<T extends OrmEntity> extends GenericQueryResolver<
         try {
             await connection.run(sql.sql, sql.params);
             deleteResult.modified = await connection.getChanges();
-
             //todo, implement deleteResult.primaryKeys
+        } catch (error: any) {
+            error = new DatabaseDeleteError(this.classSchema, `Could not delete ${this.classSchema.getClassName()} in database`, { cause: error });
+            error.query = model;
+            throw this.handleSpecificError(error);
         } finally {
             connection.release();
         }
@@ -230,7 +278,7 @@ export class SQLQueryResolver<T extends OrmEntity> extends GenericQueryResolver<
 
     async find(model: SQLQueryModel<T>): Promise<T[]> {
         const sqlBuilderFrame = this.session.stopwatch ? this.session.stopwatch.start('SQL Builder') : undefined;
-        const sqlBuilder = new SqlBuilder(this.platform);
+        const sqlBuilder = new SqlBuilder(this.adapter);
         const sql = sqlBuilder.select(this.classSchema, model);
         if (sqlBuilderFrame) sqlBuilderFrame.end();
 
@@ -238,32 +286,34 @@ export class SQLQueryResolver<T extends OrmEntity> extends GenericQueryResolver<
         const connection = await this.connectionPool.getConnection(this.session.logger, this.session.assignedTransaction, this.session.stopwatch);
         if (connectionFrame) connectionFrame.end();
 
+        let rows: any[] = [];
         try {
-            const rows = await connection.execAndReturnAll(sql.sql, sql.params);
-
-            const formatterFrame = this.session.stopwatch ? this.session.stopwatch.start('Formatter') : undefined;
-            const results: T[] = [];
-            if (model.isAggregate() || model.sqlSelect) {
-                //when aggregate the field types could be completely different, so don't normalize
-                for (const row of rows) results.push(row); //mysql returns not a real array, so we have to iterate
-                if (formatterFrame) formatterFrame.end();
-                return results;
-            }
-            const formatter = this.createFormatter(model.withIdentityMap);
-            if (model.hasJoins()) {
-                const converted = sqlBuilder.convertRows(this.classSchema, model, rows);
-                for (const row of converted) results.push(formatter.hydrate(model, row));
-            } else {
-                for (const row of rows) results.push(formatter.hydrate(model, row));
-            }
-            if (formatterFrame) formatterFrame.end();
-
-            return results;
+            rows = await connection.execAndReturnAll(sql.sql, sql.params);
         } catch (error: any) {
-            throw new DatabaseError(`Could not query ${this.classSchema.getClassName()} due to SQL error ${error}.\nSQL: ${sql.sql}\nParams: ${JSON.stringify(sql.params)}. Error: ${error}`);
+            error = this.handleSpecificError(error);
+            throw new DatabaseError(`Could not query ${this.classSchema.getClassName()} due to SQL error ${error}`, { cause: error });
         } finally {
             connection.release();
         }
+
+        const formatterFrame = this.session.stopwatch ? this.session.stopwatch.start('Formatter') : undefined;
+        const results: T[] = [];
+        if (model.isAggregate() || model.sqlSelect) {
+            //when aggregate the field types could be completely different, so don't normalize
+            for (const row of rows) results.push(row); //mysql returns not a real array, so we have to iterate
+            if (formatterFrame) formatterFrame.end();
+            return results;
+        }
+        const formatter = this.createFormatter(model.withIdentityMap);
+        if (model.hasJoins()) {
+            const converted = sqlBuilder.convertRows(this.classSchema, model, rows);
+            for (const row of converted) results.push(formatter.hydrate(model, row));
+        } else {
+            for (const row of rows) results.push(formatter.hydrate(model, row));
+        }
+        if (formatterFrame) formatterFrame.end();
+
+        return results;
     }
 
     async findOneOrUndefined(model: SQLQueryModel<T>): Promise<T | undefined> {
@@ -281,7 +331,7 @@ export class SQLQueryResolver<T extends OrmEntity> extends GenericQueryResolver<
 
         const sqlBuilderFrame = this.session.stopwatch ? this.session.stopwatch.start('SQL Builder') : undefined;
         const set = buildSetFromChanges(this.platform, this.classSchema, changes);
-        const sqlBuilder = new SqlBuilder(this.platform);
+        const sqlBuilder = new SqlBuilder(this.adapter);
         const sql = sqlBuilder.update(this.classSchema, model, set);
         if (sqlBuilderFrame) sqlBuilderFrame.end();
 
@@ -292,6 +342,9 @@ export class SQLQueryResolver<T extends OrmEntity> extends GenericQueryResolver<
         try {
             await connection.run(sql.sql, sql.params);
             patchResult.modified = await connection.getChanges();
+        } catch (error: any) {
+            error = new DatabasePatchError(this.classSchema, model, changes, `Could not patch ${this.classSchema.getClassName()} in database`, { cause: error });
+            throw this.handleSpecificError(error);
         } finally {
             connection.release();
         }
@@ -314,6 +367,8 @@ export function identifier(id: string) {
     return new SQLQueryIdentifier(id);
 }
 
+export type SqlStatement = { sql: string, params: any[] };
+
 export class SqlQuery {
     constructor(public parts: ReadonlyArray<QueryPart>) {
     }
@@ -325,8 +380,8 @@ export class SqlQuery {
     convertToSQL(
         platform: DefaultPlatform,
         placeholderStrategy: SqlPlaceholderStrategy,
-        tableName?: string
-    ): { sql: string, params: any[] } {
+        tableName?: string,
+    ): SqlStatement {
         let sql = '';
         const params: any[] = [];
 
@@ -384,7 +439,7 @@ export class SQLDatabaseQuery<T extends OrmEntity> extends Query<T> {
     constructor(
         classSchema: ReflectionClass<T>,
         protected databaseSession: DatabaseSession<DatabaseAdapter>,
-        protected resolver: SQLQueryResolver<T>
+        protected resolver: SQLQueryResolver<T>,
     ) {
         super(classSchema, databaseSession, resolver);
         if (!databaseSession.withIdentityMap) this.model.withIdentityMap = false;
@@ -424,42 +479,43 @@ export class SQLDatabaseQueryFactory extends DatabaseAdapterQueryFactory {
 
     createQuery<T extends OrmEntity>(classType: ReceiveType<T> | ClassType<T> | AbstractClassType<T> | ReflectionClass<T>): SQLDatabaseQuery<T> {
         return new SQLDatabaseQuery(ReflectionClass.from(classType), this.databaseSession,
-            new SQLQueryResolver(this.connectionPool, this.platform, ReflectionClass.from(classType), this.databaseSession)
+            new SQLQueryResolver(this.connectionPool, this.platform, ReflectionClass.from(classType), this.databaseSession.adapter, this.databaseSession),
         );
     }
 }
 
+@entity.name('migration_state')
+export class MigrationStateEntity {
+    created: Date = new Date;
+
+    constructor(public version: number & PrimaryKey) {
+    }
+}
+
 export class SqlMigrationHandler {
-    protected migrationEntity = class Entity {
-        created: Date = new Date;
-
-        constructor(public version: number) {
-        }
-    };
-
     constructor(protected database: Database<SQLDatabaseAdapter>) {
     }
 
     public async setLatestMigrationVersion(version: number): Promise<void> {
         const session = this.database.createSession();
-        session.add(new this.migrationEntity(version));
+        session.add(new MigrationStateEntity(version));
         await session.commit();
     }
 
     public async removeMigrationVersion(version: number): Promise<void> {
         const session = this.database.createSession();
-        await session.query(this.migrationEntity).filter({ version }).deleteOne();
+        await session.query(MigrationStateEntity).filter({ version }).deleteOne();
     }
 
     public async getLatestMigrationVersion(): Promise<number> {
         const session = this.database.createSession();
         try {
-            const version = await session.query(this.migrationEntity).sort({ version: 'desc' }).findOneOrUndefined();
+            const version = await session.query(MigrationStateEntity).sort({ version: 'desc' }).findOneOrUndefined();
             return version ? version.version : 0;
         } catch (error) {
             const connection = await this.database.adapter.connectionPool.getConnection();
             try {
-                const [table] = this.database.adapter.platform.createTables(DatabaseEntityRegistry.from([this.migrationEntity]));
+                const [table] = this.database.adapter.platform.createTables(DatabaseEntityRegistry.from([MigrationStateEntity]));
                 const createSql = this.database.adapter.platform.getAddTableDDL(table);
                 for (const sql of createSql) {
                     await connection.run(sql);
@@ -472,12 +528,13 @@ export class SqlMigrationHandler {
     }
 }
 
-export class RawQuery {
+export class RawQuery<T> implements FindQuery<T> {
     constructor(
         protected session: DatabaseSession<SQLDatabaseAdapter>,
         protected connectionPool: SQLConnectionPool,
         protected platform: DefaultPlatform,
         protected sql: SqlQuery,
+        protected type: Type,
     ) {
     }
 
@@ -496,22 +553,43 @@ export class RawQuery {
     }
 
     /**
-     * Returns the raw result of a single row.
+     * Returns the SQL statement with placeholders replaced with the actual values.
      */
-    async findOne(): Promise<any> {
+    getSql(): SqlStatement {
+        return this.sql.convertToSQL(this.platform, new this.platform.placeholderStrategy);
+    }
+
+    /**
+     * Returns the raw result of a single row.
+     *
+     * Note that this does not resolve/map joins. Use the regular database.query() for that.
+     */
+    async findOneOrUndefined(): Promise<T> {
         return (await this.find())[0];
     }
 
     /**
-     * Returns the full result of a raw query.
+     * Note that this does not resolve/map joins. Use the regular database.query() for that.
      */
-    async find(): Promise<any[]> {
+    async findOne(): Promise<T> {
+        const item = await this.findOneOrUndefined();
+        if (!item) throw new ItemNotFound('Item not found');
+        return item;
+    }
+
+    /**
+     * Returns the full result of a raw query.
+     *
+     * Note that this does not resolve/map joins. Use the regular database.query() for that.
+     */
+    async find(): Promise<T[]> {
         const sql = this.sql.convertToSQL(this.platform, new this.platform.placeholderStrategy);
         const connection = await this.connectionPool.getConnection(this.session.logger, this.session.assignedTransaction, this.session.stopwatch);
 
         try {
+            const caster = castFunction(undefined, undefined, this.type);
             const res = await connection.execAndReturnAll(sql.sql, sql.params);
-            return isArray(res) ? [...res] : [];
+            return (isArray(res) ? [...res] : []).map(v => caster(v)) as T[];
         } finally {
             connection.release();
         }
@@ -526,14 +604,17 @@ export class SqlRawFactory implements RawFactory<[SqlQuery]> {
     ) {
     }
 
-    create(sql: SqlQuery): RawQuery {
-        return new RawQuery(this.session, this.connectionPool, this.platform, sql);
+    create<T>(sql: SqlQuery, type?: ReceiveType<T>): RawQuery<T> {
+        type = type ? resolveReceiveType(type) : { kind: ReflectionKind.any };
+        return new RawQuery(this.session, this.connectionPool, this.platform, sql, type);
     }
 }
 
 export abstract class SQLDatabaseAdapter extends DatabaseAdapter {
     public abstract platform: DefaultPlatform;
     public abstract connectionPool: SQLConnectionPool;
+
+    public preparedEntities = new Map<ReflectionClass<any>, PreparedEntity>();
 
     abstract queryFactory(databaseSession: DatabaseSession<this>): SQLDatabaseQueryFactory;
 
@@ -557,6 +638,11 @@ export abstract class SQLDatabaseAdapter extends DatabaseAdapter {
         return true;
     }
 
+    createSelectSql(query: Query<any>): Sql {
+        const sqlBuilder = new SqlBuilder(this);
+        return sqlBuilder.select(query.classSchema, query.model as any);
+    }
+
     /**
      * Creates (and re-creates already existing) tables in the database.
      * This is only for testing purposes useful.
@@ -566,7 +652,7 @@ export abstract class SQLDatabaseAdapter extends DatabaseAdapter {
     public async createTables(entityRegistry: DatabaseEntityRegistry): Promise<void> {
         const connection = await this.connectionPool.getConnection();
         try {
-            const database = new DatabaseModel();
+            const database = new DatabaseModel([], this.getName());
             database.schemaName = this.getSchemaName();
             this.platform.createTables(entityRegistry, database);
             const DDLs = this.platform.getAddTablesDDL(database);
@@ -578,30 +664,31 @@ export abstract class SQLDatabaseAdapter extends DatabaseAdapter {
         }
     }
 
-    public async getMigrations(entityRegistry: DatabaseEntityRegistry): Promise<{ [name: string]: { sql: string[], diff: string } }> {
+    public async getMigrations(options: MigrateOptions, entityRegistry: DatabaseEntityRegistry): Promise<{ [name: string]: { sql: string[], diff: string } }> {
         const migrations: { [name: string]: { sql: string[], diff: string } } = {};
 
         const connection = await this.connectionPool.getConnection();
 
         try {
-            for (const entity of entityRegistry.entities) {
-                const databaseModel = new DatabaseModel();
-                databaseModel.schemaName = this.getSchemaName();
-                this.platform.createTables(entityRegistry, databaseModel);
+            const databaseModel = new DatabaseModel([], this.getName());
+            databaseModel.schemaName = this.getSchemaName();
+            this.platform.createTables(entityRegistry, databaseModel);
+            const schemaParser = new this.platform.schemaParserType(connection, this.platform);
 
-                const schemaParser = new this.platform.schemaParserType(connection, this.platform);
+            const parsedDatabaseModel = new DatabaseModel([], this.getName());
+            parsedDatabaseModel.schemaName = this.getSchemaName();
+            await schemaParser.parse(parsedDatabaseModel);
+            parsedDatabaseModel.removeUnknownTables(databaseModel);
+            parsedDatabaseModel.removeTable(ReflectionClass.from(MigrationStateEntity).getCollectionName());
 
-                const parsedDatabaseModel = new DatabaseModel();
-                parsedDatabaseModel.schemaName = this.getSchemaName();
-                await schemaParser.parse(parsedDatabaseModel);
-
+            for (const entity of entityRegistry.forMigration()) {
                 const databaseDiff = DatabaseComparator.computeDiff(parsedDatabaseModel, databaseModel);
                 if (databaseDiff) {
                     const table = databaseModel.getTableForClass(entity);
                     databaseDiff.forTable(table);
                     const diff = databaseDiff.getDiff(table);
 
-                    const upSql = this.platform.getModifyDatabaseDDL(databaseDiff);
+                    const upSql = this.platform.getModifyDatabaseDDL(databaseDiff, options);
                     if (upSql.length) {
                         migrations[entity.getName()] = { sql: upSql, diff: diff ? diff.toString() : '' };
                     }
@@ -611,38 +698,22 @@ export abstract class SQLDatabaseAdapter extends DatabaseAdapter {
             connection.release();
         }
 
-
         return migrations;
     }
 
-    public async migrate(entityRegistry: DatabaseEntityRegistry): Promise<void> {
+    public async migrate(options: MigrateOptions, entityRegistry: DatabaseEntityRegistry): Promise<void> {
+        const migrations = await this.getMigrations(options, entityRegistry);
         const connection = await this.connectionPool.getConnection();
 
         try {
-            const databaseModel = new DatabaseModel();
-            databaseModel.schemaName = this.getSchemaName();
-            this.platform.createTables(entityRegistry, databaseModel);
-
-            const schemaParser = new this.platform.schemaParserType(connection, this.platform);
-
-            const parsedDatabaseModel = new DatabaseModel();
-            parsedDatabaseModel.schemaName = this.getSchemaName();
-            await schemaParser.parse(parsedDatabaseModel);
-
-            const databaseDiff = DatabaseComparator.computeDiff(parsedDatabaseModel, databaseModel);
-            if (!databaseDiff) {
-                return;
-            }
-
-            const upSql = this.platform.getModifyDatabaseDDL(databaseDiff);
-            if (!upSql.length) return;
-
-            for (const sql of upSql) {
-                try {
-                    await connection.run(sql);
-                } catch (error) {
-                    console.error('Could not execute migration SQL', sql, error);
-                    throw error;
+            for (const [databaseName, migration] of Object.entries(migrations)) {
+                for (const sql of migration.sql) {
+                    try {
+                        await connection.run(sql);
+                    } catch (error) {
+                        console.error('Could not execute migration SQL', sql, error);
+                        throw error;
+                    }
                 }
             }
         } finally {
@@ -662,11 +733,19 @@ export class SQLPersistence extends DatabasePersistence {
         super();
     }
 
+    /**
+     * If possible, this method should handle specific SQL errors and convert
+     * them to more specific error classes with more information, e.g. unique constraint.
+     */
+    handleSpecificError(error: Error): Error {
+        return error;
+    }
+
     async getConnection(): Promise<ReturnType<this['connectionPool']['getConnection']>> {
         if (!this.connection) {
             this.connection = await this.connectionPool.getConnection(this.session.logger, this.session.assignedTransaction, this.session.stopwatch);
         }
-        return this.connection;
+        return this.connection as any;
     }
 
     release() {
@@ -686,12 +765,13 @@ export class SQLPersistence extends DatabasePersistence {
 
     async update<T extends OrmEntity>(classSchema: ReflectionClass<T>, changeSets: DatabasePersistenceChangeSet<T>[]): Promise<void> {
         const batchSize = await this.session.adapter.getUpdateBatchSize(classSchema);
+        const entity = getPreparedEntity(this.session.adapter, classSchema);
 
         if (batchSize > changeSets.length) {
-            await this.batchUpdate(classSchema, changeSets);
+            await this.batchUpdate(entity, changeSets);
         } else {
             for (let i = 0; i < changeSets.length; i += batchSize) {
-                await this.batchUpdate(classSchema, changeSets.slice(i, i + batchSize));
+                await this.batchUpdate(entity, changeSets.slice(i, i + batchSize));
             }
         }
     }
@@ -711,10 +791,9 @@ export class SQLPersistence extends DatabasePersistence {
         }
     }
 
-    async batchUpdate<T extends OrmEntity>(classSchema: ReflectionClass<T>, changeSets: DatabasePersistenceChangeSet<T>[]): Promise<void> {
+    async batchUpdate<T extends OrmEntity>(entity: PreparedEntity, changeSets: DatabasePersistenceChangeSet<T>[]): Promise<void> {
         //simple update implementation that is not particular performant nor does it support atomic updates (like $inc)
-
-        const scopeSerializer = getPartialSerializeFunction(classSchema.type, this.platform.serializer.serializeRegistry);
+        const scopeSerializer = getPartialSerializeFunction(entity.type, this.platform.serializer.serializeRegistry);
         const updates: string[] = [];
 
         for (const changeSet of changeSets) {
@@ -732,39 +811,51 @@ export class SQLPersistence extends DatabasePersistence {
                 set.push(`${this.platform.quoteIdentifier(i)} = ${this.platform.quoteValue(value[i])}`);
             }
 
-            updates.push(`UPDATE ${this.platform.getTableIdentifier(classSchema)} SET ${set.join(', ')} WHERE ${where.join(' AND ')}`);
+            updates.push(`UPDATE ${entity.tableNameEscaped}
+                          SET ${set.join(', ')}
+                          WHERE ${where.join(' AND ')}`);
         }
 
         const sql = updates.join(';\n');
-        await (await this.getConnection()).run(sql);
+
+        try {
+            await (await this.getConnection()).run(sql);
+        } catch (error: any) {
+            const reflection = ReflectionClass.from(entity.type);
+            error = new DatabaseUpdateError(
+                reflection,
+                changeSets,
+                `Could not update ${reflection.getClassName()} in database`,
+                { cause: error },
+            );
+            throw this.handleSpecificError(error);
+        }
     }
 
     protected async batchInsert<T>(classSchema: ReflectionClass<T>, items: T[]) {
         const scopeSerializer = getSerializeFunction(classSchema.type, this.platform.serializer.serializeRegistry);
+        const placeholder = new this.platform.placeholderStrategy;
+
         const insert: string[] = [];
         const params: any[] = [];
-        this.resetPlaceholderSymbol();
         const names: string[] = [];
+        const prepared = getPreparedEntity(this.session.adapter, classSchema);
 
-        for (const property of classSchema.getProperties()) {
-            // if (property.isParentReference) continue;
-            if (property.isBackReference()) continue;
-            if (property.isAutoIncrement()) continue;
-            names.push(this.platform.quoteIdentifier(property.name));
+        for (const property of prepared.fields) {
+            if (property.autoIncrement) continue;
+            names.push(property.columnNameEscaped);
         }
 
         for (const item of items) {
             const converted = scopeSerializer(item);
-
             const row: string[] = [];
-            for (const property of classSchema.getProperties()) {
-                // if (property.isParentReference) continue;
-                if (property.isBackReference()) continue;
-                if (property.isAutoIncrement()) continue;
+
+            for (const property of prepared.fields) {
+                if (property.autoIncrement) continue;
 
                 const v = converted[property.name];
                 params.push(v === undefined ? null : v);
-                row.push(this.getPlaceholderSymbol());
+                row.push(property.sqlTypeCast(placeholder.getPlaceholder()));
             }
 
             insert.push(row.join(', '));
@@ -773,31 +864,148 @@ export class SQLPersistence extends DatabasePersistence {
         const sql = this.getInsertSQL(classSchema, names, insert);
         try {
             await (await this.getConnection()).run(sql, params);
-        } catch (error) {
-            throw error;
+        } catch (error: any) {
+            error = new DatabaseInsertError(
+                classSchema,
+                items as OrmEntity[],
+                `Could not insert ${classSchema.getClassName()} into database`,
+                { cause: error },
+            );
+            throw this.handleSpecificError(error);
         }
-    }
-
-    protected resetPlaceholderSymbol() {
-    }
-
-    protected getPlaceholderSymbol() {
-        return '?';
     }
 
     protected getInsertSQL(classSchema: ReflectionClass<any>, fields: string[], values: string[]): string {
-        return `INSERT INTO ${this.platform.getTableIdentifier(classSchema)} (${fields.join(', ')}) VALUES (${values.join('), (')})`;
+        return `INSERT INTO ${this.platform.getTableIdentifier(classSchema)} (${fields.join(', ')})
+                VALUES (${values.join('), (')})`;
     }
 
     async remove<T extends OrmEntity>(classSchema: ReflectionClass<T>, items: T[]): Promise<void> {
+        const scopeSerializer = getSerializeFunction(classSchema.type, this.platform.serializer.serializeRegistry);
         const pks: any[] = [];
-        const pk = classSchema.getPrimary();
+        const primary = classSchema.getPrimary();
+        const pkName = primary.name;
+        const params: any[] = [];
+        const placeholder = new this.platform.placeholderStrategy;
+
         for (const item of items) {
-            pks.push(item[pk.name as keyof T]);
+            const converted = scopeSerializer(item);
+            pks.push(placeholder.getPlaceholder());
+            params.push(converted[pkName]);
         }
 
-        const inValues = pks.map(v => this.platform.quoteValue(v)).join(', ');
-        const sql = `DELETE FROM ${this.platform.getTableIdentifier(classSchema)} WHERE ${this.platform.quoteIdentifier(pk.name)} IN (${inValues})`;
-        await (await this.getConnection()).run(sql);
+        const sql = `DELETE
+                     FROM ${this.platform.getTableIdentifier(classSchema)}
+                     WHERE ${this.platform.quoteIdentifier(pkName)} IN (${pks})`;
+        try {
+            await (await this.getConnection()).run(sql, params);
+        } catch (error: any) {
+            error = new DatabaseDeleteError(
+                classSchema,
+                `Could not delete ${classSchema.getClassName()} from database`,
+                { cause: error },
+            );
+            error.items = items;
+            throw this.handleSpecificError(error);
+        }
     }
+}
+
+export function prepareBatchUpdate(
+    platform: DefaultPlatform,
+    entity: PreparedEntity,
+    changeSets: DatabasePersistenceChangeSet<any>[],
+    options: { setNamesWithTableName?: true } = {},
+) {
+    const partialSerialize = getPartialSerializeFunction(entity.type, platform.serializer.serializeRegistry);
+    const tableName = entity.tableNameEscaped;
+    const pkName = entity.primaryKey.name;
+    const pkField = entity.primaryKey.columnNameEscaped;
+    const originPkName = '_origin_' + pkName;
+    const originPkField = platform.quoteIdentifier(originPkName);
+
+    const primaryKeys: any[] = [];
+    const values: { [name: string]: any[] } = {};
+    const valuesSet: { [name: string]: any[] } = {};
+    const setNames: string[] = [];
+    const aggregateSelects: { [name: string]: { id: any, sql: string }[] } = {};
+
+    const assignReturning: { [name: string]: { item: any, names: string[] } } = {};
+    const setReturning: { [name: string]: 1 } = {};
+    const changedFields: string[] = [];
+    const changedProperties: PreparedField[] = [];
+
+    for (const changeSet of changeSets) {
+        for (const fieldName of changeSet.changes.fieldNames) {
+            if (!changedFields.includes(fieldName)) {
+                changedProperties.push(entity.fieldMap[fieldName]);
+                changedFields.push(fieldName);
+                if (!values[fieldName]) {
+                    values[fieldName] = [];
+                    valuesSet[fieldName] = [];
+
+                    setNames.push((options.setNamesWithTableName ? tableName + '.' : '') + `${entity.fieldMap[fieldName].columnNameEscaped} = _b.${entity.fieldMap[fieldName].columnNameEscaped}`);
+                }
+            }
+        }
+    }
+
+    if (!changedFields) {
+        return;
+    }
+
+    for (const changeSet of changeSets) {
+        const pk = partialSerialize(changeSet.primaryKey);
+        primaryKeys.push(pk[pkName]);
+
+        const id = changeSet.primaryKey[pkName];
+
+        if (changeSet.changes.$set) {
+            const value = partialSerialize(changeSet.changes.$set);
+            for (const fieldName of changedFields) {
+                values[fieldName].push(value[fieldName] ?? null);
+                valuesSet[fieldName].push(fieldName in value ? 1 : 0);
+            }
+        }
+
+        if (changeSet.changes.$inc) {
+            for (const fieldName in changeSet.changes.$inc) {
+                if (!changeSet.changes.$inc.hasOwnProperty(fieldName)) continue;
+                const value = changeSet.changes.$inc[fieldName];
+                if (!aggregateSelects[fieldName]) aggregateSelects[fieldName] = [];
+
+                if (!assignReturning[id]) {
+                    assignReturning[id] = { item: changeSet.item, names: [] };
+                }
+
+                assignReturning[id].names.push(fieldName);
+                setReturning[fieldName] = 1;
+                values[fieldName].push(value[fieldName] ?? null);
+                valuesSet[fieldName].push(1);
+
+                aggregateSelects[fieldName].push({
+                    id: changeSet.primaryKey[pkName],
+                    sql: `_origin.${platform.quoteIdentifier(fieldName)} + ${platform.quoteValue(value)}`,
+                });
+            }
+        }
+    }
+
+    return {
+        changedFields,
+        changedProperties,
+        primaryKeys,
+        values,
+        valuesSet,
+        pkField,
+        pkName,
+        aggregateSelects,
+        originPkField,
+        originPkName,
+        setReturning,
+        assignReturning,
+        setNames,
+        tableName,
+    };
+
 }

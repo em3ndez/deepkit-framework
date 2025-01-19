@@ -26,9 +26,10 @@ import { eachPair } from './iterators.js';
 export class CustomError extends Error {
     public name: string;
     public stack?: string;
+    public cause?: Error | any;
 
-    constructor(public message: string = '') {
-        super(message);
+    constructor(...args: any[]) {
+        super(...args);
         this.name = this.constructor.name;
     }
 }
@@ -134,17 +135,17 @@ export function isClassInstance(target: any): boolean {
 }
 
 /**
- * Returns a human readable string representation from the given value.
+ * Returns a human-readable string representation from the given value.
  */
-export function stringifyValueWithType(value: any): string {
+export function stringifyValueWithType(value: any, depth: number = 0): string {
     if ('string' === typeof value) return `string(${value})`;
     if ('number' === typeof value) return `number(${value})`;
     if ('boolean' === typeof value) return `boolean(${value})`;
     if ('bigint' === typeof value) return `bigint(${value})`;
-    if (isPlainObject(value)) return `object ${prettyPrintObject(value)}`;
+    if (isPlainObject(value)) return `object ${depth < 2 ? prettyPrintObject(value, depth) : ''}`;
     if (isArray(value)) return `Array`;
     if (isClass(value)) return `${getClassName(value)}`;
-    if (isObject(value)) return `${getClassName(getClassTypeFromInstance(value))} ${prettyPrintObject(value)}`;
+    if (isObject(value)) return `${getClassName(getClassTypeFromInstance(value))} ${depth < 2 ? prettyPrintObject(value, depth) : ''}`;
     if ('function' === typeof value) return `function ${value.name}`;
     if (null === value) return `null`;
     return 'undefined';
@@ -173,10 +174,10 @@ export function changeClass<T>(value: object, newClass: ClassType<T>): T {
     return Object.assign(Object.create(newClass.prototype), value);
 }
 
-export function prettyPrintObject(object: object): string {
-    let res: string[] = [];
+export function prettyPrintObject(object: object, depth: number = 0): string {
+    const res: string[] = [];
     for (const i in object) {
-        res.push(i + ': ' + stringifyValueWithType((object as any)[i]));
+        res.push(i + ': ' + stringifyValueWithType((object as any)[i], depth + 1));
     }
     return '{' + res.join(',') + '}';
 }
@@ -188,7 +189,7 @@ export function prettyPrintObject(object: object): string {
  */
 export function isFunction(obj: any): obj is Function {
     if ('function' === typeof obj) {
-        return !obj.toString().startsWith('class ');
+        return !obj.toString().startsWith('class ') && !obj.toString().startsWith('class{');
     }
 
     return false;
@@ -232,6 +233,21 @@ export function isClass(obj: any): obj is AbstractClassType {
     return false;
 }
 
+declare var global: any;
+declare var window: any;
+
+export function isGlobalClass(obj: any): obj is AbstractClassType {
+    if ('function' !== typeof obj) return false;
+
+    if ('undefined' !== typeof window) {
+        return (window as any)[getClassName(obj)] === obj;
+    }
+    if ('undefined' !== typeof global) {
+        return (global as any)[getClassName(obj)] === obj;
+    }
+    return false;
+}
+
 /**
  * Returns true for real objects: object literals ({}) or class instances (new MyClass).
  *
@@ -245,11 +261,21 @@ export function isObject(obj: any): obj is { [key: string]: any } {
 }
 
 /**
+ * Returns true if given obj is a plain object, and no Date, Array, Map, Set, etc.
+ *
+ * This is different to isObject and used in the type system to differentiate
+ * between JS objects in general and what we define as ReflectionKind.objectLiteral.
+ * Since we have Date, Set, Map, etc. in the type system, we need to differentiate
+ * between them and all other object literals.
+ */
+export function isObjectLiteral(obj: any): obj is { [key: string]: any } {
+    return isObject(obj) && !(obj instanceof Date) && !(obj instanceof Map) && !(obj instanceof Set);
+}
+
+/**
  * @public
  */
-export function isArray(obj: any): obj is any[] {
-    return Array.isArray(obj);
-}
+export const isArray: (obj: any) => obj is any[] = Array.isArray;
 
 /**
  * @public
@@ -308,7 +334,7 @@ export function isNumeric(s: string | number): boolean {
     return true;
 }
 
-export const isInteger: (obj: any) => obj is number = Number.isInteger as any || function (obj: any) {
+export const isInteger: (obj: any) => obj is number = Number.isInteger as any || function(obj: any) {
     return (obj % 1) === 0;
 };
 
@@ -515,6 +541,20 @@ export async function asyncOperation<T>(executor: (resolve: (value: T) => void, 
 }
 
 /**
+ * When an API is called that returns a promise that loses the stack trace on error, you can use fixAsyncOperation().
+ *
+ * ```typescript
+ * cons storage = new BrokenPromiseStorage();
+ * const files = await fixAsyncOperation(storage.files('/'));
+ * ```
+ */
+export function fixAsyncOperation<T>(promise: Promise<T>): Promise<T> {
+    return asyncOperation(async (resolve, reject) => {
+        resolve(await promise);
+    });
+}
+
+/**
  * @public
  */
 export function mergePromiseStack<T>(promise: Promise<T>, stack?: string): Promise<T> {
@@ -592,6 +632,7 @@ export function time(): number {
  * @public
  */
 export function getPathValue(bag: { [field: string]: any }, parameterPath: string, defaultValue?: any): any {
+    if (parameterPath === '' || parameterPath === undefined) return bag;
     if (isSet(bag[parameterPath])) {
         return bag[parameterPath];
     }
@@ -672,6 +713,15 @@ export function getParentClass(classType: ClassType): ClassType | undefined {
     return parent;
 }
 
+export function getInheritanceChain(classType: ClassType): ClassType[] {
+    const chain: ClassType[] = [classType];
+    let current = classType;
+    while (current = getParentClass(current) as ClassType) {
+        chain.push(current);
+    }
+    return chain;
+}
+
 declare var v8debug: any;
 
 export function inDebugMode() {
@@ -695,6 +745,10 @@ export function isIterable(value: any): boolean {
     return isArray(value) || value instanceof Set || value instanceof Map;
 }
 
+export function iterableSize(value: Array<unknown> | Set<unknown> | Map<unknown, unknown>): number {
+    return isArray(value) ? value.length : value.size || 0;
+}
+
 /**
  * Returns __filename, works in both cjs and esm.
  */
@@ -709,4 +763,129 @@ export function getCurrentFileName(): string {
         path = path.slice(1);
     }
     return path;
+}
+
+/**
+ * Escape special characters in a regex string, so it can be used as a literal string.
+ */
+export function escapeRegExp(string: string): string {
+    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& means the whole matched string
+}
+
+export function hasProperty(object: any, property: any): boolean {
+    return Object.prototype.hasOwnProperty.call(object, property);
+}
+
+/**
+ * Returns an iterator of numbers from start (inclusive) to stop (exclusive) by step.
+ */
+export function* range(startOrLength: number, stop: number = 0, step: number = 1): IterableIterator<number> {
+    let i = startOrLength;
+    let end = stop;
+    if (stop === 0) {
+        i = 0;
+        end = startOrLength;
+    }
+
+    for (; i < end; i += step) {
+        yield i;
+    }
+}
+
+/**
+ * Returns an array of numbers from start (inclusive) to stop (exclusive) by step.
+ *
+ * Works the same as python's range function.
+ */
+export function rangeArray(startOrLength: number, stop: number = 0, step: number = 1): number[] {
+    return [...range(startOrLength, stop, step)];
+}
+
+/**
+ * Returns a combined array of the given arrays.
+ *
+ * Works the same as python's zip function.
+ */
+export function zip<T extends (readonly unknown[])[]>(
+    ...args: T
+): { [K in keyof T]: T[K] extends (infer V)[] ? V : never }[] {
+    const minLength = Math.min(...args.map((arr) => arr.length));
+    //@ts-ignore
+    return Array.from({ length: minLength }).map((_, i) => args.map((arr) => arr[i]));
+}
+
+/**
+ * Forwards the runtime type arguments from function x to function y.
+ * This is necessary when a generic function is overridden and forwarded to something else.
+ *
+ * ```typescript
+ * let generic = <T>(type?: ReceiveType<T>) => undefined;
+ *
+ * let forwarded<T> = () => {
+ *     forwardTypeArguments(forwarded, generic); //all type arguments are forwarded to generic()
+ *     generic(); //call as usual
+ * }
+ *
+ * forwarded<any>(); //generic receives any in runtime.
+ * ```
+ *
+ * Note that generic.bind(this) will not work, as bind() creates a new function and forwarded type arguments can not
+ * reach the original function anymore.
+ *
+ * ```typescript
+ * let forwarded<T> = () => {
+ *     const bound = generic.bind(this);
+ *     forwardTypeArguments(forwarded, bound); //can not be forwarded anymore
+ *     bound(); //fails
+ * }
+ * ```
+ *
+ *  This is a limitation of JavaScript. In this case you have to manually forward type arguments.
+ *
+ *  ```typescript
+ *  let forwarded<T> = (type?: ReceiveType<T>) => {
+ *     const bound = generic.bind(this);
+ *     bound(type);
+ *  }
+ *  ```
+ */
+export function forwardTypeArguments(x: any, y: any): void {
+    y.Ω = x.Ω;
+}
+
+export function formatError(error: any, withStack: boolean = false): string {
+    if (error && error.name === 'AggregateError' && 'errors' in error) {
+        return `${(withStack && error.stack) || `AggregateError: ${error.message}`}\nErrors:\n${error.errors.map((v: any) => formatError(v)).join('\n')}`;
+    }
+
+    if (error instanceof Error) {
+        let current: any = error.cause;
+        let errors: string[] = [(withStack && error.stack) || error.message || 'Error'];
+        while (current) {
+            errors.push(`cause by ${formatError(current)}`);
+            current = current.cause;
+        }
+        return errors.join('\n');
+    }
+
+    if (withStack && error.stack) return error.stack;
+    return String(error);
+}
+
+/**
+ * Asserts that the given object is an instance of the given class.
+ */
+export function assertInstanceOf<T>(object: any, constructor: { new(...args: any[]): T }): asserts object is T {
+    if (!(object instanceof constructor)) {
+        throw new Error(`Object ${getClassName(object)} is not an instance of the expected class ${getClassName(constructor)}`);
+    }
+}
+
+/**
+ * Asserts that the given value is defined (not null and not undefined).
+ */
+export function assertDefined<T>(value: T): asserts value is NonNullable<T> {
+    if (value === null || value === undefined) {
+        throw new Error(`Value is not defined`);
+    }
 }

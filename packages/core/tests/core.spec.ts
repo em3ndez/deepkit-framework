@@ -4,6 +4,7 @@ import {
     changeClass,
     collectForMicrotask,
     createDynamicClass,
+    escapeRegExp,
     getClassName,
     getClassTypeFromInstance,
     getObjectKeysSize,
@@ -15,16 +16,21 @@ import {
     isClassInstance,
     isConstructable,
     isFunction,
+    isGlobalClass,
+    isIterable,
     isNumeric,
     isObject,
     isPlainObject,
     isPromise,
     isPrototypeOfBase,
     isUndefined,
+    iterableSize,
+    rangeArray,
     setPathValue,
     sleep,
-    stringifyValueWithType
-} from '../src/core';
+    stringifyValueWithType,
+    zip,
+} from '../src/core.js';
 
 class SimpleClass {
     constructor(public name: string) {
@@ -123,6 +129,17 @@ test('helper isFunction', () => {
     })).toBe(true);
     expect(isFunction(async function () {
     })).toBe(true);
+    expect(isFunction(class Peter {
+    })).toBe(false);
+    expect(isFunction(class {
+    })).toBe(false);
+    expect(isFunction(class {
+    })).toBe(false);
+
+    const fn = function () {
+    };
+    fn.toString = () => 'class{}';
+    expect(isFunction(fn)).toBe(false);
 });
 
 test('helper isAsyncFunction', () => {
@@ -523,15 +540,83 @@ test('isNumeric', () => {
 });
 
 test('getParentClass', () => {
-    class User {}
+    class User {
+    }
 
-    class Admin extends User {}
+    class Admin extends User {
+    }
 
-    class SuperAdmin extends Admin {}
+    class SuperAdmin extends Admin {
+    }
 
     expect(getParentClass({} as any)).toBe(undefined);
     expect(getParentClass(Object)).toBe(undefined);
     expect(getParentClass(User)).toBe(undefined);
     expect(getParentClass(Admin)).toBe(User);
     expect(getParentClass(SuperAdmin)).toBe(Admin);
+});
+
+test('escapeRegExp', () => {
+    expect(escapeRegExp('a')).toBe('a');
+    expect(escapeRegExp('a.')).toBe('a\\.');
+    expect(escapeRegExp('a.\\')).toBe('a\\.\\\\');
+    expect(escapeRegExp('a.\\b')).toBe('a\\.\\\\b');
+    expect(escapeRegExp('a.\\b\\')).toBe('a\\.\\\\b\\\\');
+    expect(escapeRegExp('a.\\b\\c')).toBe('a\\.\\\\b\\\\c');
+
+    expect(new RegExp('^' + escapeRegExp('a[.](c')).exec('a[.](c')![0]).toEqual('a[.](c');
+    expect(new RegExp('^' + escapeRegExp('a[.](c')).exec('da[.](c')).toEqual(null);
+});
+
+test('range', () => {
+    expect(rangeArray(2)).toEqual([0, 1]);
+    expect(rangeArray(0, 1)).toEqual([0]);
+    expect(rangeArray(0, 2)).toEqual([0, 1]);
+    expect(rangeArray(1, 2)).toEqual([1]);
+    expect(rangeArray(1, 2, 2)).toEqual([1]);
+    expect(rangeArray(1, 4, 2)).toEqual([1, 3]);
+    expect(rangeArray(2, 4)).toEqual([2, 3]);
+});
+
+test('zip', () => {
+    expect(zip([1, 2, 3], ['a', 'b', 'c'])).toEqual([[1, 'a'], [2, 'b'], [3, 'c']]);
+    expect(zip([1, 2, 3], ['a', 'b'])).toEqual([[1, 'a'], [2, 'b']]);
+    expect(zip([1, 2], ['a', 'b', 'c'])).toEqual([[1, 'a'], [2, 'b']]);
+    expect(zip([1, 2, 3], ['a', 'b', 'c'], [true, false, true])).toEqual([[1, 'a', true], [2, 'b', false], [3, 'c', true]]);
+});
+
+test('isIterable', () => {
+    expect(isIterable([])).toBe(true);
+    expect(isIterable({})).toBe(false);
+    expect(isIterable(new Map())).toBe(true);
+    expect(isIterable(new Set())).toBe(true);
+    expect(isIterable(new WeakMap())).toBe(false);
+    expect(isIterable(new WeakSet())).toBe(false);
+    expect(isIterable(new Uint8Array())).toBe(false);
+    expect(isIterable(new Error())).toBe(false);
+});
+
+test('iterableSize', () => {
+    expect(iterableSize([])).toBe(0);
+    expect(iterableSize([1, 2, 3])).toBe(3);
+    expect(iterableSize(new Map())).toBe(0);
+    expect(iterableSize(new Map([[1, 2], [3, 4]]) as any)).toBe(2);
+    expect(iterableSize(new Set())).toBe(0);
+    expect(iterableSize(new Set([1, 2, 3]) as any)).toBe(3);
+});
+
+test('isGlobalClass', () => {
+    expect(isGlobalClass(undefined)).toBe(false);
+    expect(isGlobalClass({})).toBe(false);
+
+    expect(isGlobalClass(Date)).toBe(true);
+    expect(isGlobalClass(Array)).toBe(true);
+    expect(isGlobalClass(TextDecoder)).toBe(true);
+
+    class MyError extends Error {
+    }
+    expect(isGlobalClass(Error)).toBe(true);
+    expect(isGlobalClass(MyError)).toBe(false);
+
+    expect(isGlobalClass(Uint8Array)).toBe(true);
 });

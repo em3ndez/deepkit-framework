@@ -1,22 +1,11 @@
 import { expect, test } from '@jest/globals';
 import bson, { Binary } from 'bson';
-import { deserializeBSON, getBSONDeserializer } from '../src/bson-deserializer';
-import {
-    BinaryBigInt,
-    copyAndSetParent,
-    MongoId,
-    nodeBufferToArrayBuffer,
-    PrimaryKey,
-    Reference,
-    ReflectionKind,
-    SignedBinaryBigInt,
-    TypeObjectLiteral,
-    typeOf,
-    uuid,
-    UUID
-} from '@deepkit/type';
+import { deserializeBSON, getBSONDeserializer } from '../src/bson-deserializer.js';
+import { BinaryBigInt, copyAndSetParent, MongoId, nodeBufferToArrayBuffer, PrimaryKey, Reference, ReflectionKind, SignedBinaryBigInt, TypeObjectLiteral, typeOf, uuid, UUID } from '@deepkit/type';
 import { getClassName } from '@deepkit/core';
-import { serializeWithoutOptimiser } from '../src/bson-serializer';
+import { serializeBSONWithoutOptimiser } from '../src/bson-serializer.js';
+import { BSONType } from '../src/utils';
+import { deserializeBSONWithoutOptimiser } from '../src/bson-parser';
 
 const { deserialize, serialize } = bson;
 
@@ -728,10 +717,10 @@ test('any', () => {
         ]
     });
 
-    const bson = serializeWithoutOptimiser(data);
+    const bson = serializeBSONWithoutOptimiser(data);
     const deserializer = getBSONDeserializer(undefined, type);
-    const back = deserializer(bson);
-    console.log('back', back);
+    const back: any = deserializer(bson);
+    expect(back.value).toEqual(data.value);
 });
 
 test('circular', () => {
@@ -740,7 +729,7 @@ test('circular', () => {
         child?: Model;
     }
 
-    const bson = serializeWithoutOptimiser({ items: [{ id: 0, child: { id: 2 } }] } as Response);
+    const bson = serializeBSONWithoutOptimiser({ items: [{ id: 0, child: { id: 2 } }] } as Response);
 
     interface Response {
         items: Model[];
@@ -757,7 +746,7 @@ test('additional are ignored', () => {
         setVersion: 1,
         ismaster: true,
     };
-    const bson = serializeWithoutOptimiser(data);
+    const bson = serializeBSONWithoutOptimiser(data);
 
     interface IsMasterResponse  {
         ismaster: boolean;
@@ -766,4 +755,21 @@ test('additional are ignored', () => {
     const fn = getBSONDeserializer<IsMasterResponse>();
     const back = fn(bson);
     expect(back).toEqual({ismaster: true});
+});
+
+test('invalid buffer, string parse', () => {
+    const buffer = Buffer.from([
+        28, 0, 0, 0, //size
+        BSONType.BINARY, //just some type
+        112, 111, 115, 105, 116, 105, 111, 110, // 0, /'/position\n' without ending
+        // to simulate a buffer that is not correctly serialized
+    ]);
+
+    expect(() => deserializeBSONWithoutOptimiser(buffer)).toThrow('Unexpected end of buffer');
+
+    const deserialize = getBSONDeserializer<{ position: Uint8Array }>();
+    expect(() => deserialize(buffer)).toThrow('Cannot convert undefined value to Uint8Array');
+
+    const deserialize2 = getBSONDeserializer<{ [name: string]: Uint8Array }>();
+    expect(() => deserialize2(buffer)).toThrow('Serialization failed. Unexpected end of buffer');
 });

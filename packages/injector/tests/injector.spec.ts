@@ -1,9 +1,17 @@
 import { expect, test } from '@jest/globals';
-import { CircularDependencyError, injectedFunction, Injector, InjectorContext } from '../src/injector';
-import { InjectorModule } from '../src/module';
+import {
+    CircularDependencyError,
+    DependenciesUnmetError,
+    injectedFunction,
+    Injector,
+    InjectorContext,
+    TransientInjectionTarget,
+    PartialFactory,
+} from '../src/injector.js';
+import { InjectorModule } from '../src/module.js';
 import { ReflectionClass, ReflectionKind } from '@deepkit/type';
-import { Inject } from '../src/types';
-import { provide } from '../src/provider';
+import { Inject } from '../src/types.js';
+import { provide } from '../src/provider.js';
 
 export const a = 'asd';
 
@@ -20,6 +28,13 @@ test('injector basics', () => {
     const injector = Injector.from([MyServer, Connection]);
     expect(injector.get(Connection)).toBeInstanceOf(Connection);
     expect(injector.get(MyServer)).toBeInstanceOf(MyServer);
+});
+
+test('type injection', () => {
+    class Service {}
+    const injector = Injector.from([Service, { provide: 'token', useExisting: Service }]);
+    expect(injector.get<Service>()).toBeInstanceOf(Service);
+    expect(injector.get<Service>('token')).toBeInstanceOf(Service);
 });
 
 test('missing dep', () => {
@@ -99,7 +114,7 @@ test('injector key', () => {
     expect(injector.get(MyServer)).toBeInstanceOf(MyServer);
 });
 
-test('interface dependency direct match', () => {
+test('interface dependency provide implementation implementing interface shallow', () => {
     interface Connection {
         id: number;
 
@@ -110,6 +125,71 @@ test('interface dependency direct match', () => {
         id: number = 0;
 
         write(data: Uint16Array): void {
+        }
+
+        additional(): void {
+        }
+    }
+
+    class MyServer {
+        constructor(public connection: Connection) {
+        }
+    }
+
+    const injector = Injector.from([MyServer, MyConnection]);
+    const server = injector.get(MyServer);
+    expect(server).toBeInstanceOf(MyServer);
+    expect(server.connection).toBeInstanceOf(MyConnection);
+    expect(server.connection.id).toBe(0);
+});
+
+test('interface dependency provide implementation implementing interface deep 1', () => {
+    interface Connection {
+        id: number;
+
+        write(data: Uint16Array): void;
+    }
+
+    class MyConnection implements Connection {
+        id: number = 0;
+
+        write(data: Uint16Array): void {
+        }
+
+        additional(): void {
+        }
+    }
+
+    class SecondConnection extends MyConnection {
+
+    }
+
+    class MyServer {
+        constructor(public connection: Connection) {
+        }
+    }
+
+    const injector = Injector.from([MyServer, SecondConnection]);
+    const server = injector.get(MyServer);
+    expect(server).toBeInstanceOf(MyServer);
+    expect(server.connection).toBeInstanceOf(SecondConnection);
+    expect(server.connection.id).toBe(0);
+});
+
+test('interface dependency provide interface', () => {
+    interface Connection {
+        id: number;
+
+        write(data: Uint16Array): void;
+    }
+
+    class MyConnection implements Connection {
+        id: number = 0;
+
+        write(data: Uint16Array): void {
+        }
+
+        additional(): void {
         }
     }
 
@@ -180,14 +260,14 @@ test('interface dependency multiple matches', () => {
     }
 
     {
-        const injector = Injector.from([MyServer, provide<{ write(): void }>(MyConnection1)]);
+        const injector = Injector.from([MyServer, provide<Connection>(MyConnection1)]);
         const server = injector.get(MyServer);
         expect(server.connection).toBeInstanceOf(MyConnection1);
     }
 
     {
         //last match wins
-        const injector = Injector.from([MyServer, provide<{ write(): void }>(MyConnection1), provide<{ write(): void }>(MyConnection2)]);
+        const injector = Injector.from([MyServer, provide<Connection>(MyConnection1), provide<Connection>(MyConnection2)]);
         const server = injector.get(MyServer);
         expect(server.connection).toBeInstanceOf(MyConnection2);
     }
@@ -543,18 +623,18 @@ test('setup provider', () => {
 
     {
         const module = new InjectorModule([MyService]);
-        module.setupProvider<MyService>().addTransporter('a');
-        module.setupProvider<MyService>().addTransporter('b');
-        expect(module.setupProviderRegistry.get(MyService).length).toBe(2);
+        module.configureProvider<MyService>(v => v.addTransporter('a'));
+        module.configureProvider<MyService>(v => v.addTransporter('b'));
+        expect(module.configurationProviderRegistry.get(MyService).length).toBe(2);
         const i1 = Injector.fromModule(module);
         expect(i1.get(MyService).transporter).toEqual(['a', 'b']);
     }
 
     {
         const module = new InjectorModule([MyService]);
-        module.setupProvider<MyService>().transporter = ['a'];
-        module.setupProvider<MyService>().transporter = ['a', 'b', 'c'];
-        expect(module.setupProviderRegistry.get(MyService).length).toBe(2);
+        module.configureProvider<MyService>(v => v.transporter = ['a']);
+        module.configureProvider<MyService>(v => v.transporter = ['a', 'b', 'c']);
+        expect(module.configurationProviderRegistry.get(MyService).length).toBe(2);
         const i1 = Injector.fromModule(module);
         expect(i1.get(MyService).transporter).toEqual(['a', 'b', 'c']);
     }
@@ -705,3 +785,276 @@ test('injectedFunction skip 2', () => {
 
     expect(wrapped(undefined, 'abc', new A)).toBe('abc');
 });
+
+test('TransientInjectionTarget', () => {
+    {
+        class A {
+            constructor (public readonly b: B) {
+            }
+        }
+
+        class B {
+            constructor (
+                public readonly target: TransientInjectionTarget
+            ) {
+            }
+        }
+
+        const injector = Injector.from([A, { provide: B, transient: true }]);
+        const a = injector.get(A);
+        expect(a.b.target).toBeInstanceOf(TransientInjectionTarget);
+        expect(a.b.target.token).toBe(A);
+    }
+
+    {
+        class A {
+            constructor (public readonly b: B) {
+            }
+        }
+
+        class B {
+            constructor (
+                public readonly target: TransientInjectionTarget
+            ) {
+            }
+        }
+
+        const injector = Injector.from([
+            A,
+            { provide: B, useFactory: (target: TransientInjectionTarget) => new B(target), transient: true }
+        ]);
+        const a = injector.get(A);
+        expect(a.b.target).toBeInstanceOf(TransientInjectionTarget);
+        expect(a.b.target.token).toBe(A);
+    }
+
+    {
+        class A {
+            constructor (public readonly b: B) {
+            }
+        }
+
+        class B {
+            constructor (
+                public readonly target: TransientInjectionTarget
+            ) {
+            }
+        }
+
+        expect(() =>  Injector.from([A, B])).toThrow();
+    }
+
+    {
+        class A {
+            constructor (
+                public readonly target: TransientInjectionTarget
+            ) {
+            }
+        }
+
+        const injector = Injector.from([{ provide: A, transient: true }]);
+        expect(() => injector.get(A)).toThrow(DependenciesUnmetError);
+    }
+
+    {
+        class A {
+            constructor (
+                public readonly target: TransientInjectionTarget
+            ) {
+            }
+        }
+
+        const injector = Injector.from([
+            { provide: A, transient: true, useFactory: (target: TransientInjectionTarget) => new A(target) }
+        ]);
+        expect(() => injector.get(A)).toThrow(DependenciesUnmetError);
+    }
+
+    {
+        class A {
+            constructor (
+                public readonly target?: TransientInjectionTarget
+            ) {
+            }
+        }
+
+        const injector = Injector.from([{ provide: A, transient: true }]);
+        expect(() => injector.get(A)).not.toThrow();
+    }
+
+    {
+        class A {
+            constructor (public b: C) {
+            }
+        }
+
+        class B {
+            constructor (public target: TransientInjectionTarget) {
+            }
+        }
+
+        class C {
+            constructor (public target: TransientInjectionTarget) {
+            }
+        }
+
+        const injector = Injector.from([
+            A,
+            { provide: B, transient: true },
+            { provide: C, transient: true, useExisting: B },
+        ]);
+        const a = injector.get(A);
+        expect(a.b).toBeInstanceOf(B);
+        expect(a.b.target.token).toBe(A);
+    }
+
+    {
+        class A {
+            constructor (public b: B) {
+            }
+        }
+
+        interface B {
+            target: TransientInjectionTarget;
+        }
+
+        const injector = Injector.from([
+            A,
+            provide<B>({ transient: true, useFactory: (target: TransientInjectionTarget): B => ({ target }) }),
+        ]);
+
+        const a = injector.get(A);
+        expect(a.b).toBeDefined();
+        expect(a.b.target.token).toBe(A);
+    }
+});
+
+test('PartialFactory', () => {
+    {
+        class A {
+            constructor (public b: B, public num: number) {
+            }
+        }
+
+        class B {
+            public b = 'b';
+
+            constructor() {
+            }
+        }
+
+        const injector = Injector.from([B]);
+        const factory = injector.get<PartialFactory<A>>();
+
+        const a = factory({
+            num: 5,
+        });
+
+        expect(a.b).toBeInstanceOf(B);
+        expect(a.num).toBe(5);
+    }
+
+    {
+        class A {
+            public num!: Inject<number>;
+            public b!: Inject<B>;
+        }
+
+        class B {
+            public b = 'b';
+        }
+
+        const injector = Injector.from([B]);
+        const factory = injector.get<PartialFactory<A>>();
+
+        const a = factory({
+            num: 6,
+        });
+
+        expect(a.b).toBeInstanceOf(B);
+        expect(a.num).toBe(6);
+    }
+
+    {
+        class A {
+            constructor(public factory: PartialFactory<B>) {
+            }
+        }
+
+        class B {
+            constructor(public num: number, public c: C) {
+            }
+        }
+
+        class C {
+            public c = 'c';
+        }
+
+        const injector = Injector.from([A, C]);
+
+        const a = injector.get(A);
+        const b = a.factory({ num: 5 });
+
+        expect(a.factory).toBeInstanceOf(Function);
+        expect(b).toBeInstanceOf(B);
+        expect(b.num).toBe(5);
+        expect(b.c).toBeInstanceOf(C);
+    }
+
+    {
+        class A {
+            public b: B;
+            public num: number;
+
+            constructor(public factory: PartialFactory<{ b: B; num: number }>) {
+                const { b, num } = factory({ num: 5 });
+                this.b = b;
+                this.num = num;
+            }
+        }
+
+        class B {
+            public b = 'b';
+        }
+
+        const injector = Injector.from([A, B]);
+        const a = injector.get(A);
+
+        expect(injector.get(B)).toBeInstanceOf(B);
+        expect(a.b).toBeInstanceOf(B);
+        expect(a.num).toBe(5);
+    }
+});
+
+test('isProvided supports receive type', () => {
+    interface A {
+        b: string;
+    }
+    const providers = [provide<A>({ useValue: { b: 'a' } })];
+    const module = new InjectorModule(providers)
+    expect(module.isProvided<A>()).toBe(true);
+});
+
+test('isProvided supports token', () => {
+    class A {}
+    const providers = [A];
+    const module = new InjectorModule(providers)
+    expect(module.isProvided(A)).toBe(true);
+});
+
+test('throw error when both forRoot and exports are used', () => {
+    class A {}
+
+    class TestModule extends InjectorModule {}
+
+    const module = new TestModule();
+    module.forRoot();
+    module.addProvider(A);
+    module.addExport(A);
+
+    const root = new InjectorModule();
+    root.addImport(module);
+
+    const injector = new InjectorContext(root);
+    expect(() => injector.getRootInjector()).toThrowError();
+})

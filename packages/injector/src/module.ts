@@ -1,29 +1,71 @@
 import { NormalizedProvider, ProviderWithScope, TagProvider, Token } from './provider.js';
 import { arrayRemoveItem, ClassType, getClassName, isClass, isPlainObject, isPrototypeOfBase } from '@deepkit/core';
-import { BuildContext, Injector, SetupProviderRegistry } from './injector.js';
-import { hasTypeInformation, isExtendable, isType, ReceiveType, reflect, ReflectionKind, resolveReceiveType } from '@deepkit/type';
+import { BuildContext, getContainerToken, Injector, resolveToken } from './injector.js';
+import {
+    hasTypeInformation,
+    isType,
+    ReceiveType,
+    reflect,
+    ReflectionKind,
+    reflectOrUndefined,
+    resolveReceiveType,
+    Type,
+    TypeClass,
+    typeInfer,
+    TypeObjectLiteral,
+    visit,
+} from '@deepkit/type';
+import { nominalCompatibility } from './types.js';
 
-export type ConfigureProvider<T> = { [name in keyof T]: T[name] extends (...args: infer A) => any ? (...args: A) => ConfigureProvider<T> : T[name] };
+export interface ConfigureProviderOptions {
+    /**
+     * If there are several registered configuration functions for the same token,
+     * they are executed in order of their `order` value ascending. The default is 0.
+     * The lower the number, the earlier it is executed.
+     */
+    order: number;
 
-/**
- * Returns a configuration object that reflects the API of the given ClassType or token. Each call
- * is scheduled and executed once the provider has been created by the dependency injection container.
- */
-export function setupProvider<T>(token: Token, registry: SetupProviderRegistry, order: number): ConfigureProvider<T extends ClassType<infer C> ? C : T> {
-    const proxy = new Proxy({}, {
-        get(target, prop) {
-            return (...args: any[]) => {
-                registry.add(token, { type: 'call', methodName: prop, args: args, order });
-                return proxy;
-            };
-        },
-        set(target, prop, value) {
-            registry.add(token, { type: 'property', property: prop, value: value, order });
-            return true;
+    /**
+     * Replaces the instance with the value returned by the configuration function.
+     */
+    replace: boolean;
+
+    /**
+     * Per default only providers in the same module are configured.
+     * If you want to configure providers of all modules, set this to true.
+     */
+    global: boolean;
+}
+
+export interface ConfigureProviderEntry {
+    type: Type;
+    options: ConfigureProviderOptions;
+    call: Function;
+}
+
+export class ConfigurationProviderRegistry {
+    public configurations: ConfigureProviderEntry[] = [];
+
+    public add(type: Type, call: Function, options: ConfigureProviderOptions) {
+        this.configurations.push({ type, options, call });
+    }
+
+    mergeInto(registry: ConfigurationProviderRegistry): void {
+        for (const { type, options, call } of this.configurations) {
+            registry.add(type, call, options);
         }
-    });
+    }
 
-    return proxy as any;
+    public get(token: Token): ConfigureProviderEntry[] {
+        const results: ConfigureProviderEntry[] = [];
+        for (const configure of this.configurations) {
+            const lookup = isClass(token) ? resolveReceiveType(token) : token;
+            if (dependencyLookupMatcher(configure.type, lookup)) {
+                results.push(configure);
+            }
+        }
+        return results;
+    }
 }
 
 let moduleIds: number = 0;
@@ -57,19 +99,74 @@ export interface PreparedProvider {
     resolveFrom?: InjectorModule;
 }
 
-function lookupPreparedProviders(preparedProviders: PreparedProvider[], token: Token): PreparedProvider | undefined {
-    let last: PreparedProvider | undefined;
+/**
+ * 0 means not compatible, 1 means exactly compatible, n>1 means compatible but not exactly. The higher the number the further away the compatibility is (the inheritance chain).
+ */
+function getSpecificity(a: Type, b: Type): number {
+    return nominalCompatibility(a, b);
+}
+
+function getTypeFromToken(token: Token): Type {
+    return isClass(token) && hasTypeInformation(token) ? reflect(token) : isType(token) ? token : typeInfer(token);
+}
+
+function getTypeFromProvider(preparedProvider: PreparedProvider): Type {
+    return isClass(preparedProvider.token) && hasTypeInformation(preparedProvider.token)
+        ? reflect(preparedProvider.token) : isType(preparedProvider.token) ? preparedProvider.token : typeInfer(preparedProvider.token);
+}
+
+type LookupMatcher = (token: Type, provider: Type, candidate?: Type) => boolean;
+
+function exportLookupMatcher(token: Type, provider: Type, candidate?: Type): boolean {
+    if (token.id) return token.id === provider.id;
+
+    if (token.kind === ReflectionKind.function && provider.kind === ReflectionKind.function && provider.function && provider.function === token.function) return true;
+    if (token.kind === ReflectionKind.class && provider.kind === ReflectionKind.class && provider.classType && provider.classType === token.classType) return true;
+    if (token.kind === ReflectionKind.literal && provider.kind === ReflectionKind.literal && provider.literal === token.literal) return true;
+    return false;
+}
+
+function dependencyLookupMatcher(token: Type, provider: Type, candidate?: Type): boolean {
+    if (token.id && token.id === provider.id) return true;
+
+    const spec = getSpecificity(token, provider);
+    if (!spec) return false;
+
+    if (candidate) {
+        //if we have already a matching old candidate, we check if the old candidate was more specific than the new one.
+        //if the old one was more specific, we don't want to replace it. (lower number means more specific)
+        const oldSpec = getSpecificity(token, candidate);
+        if (oldSpec <= spec) return false;
+    }
+
+    return true;
+}
+
+function lookupPreparedProviders(
+    preparedProviders: PreparedProvider[],
+    token: Token | PreparedProvider,
+    matcher: LookupMatcher,
+    candidate?: PreparedProvider,
+): PreparedProvider | undefined {
+    const tokenProvider: any | undefined = (isPlainObject(token) && 'provide' in token && !('kind' in token)) ? token : undefined;
+    const tokenType = tokenProvider ? undefined : getTypeFromToken(token);
+
     for (const preparedProvider of preparedProviders) {
-        if (token === preparedProvider.token) {
-            last = preparedProvider;
-        } else if (isType(token)) {
-            if (token.kind === ReflectionKind.any || token.kind === ReflectionKind.unknown) continue;
-            if (token.kind === ReflectionKind.function && token.function && token.function === preparedProvider.token) last = preparedProvider;
-            if (isType(preparedProvider.token) && isExtendable(preparedProvider.token, token)) last = preparedProvider;
-            if (isClass(preparedProvider.token) && hasTypeInformation(preparedProvider.token) && isExtendable(reflect(preparedProvider.token), token)) last = preparedProvider;
+        if (tokenProvider) {
+            //token is a PreparedProvider, which matches only by identity
+            if (preparedProvider === tokenProvider || preparedProvider.providers.includes(tokenProvider)) return preparedProvider;
+            continue;
+        }
+        if (!tokenType) continue;
+
+        const preparedProviderType = getTypeFromToken(preparedProvider.token);
+
+        if (matcher(tokenType, preparedProviderType, candidate ? getTypeFromProvider(candidate) : undefined)) {
+            candidate = preparedProvider;
         }
     }
-    return last;
+
+    return candidate;
 }
 
 function registerPreparedProvider(preparedProviders: PreparedProvider[], modules: InjectorModule[], providers: NormalizedProvider[], replaceExistingScope: boolean = true) {
@@ -77,7 +174,8 @@ function registerPreparedProvider(preparedProviders: PreparedProvider[], modules
     if (token === undefined) {
         throw new Error('token is undefined: ' + JSON.stringify(providers));
     }
-    const preparedProvider = lookupPreparedProviders(preparedProviders, token);
+
+    const preparedProvider = lookupPreparedProviders(preparedProviders, token, exportLookupMatcher);
     if (preparedProvider) {
         preparedProvider.token = token;
         for (const m of modules) {
@@ -103,16 +201,50 @@ function registerPreparedProvider(preparedProviders: PreparedProvider[], modules
     }
 }
 
-export function findModuleForConfig(config: ClassType, modules: InjectorModule[]): InjectorModule | undefined {
-    //go first through first level tree, then second, the third, etc, until no left
+function isInChildOfConfig(findType: TypeClass | TypeObjectLiteral, inType?: ClassType): string | undefined {
+    if (!inType) return;
+    const inTypeType = reflect(inType);
+    if (inTypeType.kind !== ReflectionKind.class && inTypeType.kind !== ReflectionKind.objectLiteral) return;
+
+    let found: string | undefined = undefined;
+    visit(inTypeType, (type, path): false | void => {
+        if (type === findType) {
+            found = path;
+            return false;
+        } else if (type.kind === ReflectionKind.class && findType.kind === ReflectionKind.class && type.classType === findType.classType) {
+            found = path;
+            return false;
+        }
+    });
+
+    return found;
+}
+
+export function findModuleForConfig(config: ClassType, modules: InjectorModule[]): { module: InjectorModule, path: string } | undefined {
+    //go first through first level tree, then second, the third, etc., until no left
     const next: InjectorModule[] = modules.slice();
+
+    const configType = reflectOrUndefined(config);
+    if (!configType) return;
+
+    if (configType.kind !== ReflectionKind.class && configType.kind !== ReflectionKind.objectLiteral) return;
 
     while (next.length) {
         const iterateOver: InjectorModule[] = next.slice();
         next.length = 0;
 
         for (const m of iterateOver) {
-            if (m.configDefinition === config) return m;
+            if (m.configDefinition === config) return { module: m, path: '' };
+            const foundInChild = isInChildOfConfig(configType, m.configDefinition);
+            if (foundInChild) return { module: m, path: foundInChild };
+
+            let parent = m.parent;
+            while (parent) {
+                if (parent.configDefinition === config) return { module: parent, path: '' };
+                const foundInChild = isInChildOfConfig(configType, parent.configDefinition);
+                if (foundInChild) return { module: parent, path: foundInChild };
+                parent = parent.parent;
+            }
             next.push(...m.imports);
         }
     }
@@ -122,8 +254,9 @@ export function findModuleForConfig(config: ClassType, modules: InjectorModule[]
 
 export type ExportType = Token | InjectorModule;
 
-export function isProvided(providers: ProviderWithScope[], token: any): boolean {
-    return providers.find(v => !(v instanceof TagProvider) ? token === (isClass(v) ? v : v.provide) : false) !== undefined;
+
+export function isProvided<T>(providers: ProviderWithScope[], token: Token<T>): boolean {
+    return providers.some(v => getContainerToken(resolveToken(v)) === getContainerToken(token));
 }
 
 export function getScope(provider: ProviderWithScope): string {
@@ -146,8 +279,8 @@ export class InjectorModule<C extends { [name: string]: any } = any, IMPORT = In
      */
     injector?: Injector;
 
-    public setupProviderRegistry: SetupProviderRegistry = new SetupProviderRegistry;
-    public globalSetupProviderRegistry: SetupProviderRegistry = new SetupProviderRegistry;
+    public configurationProviderRegistry: ConfigurationProviderRegistry = new ConfigurationProviderRegistry;
+    public globalConfigurationProviderRegistry: ConfigurationProviderRegistry = new ConfigurationProviderRegistry;
 
     imports: InjectorModule[] = [];
 
@@ -159,7 +292,7 @@ export class InjectorModule<C extends { [name: string]: any } = any, IMPORT = In
         public providers: ProviderWithScope[] = [],
         public parent?: InjectorModule,
         public config: C = {} as C,
-        public exports: ExportType[] = []
+        public exports: ExportType[] = [],
     ) {
         if (this.parent) this.parent.registerAsChildren(this);
     }
@@ -228,9 +361,9 @@ export class InjectorModule<C extends { [name: string]: any } = any, IMPORT = In
         throw new Error(`Injector already built for ${getClassName(this)}. Can not modify its provider or tree structure.`);
     }
 
-    addExport(...controller: ExportType[]): this {
+    addExport(...types: (ExportType | ExportType[])[]): this {
         this.assertInjectorNotBuilt();
-        this.exports.push(...controller);
+        this.exports.push(...types.flat());
         return this;
     }
 
@@ -238,13 +371,16 @@ export class InjectorModule<C extends { [name: string]: any } = any, IMPORT = In
         return this.exports.includes(token);
     }
 
-    isProvided(classType: ClassType): boolean {
-        return isProvided(this.getProviders(), classType);
+    isProvided<T>(token?: Token<T>, type?: ReceiveType<T>): boolean {
+        if (!token) {
+            token = resolveReceiveType(type);
+        }
+        return isProvided<T>(this.getProviders(), token);
     }
 
-    addProvider(...provider: ProviderWithScope[]): this {
+    addProvider(...provider: (ProviderWithScope | ProviderWithScope[])[]): this {
         this.assertInjectorNotBuilt();
-        this.providers.push(...provider);
+        this.providers.push(...provider.flat());
         return this;
     }
 
@@ -321,26 +457,30 @@ export class InjectorModule<C extends { [name: string]: any } = any, IMPORT = In
     }
 
     /**
-     * Allows to register additional setup calls for a provider in this module.
-     * The injector token needs to be available in the local module providers.
-     * Use setupGlobalProvider to register globally setup calls (not limited to this module only).
+     * Configures a provider by applying a custom configuration function to its instance.
+     * The passed configure function is executed when instance was created.
+     * If the provider is in a scope and the scope created multiple instances,
+     * the configure function is executed for each instance.
      *
-     * Returns a object that reflects the API of the given ClassType or token. Each call
-     * is scheduled and executed once the provider is created by the dependency injection container.
-     */
-    setupProvider<T>(order: number = 0, classTypeOrToken?: ReceiveType<T>): ConfigureProvider<T extends ClassType<infer C> ? C : T> {
-        return setupProvider(resolveReceiveType(classTypeOrToken), this.setupProviderRegistry, order);
-    }
-
-    /**
-     * Allows to register additional setup calls for a provider in the whole module tree.
-     * The injector token needs to be available in the local module providers.
+     * The purpose of a provider configuration is to configure the instance, for example
+     * call methods on it, set properties, etc.
      *
-     * Returns a object that reflects the API of the given ClassType or token. Each call
-     * is scheduled and executed once the provider is created by the dependency injection container.
+     * The first parameter of the function is always the instance of the provider that was created.
+     * All additional defined parameters will be provided by the dependency injection container.
+     *
+     * if `options.replace` is true, the returned value of `configure` will
+     * replace the instance.
+     * if `options.global` is true, the configuration function is applied to all
+     * providers in the whole module tree.
+     * The `options.order` defines the order of execution of the configuration function.
+     * The lower the number, the earlier it is executed.
      */
-    setupGlobalProvider<T>(order: number = 0, classTypeOrToken?: ReceiveType<T>): ConfigureProvider<T extends ClassType<infer C> ? C : T> {
-        return setupProvider(resolveReceiveType(classTypeOrToken), this.globalSetupProviderRegistry, order);
+    configureProvider<T>(configure: (instance: T, ...args: any[]) => any, options: Partial<ConfigureProviderOptions> = {}, type?: ReceiveType<T>): this {
+        const optionsResolved = Object.assign({ order: 0, replace: false, global: false }, options);
+        type = resolveReceiveType(type);
+        const registry = options.global ? this.globalConfigurationProviderRegistry : this.configurationProviderRegistry;
+        registry.add(type, configure, optionsResolved);
+        return this;
     }
 
     getOrCreateInjector(buildContext: BuildContext): Injector {
@@ -364,9 +504,14 @@ export class InjectorModule<C extends { [name: string]: any } = any, IMPORT = In
 
     protected preparedProviders?: PreparedProvider[];
 
-    getPreparedProvider(token: Token): PreparedProvider | undefined {
+    getPreparedProvider(token: Token, candidate?: PreparedProvider): PreparedProvider | undefined {
         if (!this.preparedProviders) return;
-        return lookupPreparedProviders(this.preparedProviders, token);
+        return lookupPreparedProviders(this.preparedProviders, token, dependencyLookupMatcher, candidate);
+    }
+
+    getSetupProvider(token: Token, candidate?: PreparedProvider): PreparedProvider | undefined {
+        if (!this.preparedProviders) return;
+        return lookupPreparedProviders(this.preparedProviders, token, exportLookupMatcher, candidate);
     }
 
     resolveToken(token: Token): InjectorModule | undefined {
@@ -381,7 +526,7 @@ export class InjectorModule<C extends { [name: string]: any } = any, IMPORT = In
     }
 
     /**
-     * Prepared the module for a injector tree build.
+     * Prepared the module for an injector tree build.
      *
      *  - Index providers by token so that last known provider is picked (so they can be overwritten).
      *  - Register TagProvider in TagRegistry
@@ -397,15 +542,15 @@ export class InjectorModule<C extends { [name: string]: any } = any, IMPORT = In
 
         this.preparedProviders = [];
 
-        this.globalSetupProviderRegistry.mergeInto(buildContext.globalSetupProviderRegistry);
+        this.globalConfigurationProviderRegistry.mergeInto(buildContext.globalConfigurationProviderRegistry);
 
         //make sure that providers that declare the same provider token will be filtered out so that the last will be used.
         for (const provider of this.providers) {
-            if (!provider) throw new Error('invalid provider: ' + provider);
+            if (!provider) continue;
             if (provider instanceof TagProvider) {
                 buildContext.tagRegistry.register(provider, this);
 
-                if (!lookupPreparedProviders(this.preparedProviders, provider.provider.provide)) {
+                if (!lookupPreparedProviders(this.preparedProviders, provider.provider.provide, exportLookupMatcher)) {
                     //we don't want to overwrite that provider with a tag
                     registerPreparedProvider(this.preparedProviders, [this], [provider.provider]);
                 }
@@ -445,7 +590,7 @@ export class InjectorModule<C extends { [name: string]: any } = any, IMPORT = In
         const exportToken = (token: ExportType, to: InjectorModule) => {
             if (!this.preparedProviders) return;
 
-            const preparedProvider = lookupPreparedProviders(this.preparedProviders, token);
+            const preparedProvider = lookupPreparedProviders(this.preparedProviders, token, exportLookupMatcher);
             //if it was not in provider, we continue
             if (!preparedProvider) return;
 
@@ -453,18 +598,24 @@ export class InjectorModule<C extends { [name: string]: any } = any, IMPORT = In
             preparedProvider.resolveFrom = to;
 
             const parentProviders = to.getPreparedProviders(buildContext);
-            const parentProvider = lookupPreparedProviders(parentProviders, token);
+            const parentProvider = lookupPreparedProviders(parentProviders, token, exportLookupMatcher);
             //if the parent has this token already defined, we just switch its module to ours,
             //so it's able to inject our encapsulated services.
             if (parentProvider) {
                 //we add our module as additional source for potential dependencies
                 registerPreparedProvider(parentProviders, preparedProvider.modules, preparedProvider.providers, false);
             } else {
-                parentProviders.push({ token, modules: [this], providers: preparedProvider.providers.slice() });
+                // [this, to] is used so that this service resolves dependencies from the target first (so it can overwrite them)
+                // and falls back to the module it was defined in. This includes configureProvider() calls.
+                parentProviders.push({ token: preparedProvider.token, modules: [to, this], providers: preparedProvider.providers.slice() });
             }
         };
 
         if (this.root) {
+            if (this.exports.length !== 0) {
+                throw new Error(`Can not use forRoot and exports at the same time in module ${this.constructor.name}. Either you want to export everything to the root (via forRoot: true), or export a subset to the parent (via exports)`);
+            }
+
             const root = this.findRoot();
             if (root !== this) {
                 for (const prepared of this.preparedProviders) {
@@ -488,14 +639,18 @@ export class InjectorModule<C extends { [name: string]: any } = any, IMPORT = In
                             preparedProvider.resolveFrom = this.parent;
 
                             const parentProviders = this.parent.getPreparedProviders(buildContext);
-                            const parentProvider = lookupPreparedProviders(parentProviders, preparedProvider.token);
+                            const parentProvider = lookupPreparedProviders(parentProviders, preparedProvider.token, exportLookupMatcher);
                             //if the parent has this token already defined, we just switch its module to ours,
                             //so it's able to inject our encapsulated services.
                             if (parentProvider) {
                                 //we add our module as additional source for potential dependencies
                                 registerPreparedProvider(parentProviders, preparedProvider.modules, preparedProvider.providers, false);
                             } else {
-                                parentProviders.push({ token: preparedProvider.token, modules: [this, ...preparedProvider.modules], providers: preparedProvider.providers.slice() });
+                                parentProviders.push({
+                                    token: preparedProvider.token,
+                                    modules: [this, ...preparedProvider.modules],
+                                    providers: preparedProvider.providers.slice(),
+                                });
                             }
                         }
                     }

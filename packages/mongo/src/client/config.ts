@@ -8,14 +8,15 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { Host } from './host';
-import { ConnectionOptions } from './options';
+import { Host } from './host.js';
+import { ConnectionOptions } from './options.js';
 import { parse as parseUrl } from 'url';
 import { parse as parseQueryString } from 'querystring';
-import { MongoError } from './error';
+import { MongoError } from './error.js';
 import { arrayRemoveItem, eachPair, singleStack } from '@deepkit/core';
-import { resolveSrvHosts } from './dns';
-import { ReflectionClass, validatedDeserialize } from '@deepkit/type';
+import { resolveSrvHosts } from './dns.js';
+import { cast, ReflectionClass } from '@deepkit/type';
+import { ReadPreferenceMessage } from './command/command.js';
 
 /**
  * Default URL:
@@ -54,6 +55,21 @@ export class MongoClientConfig {
         this.parseConnectionString(connectionString);
     }
 
+     applyReadPreference(cmd: ReadPreferenceMessage) {
+        if (this.options.readPreference) {
+            cmd.$readPreference = {
+                mode: this.options.readPreference,
+            };
+            if (this.options.getReadPreferenceTags().length) {
+                cmd.$readPreference.tags = this.options.getReadPreferenceTags();
+            }
+            if (this.options.maxStalenessSeconds) {
+                cmd.$readPreference.maxStalenessSeconds = this.options.maxStalenessSeconds;
+            }
+            if (this.options.hedge) cmd.$readPreference.hedge = { enabled: true };
+        }
+    }
+
     protected parseConnectionString(url: string) {
         //we replace only first `,` with `/,` so we get additional host names in parsed.path
         url = url.replace(',', '/,');
@@ -89,6 +105,7 @@ export class MongoClientConfig {
         }
 
         this.defaultDb = defaultDb;
+
         if (parsed.auth) {
             const firstColon = parsed.auth.indexOf(':');
             if (firstColon === -1) {
@@ -100,7 +117,7 @@ export class MongoClientConfig {
         }
 
         const options = parsed.query ? parseQueryString(parsed.query) : {};
-        this.options = validatedDeserialize<ConnectionOptions>(options);
+        this.options = cast<ConnectionOptions>(options);
 
         if (url.startsWith('mongodb+srv://')) {
             this.isSrv = true;
@@ -138,7 +155,7 @@ export class MongoClientConfig {
     }
 
     resolveCollectionName(schema: ReflectionClass<any>): string {
-        return schema.collectionName || schema.name || 'unknown';
+        return schema.getCollectionName() || 'unknown';
     }
 
     @singleStack()
@@ -154,7 +171,7 @@ export class MongoClientConfig {
 
             const hostsData = await this.resolveSrvHosts();
             const options = { ...hostsData.options ? parseQueryString(hostsData.options) : {} };
-            const partialOptions = validatedDeserialize<ConnectionOptions>(options) as {};
+            const partialOptions = cast<ConnectionOptions>(options) as {};
             for (const [k, v] of eachPair(partialOptions)) {
                 this.options[k] = v;
             }

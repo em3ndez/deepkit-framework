@@ -21,7 +21,7 @@ import { DebugRequest, Workflow } from '@deepkit/framework-debug-api';
                 <h3>#{{request.id}}</h3>
                 <div class="text-selection">{{request.method}} {{request.url}}</div>
                 <div class="text-selection">Status {{request.statusCode}}</div>
-                <div class="text-selection">{{request.created|date:'medium'}}</div>
+                <div class="text-selection">{{request.started|date:'medium'}}</div>
                 <div class="text-selection">Response time: {{time(request.times['http'])}}</div>
             </div>
 
@@ -70,15 +70,15 @@ import { DebugRequest, Workflow } from '@deepkit/framework-debug-api';
         </ng-container>
     `,
     styles: [`
-        app-workflow >>> .node.invalid {
+        :host::ng-deep .node.invalid {
             color: var(--text-light);
         }
 
-        app-workflow >>> .node.valid {
+        :host::ng-deep .node.valid {
             border: 0;
         }
 
-        app-workflow >>> .node.valid::after {
+        :host::ng-deep .node.valid::after {
             content: '';
             position: absolute;
             left: 0;

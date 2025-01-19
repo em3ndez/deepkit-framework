@@ -92,7 +92,7 @@ import { getTypeJitContainer } from '@deepkit/type';
                         </div>
                         <div style="margin-top: 10px; flex: 2 1 auto;">
                             <label>Description</label>
-                            {{route.description || 'none'}}
+                            <div class="formatted-text">{{route.description || 'none'}}</div>
                         </div>
                     </div>
                 </deepkit-box>
@@ -270,7 +270,7 @@ export class HttpRouteDetailComponent implements OnChanges {
         if (environment) {
             routeState.fullHeaders = [...environment.headers, ...routeState.headers];
         } else {
-            routeState.fullHeaders = routeState.headers;
+            routeState.fullHeaders = [...routeState.headers];
         }
 
         routeState.fullUrl = HttpRouteDetailComponent.getUrl() + url;
@@ -307,8 +307,8 @@ export class HttpRouteDetailComponent implements OnChanges {
             const start = performance.now();
             let body: any = undefined;
 
-            const headers: Record<any, any> = {}
-            for (const { name, value } of routeState.headers) {
+            const headers: Record<any, any> = {};
+            for (const { name, value } of routeState.fullHeaders) {
                 headers[name] = value;
             }
 

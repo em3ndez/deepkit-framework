@@ -13,14 +13,20 @@
     "esModuleInterop": true,
     "outDir": "./dist/cjs",
     "declaration": true,
-    "composite": true
+    "composite": true,
+    "types": [
+      "lz-string",
+      "micromatch",
+      "node"
+    ]
   },
   "include": [
     "src",
-    "tests",
     "install-transformer.ts",
+    "compiler-debug.ts",
     "index.ts"
   ],
+  "exclude": ["tests"],
   "references": [
     {
       "path": "../type-spec/tsconfig.json"

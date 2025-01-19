@@ -8,7 +8,13 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { AbstractClassType, ClassType, getClassName } from '@deepkit/core';
+import {
+    AbstractClassType,
+    ClassType,
+    forwardTypeArguments,
+    getClassName,
+    getClassTypeFromInstance,
+} from '@deepkit/core';
 import {
     entityAnnotation,
     EntityOptions,
@@ -19,30 +25,39 @@ import {
     ReflectionClass,
     ReflectionKind,
     resolveReceiveType,
-    Type
+    Type,
 } from '@deepkit/type';
-import { DatabaseAdapter, DatabaseEntityRegistry } from './database-adapter';
-import { DatabaseSession } from './database-session';
-import { QueryDatabaseEmitter, UnitOfWorkDatabaseEmitter } from './event';
-import { DatabaseLogger } from './logger';
-import { Query } from './query';
-import { getReference } from './reference';
-import { OrmEntity } from './type';
-import { VirtualForeignKeyConstraint } from './virtual-foreign-key-constraint';
+import { DatabaseAdapter, DatabaseEntityRegistry, MigrateOptions } from './database-adapter.js';
+import { DatabaseSession } from './database-session.js';
+import { DatabaseLogger } from './logger.js';
+import { Query } from './query.js';
+import { getReference } from './reference.js';
+import { OrmEntity } from './type.js';
+import { VirtualForeignKeyConstraint } from './virtual-foreign-key-constraint.js';
 import { Stopwatch } from '@deepkit/stopwatch';
-import { getNormalizedPrimaryKey } from './identity-map';
+import { getClassState, getInstanceState, getNormalizedPrimaryKey } from './identity-map.js';
+import { EventDispatcher, EventDispatcherUnsubscribe, EventListenerCallback, EventToken } from '@deepkit/event';
+import { DatabasePlugin, DatabasePluginRegistry } from './plugin/plugin.js';
 
 /**
  * Hydrates not completely populated item and makes it completely accessible.
+ * This is necessary if you want to load fields that were excluded from the query via lazyLoad().
  */
-export async function hydrateEntity<T>(item: T): Promise<void> {
+export async function hydrateEntity<T extends OrmEntity>(item: T): Promise<T> {
     const info = getReferenceInfo(item);
-    if (info && isReferenceHydrated(item)) return;
+    if (info && isReferenceHydrated(item)) return item;
 
     if (info && info.hydrator) {
         await info.hydrator(item);
-        return;
+        return item;
     }
+
+    const state = getInstanceState<T>(getClassState(ReflectionClass.from(getClassTypeFromInstance(item))), item);
+    if (state.hydrator) {
+        await state.hydrator(item);
+        return item;
+    }
+
     throw new Error(`Given object is not a reference from a database session and thus can not be hydrated.`);
 }
 
@@ -66,6 +81,21 @@ export function isDatabaseOf<T extends DatabaseAdapter>(database: Database<any>,
     return database.adapter instanceof adapterClassType;
 }
 
+function setupVirtualForeignKey(database: Database, virtualForeignKeyConstraint: VirtualForeignKeyConstraint) {
+    database.listen(DatabaseSession.onDeletePost, async (event) => {
+        await virtualForeignKeyConstraint.onUoWDelete(event);
+    });
+    database.listen(DatabaseSession.onUpdatePost, async (event) => {
+        await virtualForeignKeyConstraint.onUoWUpdate(event);
+    });
+    database.listen(Query.onPatchPost, async (event) => {
+        await virtualForeignKeyConstraint.onQueryPatch(event);
+    });
+    database.listen(Query.onDeletePost, async (event) => {
+        await virtualForeignKeyConstraint.onQueryDelete(event);
+    });
+}
+
 /**
  * Database abstraction. Use createSession() to create a work session with transaction support.
  *
@@ -87,16 +117,6 @@ export class Database<ADAPTER extends DatabaseAdapter = DatabaseAdapter> {
      * The entity schema registry.
      */
     public readonly entityRegistry: DatabaseEntityRegistry = new DatabaseEntityRegistry();
-
-    /**
-     * Event API for DatabaseQuery events.
-     */
-    public readonly queryEvents = new QueryDatabaseEmitter();
-
-    /**
-     * Event API for the unit of work.
-     */
-    public readonly unitOfWorkEvents = new UnitOfWorkDatabaseEmitter();
 
     public stopwatch?: Stopwatch;
 
@@ -123,57 +143,65 @@ export class Database<ADAPTER extends DatabaseAdapter = DatabaseAdapter> {
 
     public logger: DatabaseLogger = new DatabaseLogger();
 
+    /** @reflection never */
+    public eventDispatcher: EventDispatcher = new EventDispatcher();
+    public pluginRegistry: DatabasePluginRegistry = new DatabasePluginRegistry();
+
     constructor(
         public readonly adapter: ADAPTER,
-        schemas: (Type | ClassType | ReflectionClass<any>)[] = []
+        schemas: (Type | ClassType | ReflectionClass<any>)[] = [],
     ) {
         this.entityRegistry.add(...schemas);
         if (Database.registry) Database.registry.push(this);
 
         const self = this;
+
         //we cannot use arrow functions, since they can't have ReceiveType<T>
-        function query<T>(type?: ReceiveType<T> | ClassType<T> | AbstractClassType<T> | ReflectionClass<T>) {
+        function query<T extends OrmEntity>(type?: ReceiveType<T> | ClassType<T> | AbstractClassType<T> | ReflectionClass<T>) {
             const session = self.createSession();
             session.withIdentityMap = false;
             return session.query(type);
-        };
+        }
+
         this.query = query;
 
         this.raw = (...args: any[]) => {
             const session = this.createSession();
             session.withIdentityMap = false;
             if (!session.raw) throw new Error('Adapter has no raw mode');
+            forwardTypeArguments(this.raw, session.raw);
             return session.raw(...args);
         };
 
         this.registerEntity(...schemas);
 
         if (!this.adapter.isNativeForeignKeyConstraintSupported()) {
-            this.unitOfWorkEvents.onDeletePost.subscribe(async (event) => {
-                await this.virtualForeignKeyConstraint.onUoWDelete(event);
-            });
-            this.unitOfWorkEvents.onUpdatePost.subscribe(async (event) => {
-                await this.virtualForeignKeyConstraint.onUoWUpdate(event);
-            });
+            setupVirtualForeignKey(this, this.virtualForeignKeyConstraint);
+        }
+    }
 
-            this.queryEvents.onPatchPost.subscribe(async (event) => {
-                await this.virtualForeignKeyConstraint.onQueryPatch(event);
-            });
-            this.queryEvents.onDeletePost.subscribe(async (event) => {
-                await this.virtualForeignKeyConstraint.onQueryDelete(event);
-            });
+    registerPlugin(...plugins: DatabasePlugin[]): void {
+        for (const plugin of plugins) {
+            this.pluginRegistry.add(plugin);
+            plugin.onRegister(this);
         }
     }
 
     static createClass<T extends DatabaseAdapter>(name: string, adapter: T, schemas: (ClassType | ReflectionClass<any>)[] = []): ClassType<Database<T>> {
         class C extends Database<T> {
             bla!: string;
+
             constructor() {
                 super(adapter, schemas);
                 this.name = name;
             }
         }
+
         return C;
+    }
+
+    listen<T extends EventToken<any>, DEPS extends any[]>(eventToken: T, callback: EventListenerCallback<T['event']>, order: number = 0): EventDispatcherUnsubscribe {
+        return this.eventDispatcher.listen(eventToken, callback, order);
     }
 
     /**
@@ -209,7 +237,7 @@ export class Database<ADAPTER extends DatabaseAdapter = DatabaseAdapter> {
      * ```
      */
     public createSession(): DatabaseSession<ADAPTER> {
-        return new DatabaseSession(this.adapter, this.unitOfWorkEvents, this.queryEvents, this.entityRegistry, this.logger, this.stopwatch);
+        return new DatabaseSession(this.adapter, this.entityRegistry, this.eventDispatcher.fork(), this.pluginRegistry, this.logger, this.stopwatch);
     }
 
     /**
@@ -297,7 +325,7 @@ export class Database<ADAPTER extends DatabaseAdapter = DatabaseAdapter> {
     }
 
     getEntity(name: string): ReflectionClass<any> {
-        for (const entity of this.entityRegistry.entities) {
+        for (const entity of this.entityRegistry.all()) {
             if (entity.getName() === name) return entity;
         }
 
@@ -310,8 +338,10 @@ export class Database<ADAPTER extends DatabaseAdapter = DatabaseAdapter> {
      * WARNING: DON'T USE THIS IN PRODUCTION AS THIS CAN CAUSE EASILY DATA LOSS.
      * SEE THE MIGRATION DOCUMENTATION TO UNDERSTAND ITS IMPLICATIONS.
      */
-    async migrate() {
-        await this.adapter.migrate(this.entityRegistry);
+    async migrate(options: Partial<MigrateOptions> = {}) {
+        const o = new MigrateOptions();
+        Object.assign(o, options);
+        await this.adapter.migrate(o, this.entityRegistry);
     }
 
     /**
@@ -331,6 +361,16 @@ export class Database<ADAPTER extends DatabaseAdapter = DatabaseAdapter> {
     }
 
     /**
+     * Same as persist(), but allows to specify the type that should be used for the given items.
+     */
+    public async persistAs<T extends OrmEntity>(items: T[], type?: ReceiveType<T>) {
+        const session = this.createSession();
+        session.withIdentityMap = false;
+        session.addAs(items, ReflectionClass.from(type));
+        await session.commit();
+    }
+
+    /**
      * Simple direct remove. The persistence layer (batch) removes all given items.
      * This is different to createSession()+remove() in a way that `DatabaseSession.remove` adds the given items to the queue
      * (which is then committed using commit()) while this `database.remove` just simply removes the given items immediately,
@@ -342,6 +382,16 @@ export class Database<ADAPTER extends DatabaseAdapter = DatabaseAdapter> {
         const session = this.createSession();
         session.withIdentityMap = false;
         session.remove(...items);
+        await session.commit();
+    }
+
+    /**
+     * Same as remove(), but allows to specify the type that should be used for the given items.
+     */
+    public async removeAs<T extends OrmEntity>(items: T[], type?: ReceiveType<T>) {
+        const session = this.createSession();
+        session.withIdentityMap = false;
+        session.removeAs(items, ReflectionClass.from(type));
         await session.commit();
     }
 }

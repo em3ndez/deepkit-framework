@@ -13,13 +13,17 @@
     "esModuleInterop": true,
     "outDir": "./dist/cjs",
     "declaration": true,
-    "composite": true
+    "composite": true,
+    "types": []
   },
   "reflection": true,
   "include": [
     "src",
     "index.ts",
     "node_modules/@deepkit/api-console-gui/src/api.ts"
+  ],
+  "exclude": [
+    "tests"
   ],
   "references": [
     {
@@ -36,9 +40,6 @@
     },
     {
       "path": "../core/tsconfig.json"
-    },
-    {
-      "path": "../crypto/tsconfig.json"
     },
     {
       "path": "../http/tsconfig.json"

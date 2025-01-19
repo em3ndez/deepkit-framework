@@ -8,29 +8,45 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { DatabaseAdapter, DatabaseSession, DeleteResult, Formatter, GenericQueryResolver, OrmEntity, PatchResult } from '@deepkit/orm';
-import { Changes, getPartialSerializeFunction, ReflectionClass, ReflectionKind, ReflectionVisibility, resolveForeignReflectionClass, serializer, typeOf } from '@deepkit/type';
-import { MongoClient } from './client/client';
-import { AggregateCommand } from './client/command/aggregate';
-import { CountCommand } from './client/command/count';
-import { DeleteCommand } from './client/command/delete';
-import { FindCommand } from './client/command/find';
-import { FindAndModifyCommand } from './client/command/findAndModify';
-import { UpdateCommand } from './client/command/update';
-import { convertClassQueryToMongo } from './mapping';
-import { DEEP_SORT, FilterQuery, MongoQueryModel } from './query.model';
-import { MongoConnection } from './client/connection';
-import { MongoDatabaseAdapter } from './adapter';
+import { DatabaseAdapter, DatabaseDeleteError, DatabasePatchError, DatabaseSession, DeleteResult, Formatter, GenericQueryResolver, OrmEntity, PatchResult } from '@deepkit/orm';
+import {
+    Changes,
+    getPartialSerializeFunction,
+    getPatchSerializeFunction,
+    PrimaryKeyFields,
+    ReflectionClass,
+    ReflectionKind,
+    ReflectionVisibility,
+    resolveForeignReflectionClass,
+    serializer,
+    typeOf,
+} from '@deepkit/type';
+import { MongoClient } from './client/client.js';
+import { AggregateCommand } from './client/command/aggregate.js';
+import { CountCommand } from './client/command/count.js';
+import { DeleteCommand } from './client/command/delete.js';
+import { FindCommand } from './client/command/find.js';
+import { FindAndModifyCommand } from './client/command/findAndModify.js';
+import { UpdateCommand } from './client/command/update.js';
+import { convertClassQueryToMongo } from './mapping.js';
+import { DEEP_SORT, FilterQuery, MongoQueryModel } from './query.model.js';
+import { MongoConnection } from './client/connection.js';
+import { MongoDatabaseAdapter } from './adapter.js';
 import { empty } from '@deepkit/core';
-import { mongoSerializer } from './mongo-serializer';
+import { mongoSerializer } from './mongo-serializer.js';
+import { handleSpecificError } from './error.js';
 
-export function getMongoFilter<T>(classSchema: ReflectionClass<T>, model: MongoQueryModel<T>): any {
+export function getMongoFilter<T extends OrmEntity>(classSchema: ReflectionClass<T>, model: MongoQueryModel<T>): any {
     return convertClassQueryToMongo(classSchema, (model.filter || {}) as FilterQuery<T>, {}, {
         $parameter: (name, value) => {
             if (undefined === model.parameters[value]) {
                 throw new Error(`Parameter ${value} not defined in ${classSchema.getClassName()} query.`);
             }
             return model.parameters[value];
+        },
+        $like: (name, value) => {
+            const regexp = ('^' + value + '$').replace(/%/g, '.*').replace(/_/g, '.');
+            return new RegExp(regexp, 'i');
         }
     });
 }
@@ -55,6 +71,10 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
         return await this.count(model) > 0;
     }
 
+    handleSpecificError(error: Error): Error {
+        return handleSpecificError(this.session, error);
+    }
+
     protected getPrimaryKeysProjection(classSchema: ReflectionClass<any>) {
         const pk: { [name: string]: 1 | 0 } = { _id: 0 };
         for (const property of classSchema.getPrimaries()) {
@@ -63,7 +83,7 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
         return pk;
     }
 
-    protected async fetchIds(queryModel: MongoQueryModel<T>, limit: number = 0, connection: MongoConnection): Promise<any[]> {
+    protected async fetchIds(queryModel: MongoQueryModel<T>, limit: number = 0, connection: MongoConnection): Promise<PrimaryKeyFields<any>[]> {
         const primaryKeyName = this.classSchema.getPrimary().name;
         const projection = { [primaryKeyName]: 1 as const };
 
@@ -73,12 +93,10 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
             pipeline.push({ $project: projection });
             const command = new AggregateCommand(this.classSchema, pipeline);
             command.partial = true;
-            const items = await connection.execute(command);
-            return items.map(v => v[primaryKeyName]);
+            return await connection.execute(command);
         } else {
             const mongoFilter = getMongoFilter(this.classSchema, queryModel);
-            const items = await connection.execute(new FindCommand(this.classSchema, mongoFilter, projection, undefined, limit || queryModel.limit, queryModel.skip));
-            return items.map(v => v[primaryKeyName]);
+            return await connection.execute(new FindCommand(this.classSchema, mongoFilter, projection, undefined, limit || queryModel.limit, queryModel.skip));
         }
     }
 
@@ -93,8 +111,12 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
             deleteResult.primaryKeys = primaryKeys;
             const primaryKeyName = this.classSchema.getPrimary().name;
 
-            const query = convertClassQueryToMongo(this.classSchema, { [primaryKeyName]: { $in: primaryKeys } } as FilterQuery<T>);
+            const query = convertClassQueryToMongo(this.classSchema, { [primaryKeyName]: { $in: primaryKeys.map(v => v[primaryKeyName]) } } as FilterQuery<T>);
             await connection.execute(new DeleteCommand(this.classSchema, query, queryModel.limit));
+        } catch (error: any) {
+            error = new DatabaseDeleteError(this.classSchema, `Could not delete ${this.classSchema.getClassName()} in database`, { cause: error });
+            error.query = queryModel;
+            throw this.handleSpecificError(error);
         } finally {
             connection.release();
         }
@@ -107,7 +129,7 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
 
         const filter = getMongoFilter(this.classSchema, model) || {};
 
-        const partialSerialize = getPartialSerializeFunction(this.classSchema.type, mongoSerializer.serializeRegistry);
+        const patchSerialize = getPatchSerializeFunction(this.classSchema.type, mongoSerializer.serializeRegistry);
         const partialDeserialize = getPartialSerializeFunction(this.classSchema.type, serializer.deserializeRegistry);
 
         const u: any = {};
@@ -116,7 +138,7 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
         if (changes.$inc) u.$inc = changes.$inc;
 
         if (u.$set) {
-            u.$set = partialSerialize(u.$set);
+            u.$set = patchSerialize(u.$set);
         }
 
         const primaryKeyName = this.classSchema.getPrimary().name;
@@ -139,7 +161,7 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
 
                 if (res.value) {
                     const converted = partialDeserialize(res.value) as any;
-                    patchResult.primaryKeys = [converted[primaryKeyName]];
+                    patchResult.primaryKeys = [converted];
                     for (const name of returning) {
                         patchResult.returning[name] = [converted[name]];
                     }
@@ -153,8 +175,6 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
                 multi: !model.limit
             }]));
 
-            if (!returning.size) return;
-
             const projection: { [name: string]: 1 | 0 } = {};
             projection[primaryKeyName] = 1;
             for (const name of returning) {
@@ -165,11 +185,14 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
             const items = await connection.execute(new FindCommand(this.classSchema, filter, projection, {}, model.limit, model.skip));
             for (const item of items) {
                 const converted = partialDeserialize(item);
-                patchResult.primaryKeys.push(converted[primaryKeyName]);
+                patchResult.primaryKeys.push(converted);
                 for (const name of returning) {
                     patchResult.returning[name].push(converted[name]);
                 }
             }
+        } catch (error: any) {
+            error = new DatabasePatchError(this.classSchema, model, changes, `Could not patch ${this.classSchema.getClassName()} in database`, { cause: error });
+            throw this.handleSpecificError(error);
         } finally {
             connection.release();
         }
@@ -299,6 +322,7 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
                 const pipeline = this.buildAggregationPipeline(model);
                 const resultsSchema = model.isAggregate() ? this.getCachedAggregationSchema(model) : this.getSchemaWithJoins();
                 const command = new AggregateCommand(this.classSchema, pipeline, resultsSchema);
+                if (model.batchSize) command.batchSize = model.batchSize;
                 command.partial = model.isPartial();
                 const items = await connection.execute(command);
                 if (model.isAggregate()) {
@@ -307,14 +331,16 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
 
                 return items.map(v => formatter.hydrate(model, v));
             } else {
-                const items = await connection.execute(new FindCommand(
+                const command = new FindCommand(
                     this.classSchema,
                     getMongoFilter(this.classSchema, model),
                     this.getProjection(this.classSchema, model.select),
                     this.getSortFromModel(model.sort),
                     model.limit,
                     model.skip,
-                ));
+                );
+                if (model.batchSize) command.batchSize = model.batchSize;
+                const items = await connection.execute(command);
                 return items.map(v => formatter.hydrate(model, v));
             }
         } finally {
@@ -324,7 +350,7 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
 
     protected buildAggregationPipeline(model: MongoQueryModel<T>) {
         const joinRefs: string[] = [];
-        const handleJoins = <T>(pipeline: any[], query: MongoQueryModel<T>, schema: ReflectionClass<any>) => {
+        const handleJoins = <T extends OrmEntity>(pipeline: any[], query: MongoQueryModel<T>, schema: ReflectionClass<any>) => {
             for (const join of query.joins) {
                 //refs are deserialized as `any` and then further deserialized using the default serializer
                 join.as = '__ref_' + join.propertySchema.name;
@@ -472,8 +498,12 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
         if (model.isAggregate()) {
             const group: any = { _id: {} };
             const project: any = {};
+            const unset: string[] = [];
             for (const g of model.groupBy.values()) {
                 group._id[g] = '$' + g;
+                //mongo pushes the result of the groupBy into _id event if the value has absolutely nothing to do with the _id type
+                //we have in the schema. Thus, we need to make sure it is not part of the result set.
+                if (g !== '_id') unset.push('_id');
                 project[g] = '$_id.' + g;
             }
 
@@ -497,6 +527,7 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
 
             pipeline.push({ $group: group });
             pipeline.push({ $project: project });
+            if (unset.length) pipeline.push({ $unset: unset });
         }
 
         if (model.sort) pipeline.push({ $sort: this.getSortFromModel(model.sort) });
@@ -550,7 +581,7 @@ export class MongoQueryResolver<T extends OrmEntity> extends GenericQueryResolve
         );
     }
 
-    protected getSortFromModel<T>(modelSort?: DEEP_SORT<T>) {
+    protected getSortFromModel<T extends OrmEntity>(modelSort?: DEEP_SORT<T>) {
         const sort: { [name: string]: -1 | 1 | { $meta: 'textScore' } } = {};
         if (modelSort) {
             for (const [i, v] of Object.entries(modelSort)) {

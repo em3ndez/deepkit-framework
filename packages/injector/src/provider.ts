@@ -7,7 +7,7 @@
  *
  * You should have received a copy of the MIT License along with this program.
  */
-import { AbstractClassType, ClassType, isClass } from '@deepkit/core';
+import { AbstractClassType, ClassType, isClass, isFunction } from '@deepkit/core';
 import type { InjectorModule } from './module.js';
 import { ReceiveType, resolveReceiveType, Type } from '@deepkit/type';
 
@@ -20,10 +20,29 @@ export interface ProviderBase {
 }
 
 /** @reflection never */
-export type Token<T = any> = symbol | number | bigint | RegExp | boolean | string | AbstractClassType<T> | Type | T;
+export interface ProviderScope {
+    scope?: 'module' | 'rpc' | 'http' | 'cli' | string;
+}
 
-export function provide<T>(provider: { useValue: T } | { useClass: ClassType } | { useExisting: any } | { useFactory: (...args: any[]) => T } | ClassType, type?: ReceiveType<T>): NormalizedProvider {
+/** @reflection never */
+export type Token<T = any> = symbol | number | bigint | RegExp | boolean | string | AbstractClassType<T> | Type | TagProvider<T> | Function | T;
+
+export function provide<T>(
+    provider:
+        | (ProviderBase & ProviderScope &
+        (
+            | { useValue: T }
+            | { useClass: ClassType }
+            | { useExisting: any }
+            | { useFactory: (...args: any[]) => T | undefined }
+            ))
+        | ClassType
+        | ((...args: any[]) => T)
+    ,
+    type?: ReceiveType<T>,
+): NormalizedProvider {
     if (isClass(provider)) return { provide: resolveReceiveType(type), useClass: provider };
+    if (isFunction(provider)) return { provide: resolveReceiveType(type), useFactory: provider };
     return { ...provider, provide: resolveReceiveType(type) };
 }
 
@@ -70,22 +89,13 @@ export interface FactoryProvider<T> extends ProviderBase {
     provide: Token<T>;
 
     /**
-     * A function to invoke to create a value for this `token`. The function is invoked with
-     * resolved values of `token`s in the `deps` field.
+     * A function to invoke to create a value for this `token`.
      */
-    useFactory: (...args: any[]) => T;
-
-    /**
-     * A list of `token`s which need to be resolved by the injector. The list of values is then
-     * used as arguments to the `useFactory` function.
-     *
-     * @deprecated not necessary anymore
-     */
-    deps?: any[];
+    useFactory: (...args: any[]) => T | undefined;
 }
 
 /** @reflection never */
-export type Provider<T = any> = ClassType | ValueProvider<T> | ClassProvider<T> | ExistingProvider<T> | FactoryProvider<T> | TagProvider<T>;
+export type Provider<T = any> = AbstractClassType | ValueProvider<T> | ClassProvider<T> | ExistingProvider<T> | FactoryProvider<T> | TagProvider<T>;
 
 /** @reflection never */
 export type ProviderProvide<T = any> = ValueProvider<T> | ClassProvider<T> | ExistingProvider<T> | FactoryProvider<T>;
@@ -150,15 +160,10 @@ export class Tag<T, TP extends TagProvider<T> = TagProvider<T>> {
 }
 
 /** @reflection never */
-export interface ProviderScope {
-    scope?: 'module' | 'rpc' | 'http' | 'cli' | string;
-}
-
-/** @reflection never */
 export type NormalizedProvider<T = any> = ProviderProvide<T> & ProviderScope;
 
 /** @reflection never */
-export type ProviderWithScope<T = any> = ClassType | (ProviderProvide<T> & ProviderScope) | TagProvider<any>;
+export type ProviderWithScope<T = any> = AbstractClassType | (ProviderProvide<T> & ProviderScope) | TagProvider<any>;
 
 export function isScopedProvider(obj: any): obj is ProviderProvide & ProviderScope {
     return obj.provide && obj.hasOwnProperty('scope');

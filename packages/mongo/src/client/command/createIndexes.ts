@@ -8,15 +8,16 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { BaseResponse, Command } from './command';
+import { BaseResponse, Command } from './command.js';
 import { ReflectionClass } from '@deepkit/type';
-import { MongoError } from '../error';
+import { MongoError } from '../error.js';
 
 export interface CreateIndex {
     key: { [name: string]: 1 },
     name: string,
     unique: boolean,
-    sparse: boolean
+    sparse: boolean,
+    expireAfterSeconds?: number
 }
 
 interface RequestSchema {
@@ -25,17 +26,17 @@ interface RequestSchema {
     indexes: CreateIndex[];
 }
 
-export class CreateIndexesCommand<T extends ReflectionClass<any>> extends Command {
+export class CreateIndexesCommand<T extends ReflectionClass<any>> extends Command<BaseResponse> {
     constructor(
         public schema: T,
-        public indexes: { key: { [name: string]: 1 }, name: string, unique: boolean, sparse: boolean }[],
+        public indexes: CreateIndex[],
     ) {
         super();
     }
 
     async execute(config, host, transaction): Promise<BaseResponse> {
         const cmd: any = {
-            createIndexes: this.schema.collectionName || this.schema.name || 'unknown',
+            createIndexes: this.schema.getCollectionName() || 'unknown',
             $db: this.schema.databaseSchemaName || config.defaultDb || 'admin',
             indexes: this.indexes,
         };
@@ -50,6 +51,6 @@ export class CreateIndexesCommand<T extends ReflectionClass<any>> extends Comman
     }
 
     needsWritableHost(): boolean {
-        return false;
+        return true;
     }
 }

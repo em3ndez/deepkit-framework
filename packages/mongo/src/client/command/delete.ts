@@ -8,7 +8,7 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { BaseResponse, Command } from './command';
+import { BaseResponse, Command } from './command.js';
 import { ReflectionClass, UUID } from '@deepkit/type';
 
 interface DeleteResponse extends BaseResponse {
@@ -25,7 +25,7 @@ interface DeleteSchema {
     startTransaction?: boolean;
 }
 
-export class DeleteCommand<T extends ReflectionClass<any>> extends Command {
+export class DeleteCommand<T extends ReflectionClass<any>> extends Command<number> {
 
     constructor(
         public schema: T,
@@ -38,7 +38,7 @@ export class DeleteCommand<T extends ReflectionClass<any>> extends Command {
 
     async execute(config, host, transaction): Promise<number> {
         const cmd = {
-            delete: this.schema.collectionName || this.schema.name || 'unknown',
+            delete: this.schema.getCollectionName() || 'unknown',
             $db: this.schema.databaseSchemaName || config.defaultDb || 'admin',
             deletes: [
                 {

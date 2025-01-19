@@ -5,7 +5,7 @@ import { stringifyType, Type } from './reflection/type.js';
 import { entity } from './decorator.js';
 import { serializer, Serializer } from './serializer.js';
 
-export type ValidatorMeta<Name extends string, Args extends [...args: any[]] = []> = { __meta?: ['validator', Name, Args] }
+export type ValidatorMeta<Name extends string, Args extends [...args: any[]] = []> = { __meta?: never & ['validator', Name, Args] }
 
 export type ValidateFunction = (value: any, type: Type, options: any) => ValidatorError | void;
 export type Validate<T extends ValidateFunction, Options extends Parameters<T>[2] = unknown> = ValidatorMeta<'function', [T, Options]>;
@@ -27,7 +27,7 @@ export type Maximum<T extends number | bigint> = ValidatorMeta<'maximum', [T]>;
 /**
  Includes 0. Use PositiveNoZero to exclude 0.
  */
-export type Positive = ValidatorMeta<'positive', [true]>;
+export type Positive = ValidatorMeta<'positive', unknown & [true]>;
 
 /**
  * Includes 0. Use NegativeNoZero to exclude 0.
@@ -82,12 +82,24 @@ export class ValidationErrorItem {
          * Free text of the error.
          */
         public readonly message: string,
+        /**
+         * Optional value that caused the error.
+         */
+        public readonly value?: any,
     ) {
         this.path = path && path[0] === '.' ? path.slice(1) : path;
     }
 
     toString(prefix: string = '') {
-        return `${(prefix ? prefix + '.' : '') + this.path}(${this.code}): ${this.message}`;
+        let messagedCausedBy = '';
+        if (this.value !== undefined) {
+            //serialise the value and trim to 100 chars max
+            let serialisedValue = JSON.stringify(this.value);
+            if (serialisedValue.length > 100) serialisedValue = serialisedValue.slice(0, 100) + '...';
+            messagedCausedBy = ` caused by value ${serialisedValue}`;
+        }
+
+        return `${(prefix ? prefix + '.' : '') + this.path}(${this.code}): ${this.message}${messagedCausedBy}`;
     }
 }
 
@@ -95,13 +107,13 @@ export class ValidationErrorItem {
 export class ValidationError extends CustomError {
     constructor(
         public readonly errors: ValidationErrorItem[],
-        public readonly type?: Type,
+        type?: Type,
     ) {
         super(`Validation error${type ? ` for type ${stringifyType(type)}` : ''}:\n${errors.map(v => v.toString()).join(',\n')}`);
     }
 
-    static from(errors: { path: string, message: string, code?: string }[]) {
-        return new ValidationError(errors.map(v => new ValidationErrorItem(v.path, v.code || '', v.message)));
+    static from(errors: { path: string, message: string, code?: string, value?: any }[]) {
+        return new ValidationError(errors.map(v => new ValidationErrorItem(v.path, v.code || '', v.message, v.value)));
     }
 }
 

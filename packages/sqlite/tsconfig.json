@@ -1,4 +1,5 @@
 {
+  "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "forceConsistentCasingInFileNames": true,
     "strict": true,
@@ -14,13 +15,21 @@
     "esModuleInterop": true,
     "outDir": "./dist/cjs",
     "declaration": true,
-    "composite": true
+    "composite": true,
+    "types": [
+      "better-sqlite3"
+    ]
   },
+  "reflection": [
+    "tests/**/*.ts"
+  ],
   "include": [
     "benchmarks",
     "src",
-    "tests",
     "index.ts"
+  ],
+  "exclude": [
+    "tests"
   ],
   "references": [
     {

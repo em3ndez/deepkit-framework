@@ -1,4 +1,5 @@
 {
+  "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "forceConsistentCasingInFileNames": true,
     "strict": true,
@@ -8,18 +9,24 @@
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
     "moduleResolution": "node",
-    "target": "es2018",
+    "target": "es2021",
     "module": "CommonJS",
     "esModuleInterop": true,
     "baseUrl": ".",
     "outDir": "./dist/cjs",
     "declaration": true,
-    "composite": true
+    "composite": true,
+    "types": [
+      "dot-prop",
+      "node"
+    ]
   },
   "reflection": true,
   "include": [
     "src",
-    "index.ts",
+    "index.ts"
+  ],
+  "exclude": [
     "tests"
   ],
   "references": []

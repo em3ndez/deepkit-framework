@@ -1,21 +1,37 @@
 import * as ts from 'typescript';
-import { createSourceFile, ScriptTarget } from 'typescript';
+import { createSourceFile, ScriptKind, ScriptTarget } from 'typescript';
 import { expect, test } from '@jest/globals';
-import { ReflectionTransformer } from '../src/compiler';
-import { transform } from './utils';
+import { ReflectionTransformer } from '../src/compiler.js';
+import { transform, transpileAndRun } from './utils.js';
 
-test('transform simple', () => {
+test('transform simple TS', () => {
     const sourceFile = createSourceFile('app.ts', `
-        import { Logger } from './logger';
+        import { Logger } from './logger.js';
 
         function fn(logger: Logger) {}
-    `, ScriptTarget.ESNext);
+    `, ScriptTarget.ESNext, undefined, ScriptKind.TS);
 
-    const res = ts.transform(sourceFile, [(context) => (node) => new ReflectionTransformer(context).withReflectionMode('always').transformSourceFile(node)]);
+    const res = ts.transform(sourceFile, [(context) => (node) => new ReflectionTransformer(context).withReflection({reflection: 'default'}).transformSourceFile(node)]);
     const printer = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed });
     const code = printer.printNode(ts.EmitHint.SourceFile, res.transformed[0], res.transformed[0]);
 
-    console.log(code);
+    expect(code).toContain('fn.__type');
+});
+
+test('transform simple JS', () => {
+    const sourceFile = createSourceFile('app.ts', `
+        import { Logger } from './logger.js';
+        const a = (v) => {
+            return v + 1;
+        }
+        function fn(logger) {}
+    `, ScriptTarget.ESNext, undefined, ScriptKind.JS);
+
+    const res = ts.transform(sourceFile, [(context) => (node) => new ReflectionTransformer(context).withReflection({reflection: 'default'}).transformSourceFile(node)]);
+    const printer = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed });
+    const code = printer.printNode(ts.EmitHint.SourceFile, res.transformed[0], res.transformed[0]);
+
+    expect(code).not.toContain('fn.__type');
 });
 
 test('transform util', () => {
@@ -26,7 +42,7 @@ test('transform util', () => {
 test('resolve import ts', () => {
     const res = transform({
         'app': `
-            import { Logger } from './logger';
+            import { Logger } from './logger.js';
             function fn(logger: Logger) {}
         `,
         'logger': `export class Logger {}`
@@ -40,7 +56,7 @@ test('resolve import ts', () => {
 test('resolve import d.ts', () => {
     const res = transform({
         'app': `
-            import { Logger } from './logger';
+            import { Logger } from './logger.js';
             function fn(logger: Logger) {}
         `,
         'logger.d.ts': `export declare class Logger {}`
@@ -85,6 +101,7 @@ test('pass type argument arrow function', () => {
         `
     });
 
+    // compiles, but type does not receive anything
     console.log(res);
 });
 
@@ -109,4 +126,132 @@ test('class expression', () => {
     });
 
     expect(res.app).toContain('static __type = [');
+});
+
+test('export default function', () => {
+    const res = transform({
+        'app': `
+            export default function(bar: string) {
+                return bar;
+            }
+        `
+    });
+
+    expect(res.app).toContain('export default __assignType(function (bar: string');
+});
+
+test('export default async function', () => {
+    const res = transform({
+        'app': `
+            export default async function(bar: string) {
+                return bar;
+            }
+        `
+    });
+
+    expect(res.app).toContain('export default __assignType(async function (bar: string');
+});
+
+test('default function name', () => {
+    const res = transform({
+        'app': `
+            const a = {
+                default(val: any): any {
+                    console.log('default',val)
+                    return 'default'
+                }
+            };
+        `
+    });
+
+    //`function default(` is invalid syntax.
+    //as solution we skip that transformation.
+    expect(res.app).not.toContain('function default(');
+});
+
+test('declaration file', () => {
+    const res = transform({
+        'app.ts': `
+            import { T } from './types';
+
+            typeOf<T>();
+        `,
+        'types.d.ts': `
+            export type T = string;
+            export type __ΩT = any[];
+        `
+    });
+
+    expect(res['app.ts']).toContain('import { __ΩT } from \'./types');
+});
+
+test('declaration file resolved export all', () => {
+    const res = transform({
+        'app.ts': `
+            import { T } from './module';
+            typeOf<T>();
+        `,
+        'module.d.ts': `
+            export * from './module/types';
+        `,
+        'module/types.d.ts': `
+            export type T = string;
+            export type __ΩT = any[];
+        `
+    });
+
+    expect(res['app.ts']).toContain('import { __ΩT } from \'./module');
+});
+
+test('import typeOnly interface', () => {
+    const res = transform({
+        'app.ts': `
+            import type { Cache } from './module';
+            return typeOf<Cache>();
+        `,
+        'module.d.ts': `
+            export interface Cache {
+            }
+        `
+    });
+
+    //make sure OP.typeName with its type name is emitted
+    expect(res['app.ts']).toContain(`['Cache',`);
+});
+
+test('import typeOnly class', () => {
+    const res = transform({
+        'app.ts': `
+            import type { Cache } from './module';
+            typeOf<Cache>();
+        `,
+        'module.d.ts': `
+            export declare class Cache {
+            }
+        `
+    });
+
+    //make sure OP.typeName with its type name is emitted
+    expect(res['app.ts']).toContain(`['Cache',`);
+});
+
+
+test('reexport existing', () => {
+    const res = transform({
+        'app.ts': `
+            import { Cache } from './module';
+            typeOf<Cache>();
+        `,
+        'module.ts': `
+            import { Cache } from './class';
+
+            export { Cache }
+        `,
+        'class.ts': `
+            export class Cache {}
+        `
+    });
+
+    //make sure OP.typeName with its type name is emitted
+    expect(res['app.ts']).toContain(`() => Cache`);
 });

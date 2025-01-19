@@ -8,11 +8,26 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { AfterViewInit, ChangeDetectorRef, Component, ContentChild, ElementRef, EventEmitter, Input, OnChanges, Output, SimpleChanges, ViewChild } from '@angular/core';
-import { WindowSidebarComponent } from './window-sidebar.component';
+import {
+    AfterViewInit,
+    ChangeDetectorRef,
+    Component,
+    ElementRef,
+    EventEmitter,
+    Input,
+    OnChanges,
+    Output,
+    SimpleChanges,
+    TemplateRef,
+    ViewChild,
+} from '@angular/core';
 import { Subject } from 'rxjs';
 import { WindowState } from './window-state';
 import { triggerResize } from '../../core/utils';
+
+interface WinSidebar {
+    template: TemplateRef<any>;
+}
 
 @Component({
     selector: 'dui-window-content',
@@ -57,7 +72,7 @@ export class WindowContentComponent implements OnChanges, AfterViewInit {
 
     @Output() sidebarWidthChange = new EventEmitter<number>();
 
-    @ContentChild(WindowSidebarComponent, { static: false }) toolbar?: WindowSidebarComponent;
+    toolbar?: WinSidebar;
 
     @ViewChild('sidebar', { static: false }) public sidebar?: ElementRef<HTMLElement>;
     @ViewChild('sidebarContainer', { static: false }) public sidebarContainer?: ElementRef<HTMLElement>;
@@ -84,10 +99,23 @@ export class WindowContentComponent implements OnChanges, AfterViewInit {
         }
     }
 
+    unregisterSidebar(sidebar: WinSidebar) {
+        if (this.toolbar === sidebar) {
+            this.toolbar = undefined;
+            setTimeout(() => this.sidebarMoved(), 0);
+        }
+    }
+
+    registerSidebar(sidebar: WinSidebar) {
+        this.toolbar = sidebar;
+        setTimeout(() => this.sidebarMoved(), 0);
+    }
+
     sidebarMoved() {
         if (this.windowState.buttonGroupAlignedToSidebar) {
             this.windowState.buttonGroupAlignedToSidebar.sidebarMoved();
         }
+        this.sidebarWidthChange.next(this.sidebarWidth);
         triggerResize();
         this.cd.detectChanges();
     }

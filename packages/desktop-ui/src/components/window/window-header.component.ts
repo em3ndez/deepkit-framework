@@ -8,18 +8,7 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import {
-    ChangeDetectorRef,
-    Component,
-    ElementRef,
-    HostBinding,
-    Input,
-    OnDestroy,
-    OnInit,
-    SkipSelf,
-    TemplateRef,
-    ViewChild
-} from '@angular/core';
+import { ChangeDetectorRef, Component, ElementRef, HostBinding, Input, OnDestroy, OnInit, SkipSelf, TemplateRef, ViewChild } from '@angular/core';
 import { WindowState } from './window-state';
 import { Electron } from '../../core/utils';
 
@@ -68,7 +57,7 @@ export class WindowHeaderComponent implements OnDestroy {
         @SkipSelf() protected cdParent: ChangeDetectorRef,
         protected element: ElementRef,
     ) {
-        windowState.header = this;
+        this.windowState = windowState;
     }
 
     ngOnDestroy() {
@@ -147,6 +136,9 @@ export class WindowToolbarContainerComponent implements OnInit, OnDestroy {
     }
 
     ngOnInit() {
+        if (this.windowState.toolbarContainers[this.name] && this.name === 'default') {
+            console.warn(`You have multiple <dui-window-toolbar-container> with no name. This is not allowed.`);
+        }
         this.windowState.toolbarContainers[this.name] = this;
     }
 

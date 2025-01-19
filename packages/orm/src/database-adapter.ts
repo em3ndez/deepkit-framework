@@ -8,11 +8,29 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { OrmEntity } from './type';
-import { AbstractClassType, arrayRemoveItem, ClassType, getClassName, getClassTypeFromInstance, isClass, stringifyValueWithType } from '@deepkit/core';
-import { is, isSameType, ItemChanges, PrimaryKeyFields, ReceiveType, ReflectionClass, ReflectionKind, stringifyType, Type } from '@deepkit/type';
-import { Query } from './query';
-import { DatabaseSession, DatabaseTransaction } from './database-session';
+import { OrmEntity } from './type.js';
+import {
+    AbstractClassType,
+    arrayRemoveItem,
+    ClassType,
+    getClassName,
+    getClassTypeFromInstance,
+    isClass,
+    stringifyValueWithType,
+} from '@deepkit/core';
+import {
+    is,
+    isSameType,
+    ItemChanges,
+    PrimaryKeyFields,
+    ReceiveType,
+    ReflectionClass,
+    ReflectionKind,
+    stringifyType,
+    Type,
+} from '@deepkit/type';
+import { Query } from './query.js';
+import { DatabaseSession, DatabaseTransaction } from './database-session.js';
 
 export abstract class DatabaseAdapterQueryFactory {
     abstract createQuery<T extends OrmEntity>(type?: ReceiveType<T> | ClassType<T> | AbstractClassType<T> | ReflectionClass<T>): Query<T>;
@@ -39,8 +57,49 @@ export abstract class DatabasePersistence {
 }
 
 export class RawFactory<A extends Array<any>> {
-    create(...args: A): any {
+    create<T = any>(...args: A): any {
         throw new Error(`Current database adapter does not support raw mode.`);
+    }
+}
+
+export class MigrateOptions {
+    /**
+     * Whether drop statements should be issued, like DROP TABLE, DROP INDEX, etc.
+     *
+     * Default false.
+     */
+    drop: boolean = false;
+
+    /**
+     * Whether drop statements should be issued for indexes/uniques, like DROP INDEX.
+     */
+    dropIndex: boolean = false;
+
+    /**
+     * Whether create/drop statements should be issued for indexes/uniques, like CREATE/ INDEX/DROP INDEX.
+     */
+    skipIndex: boolean = false;
+
+    /**
+     * Whether foreign key constraints should be created/dropped.
+     */
+    skipForeignKey: boolean = false;
+
+    isDropIndex() {
+        if (this.skipIndex) return false;
+        return this.skipIndex || this.dropIndex || this.drop;
+    }
+
+    isIndex() {
+        return !this.skipIndex;
+    }
+
+    isForeignKey() {
+        return !this.skipForeignKey;
+    }
+
+    isDropSchema() {
+        return this.drop;
     }
 }
 
@@ -62,8 +121,11 @@ export abstract class DatabaseAdapter {
 
     abstract disconnect(force?: boolean): void;
 
-    abstract migrate(entityRegistry: DatabaseEntityRegistry): Promise<void>;
+    abstract migrate(options: MigrateOptions, entityRegistry: DatabaseEntityRegistry): Promise<void>;
 
+    /**
+     * Unique adapter name to be used in DatabaseField to apply certain adapter specific behavior per field.
+     */
     abstract getName(): string;
 
     abstract getSchemaName(): string;
@@ -79,12 +141,20 @@ export abstract class DatabaseAdapter {
  * We need to do type comparison to get always the correct (registered) ReflectionClass.
  */
 export class DatabaseEntityRegistry {
-    public readonly entities: ReflectionClass<any>[] = [];
+    protected entities: ReflectionClass<any>[] = [];
 
     static from(items: (Type | ReflectionClass<any> | ClassType)[]) {
         const e = new DatabaseEntityRegistry();
         e.add(...items);
         return e;
+    }
+
+    all(): ReflectionClass<any>[] {
+        return this.entities;
+    }
+
+    forMigration(): ReflectionClass<any>[] {
+        return this.entities.filter(v => !v.data['excludeMigration']);
     }
 
     add(...types: (Type | ReflectionClass<any> | ClassType)[]): void {
@@ -109,7 +179,7 @@ export class DatabaseEntityRegistry {
             }
 
         } else {
-            //its a regular class
+            //it's a regular class
             return ReflectionClass.from(getClassTypeFromInstance(item));
         }
 
@@ -129,8 +199,13 @@ export class DatabaseEntityRegistry {
             throw new Error(`Only TypeClass|TypeObjectLiteral expected, but got kind ${type.kind}`);
         }
 
+        // exact matches or nominal type match have priority
         for (const entity of this.entities) {
             if (entity.type === type) return entity;
+            if (entity.type.id === type.id) return entity;
+        }
+
+        for (const entity of this.entities) {
             if (type.kind === ReflectionKind.class && entity.type.kind === ReflectionKind.class) {
                 if (type.classType === entity.type.classType) {
                     //if both don't use generic, return directly

@@ -9,7 +9,7 @@
  */
 
 import { ControllerSymbol } from '@deepkit/rpc';
-import { DebugRequest } from './model';
+import { DebugRequest, MediaFile } from './model.js';
 import { Subject } from 'rxjs';
 import { deserializeType, entity, Excluded, Type } from '@deepkit/type';
 
@@ -39,6 +39,13 @@ export class Database {
     adapter!: string;
 
     entities: DatabaseEntity[] = [];
+}
+
+@entity.name('.deepkit/debugger/filesystem')
+export class Filesystem {
+    name!: string;
+    adapter!: string;
+    options: { [name: string]: any } = {};
 }
 
 @entity.name('.deepkit/debugger/config')
@@ -175,6 +182,30 @@ export class ModuleApi {
     }
 }
 
+export const DebugMediaInterface = ControllerSymbol<DebugMediaInterface>('.deepkit/debug/media', [MediaFile]);
+
+export interface DebugMediaInterface {
+    getPublicUrl(fs: number, path: string): Promise<string>;
+
+    createFolder(fs: number, path: string): Promise<void>;
+
+    getFile(fs: number, path: string): Promise<MediaFile | false>;
+
+    getFiles(fs: number, path: string): Promise<MediaFile[]>;
+
+    // getMediaPreview(fs: number, path: string): Promise<{ file: MediaFile, data: Uint8Array } | false>;
+
+    getMediaQuickLook(fs: number, path: string): Promise<{ file: MediaFile, data: Uint8Array } | false>;
+
+    getMediaData(fs: number, path: string): Promise<Uint8Array | false>;
+
+    renameFile(fs: number, path: string, newName: string): Promise<string>;
+
+    addFile(fs: number, name: string, dir: string, data: Uint8Array): Promise<void>;
+
+    remove(fs: number, paths: string[]): Promise<void>;
+}
+
 export const DebugControllerInterface = ControllerSymbol<DebugControllerInterface>('.deepkit/debug/controller', [Config, Database, Route, RpcAction, Workflow, Event, DebugRequest]);
 
 export interface DebugControllerInterface {
@@ -186,6 +217,8 @@ export interface DebugControllerInterface {
 
     databases(): Database[];
 
+    filesystems(): Filesystem[];
+
     routes(): Route[];
 
     modules(): ModuleApi;
@@ -194,11 +227,13 @@ export interface DebugControllerInterface {
 
     getWorkflow(name: string): Workflow;
 
-    getProfilerFrames(): [Uint8Array, Uint8Array];
+    getProfilerFrames(): [Uint8Array, Uint8Array, Uint8Array];
 
     resetProfilerFrames(): void;
 
     events(): Event[];
+
+    httpRequests(): DebugRequest[];
 
     // httpRequests(): Promise<Collection<DebugRequest>>;
 }

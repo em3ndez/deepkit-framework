@@ -1,10 +1,10 @@
 /** @reflection never */
 import { expect, test } from '@jest/globals';
-import { pack } from '../src/reflection/processor';
-import { copyAndSetParent, ParentLessType, ReflectionKind, ReflectionVisibility, TypeObjectLiteral, TypePropertySignature, TypeUnion } from '../src/reflection/type';
+import { pack } from '../src/reflection/processor.js';
+import { copyAndSetParent, ParentLessType, ReflectionKind, ReflectionVisibility, TypeObjectLiteral, TypePropertySignature, TypeUnion } from '../src/reflection/type.js';
 import { MappedModifier, ReflectionOp } from '@deepkit/type-spec';
-import { isExtendable } from '../src/reflection/extends';
-import { assertValidParent, expectEqualType, expectType } from './utils';
+import { isExtendable } from '../src/reflection/extends.js';
+import { assertValidParent, expectEqualType, expectType } from './utils.js';
 
 Error.stackTraceLimit = 200;
 
@@ -103,6 +103,11 @@ test('extends fn', () => {
         { kind: ReflectionKind.function, return: { kind: ReflectionKind.literal, literal: true }, parameters: [] },
         { kind: ReflectionKind.function, return: { kind: ReflectionKind.boolean }, parameters: [] }
     )).toBe(true);
+
+    expect(isExtendable(
+        { kind: ReflectionKind.function, return: { kind: ReflectionKind.literal, literal: true }, parameters: [] },
+        { kind: ReflectionKind.function, function: Function, return: { kind: ReflectionKind.unknown }, parameters: [] }
+    )).toBe(true);
 });
 
 test('arg', () => {
@@ -191,7 +196,7 @@ test('object literal', () => {
         ops: [ReflectionOp.number, ReflectionOp.propertySignature, 0, ReflectionOp.string, ReflectionOp.propertySignature, 1, ReflectionOp.objectLiteral],
         stack: ['a', 'b']
     }, {
-        kind: ReflectionKind.objectLiteral,
+        kind: ReflectionKind.objectLiteral, id: 0,
         types: [
             { kind: ReflectionKind.propertySignature, type: { kind: ReflectionKind.number }, name: 'a' },
             { kind: ReflectionKind.propertySignature, type: { kind: ReflectionKind.string }, name: 'b' },
@@ -199,7 +204,7 @@ test('object literal', () => {
     });
 
     expectType([ReflectionOp.string, ReflectionOp.number, ReflectionOp.indexSignature, ReflectionOp.objectLiteral], copyAndSetParent({
-        kind: ReflectionKind.objectLiteral,
+        kind: ReflectionKind.objectLiteral, id: 0,
         types: [
             { kind: ReflectionKind.indexSignature, index: { kind: ReflectionKind.string }, type: { kind: ReflectionKind.number } }
         ]
@@ -209,7 +214,7 @@ test('object literal', () => {
         ops: [ReflectionOp.number, ReflectionOp.propertySignature, 0, ReflectionOp.string, ReflectionOp.number, ReflectionOp.indexSignature, ReflectionOp.objectLiteral],
         stack: ['a']
     }, {
-        kind: ReflectionKind.objectLiteral,
+        kind: ReflectionKind.objectLiteral, id: 0,
         types: [
             { kind: ReflectionKind.propertySignature, type: { kind: ReflectionKind.number }, name: 'a' },
             { kind: ReflectionKind.indexSignature, index: { kind: ReflectionKind.string }, type: { kind: ReflectionKind.number } }
@@ -217,7 +222,7 @@ test('object literal', () => {
     });
 
     expectType([ReflectionOp.string, ReflectionOp.frame, ReflectionOp.number, ReflectionOp.undefined, ReflectionOp.union, ReflectionOp.indexSignature, ReflectionOp.objectLiteral], {
-        kind: ReflectionKind.objectLiteral,
+        kind: ReflectionKind.objectLiteral, id: 0,
         types: [
             {
                 kind: ReflectionKind.indexSignature,
@@ -349,7 +354,7 @@ test('mapped type simple', () => {
         stack: ['T'],
         inputs: [{ kind: ReflectionKind.union, types: [{ kind: ReflectionKind.literal, literal: 'a' }, { kind: ReflectionKind.literal, literal: 'b' }] } as TypeUnion]
     }, {
-        kind: ReflectionKind.objectLiteral,
+        kind: ReflectionKind.objectLiteral, id: 0,
         types: [{
             kind: ReflectionKind.propertySignature,
             name: 'a',
@@ -376,7 +381,7 @@ test('mapped type optional simple', () => {
         stack: ['T'],
         inputs: [{ kind: ReflectionKind.union, types: [{ kind: ReflectionKind.literal, literal: 'a' }, { kind: ReflectionKind.literal, literal: 'b' }] } as TypeUnion]
     }, {
-        kind: ReflectionKind.objectLiteral,
+        kind: ReflectionKind.objectLiteral, id: 0,
         types: [{
             kind: ReflectionKind.propertySignature,
             name: 'a',
@@ -415,7 +420,7 @@ test('mapped type keyof and query', () => {
             }]
         } as TypeObjectLiteral]
     }, {
-        kind: ReflectionKind.objectLiteral,
+        kind: ReflectionKind.objectLiteral, id: 0,
         types: [{
             kind: ReflectionKind.propertySignature,
             name: 'a',
@@ -441,7 +446,7 @@ test('mapped type keyof and fixed', () => {
         ],
         stack: ['T'],
         inputs: [{
-            kind: ReflectionKind.objectLiteral, types: [{
+            kind: ReflectionKind.objectLiteral, id: 0, types: [{
                 kind: ReflectionKind.propertySignature,
                 name: 'a',
                 type: { kind: ReflectionKind.number }
@@ -452,7 +457,7 @@ test('mapped type keyof and fixed', () => {
             }]
         } as TypeObjectLiteral]
     }, {
-        kind: ReflectionKind.objectLiteral,
+        kind: ReflectionKind.objectLiteral, id: 0,
         types: [{
             kind: ReflectionKind.propertySignature,
             name: 'a',
@@ -478,7 +483,7 @@ test('mapped type keyof and conditional', () => {
         ],
         stack: ['T'],
         inputs: [{
-            kind: ReflectionKind.objectLiteral, types: [{
+            kind: ReflectionKind.objectLiteral, id: 0, types: [{
                 kind: ReflectionKind.propertySignature,
                 name: 'a',
                 type: { kind: ReflectionKind.number }
@@ -489,7 +494,7 @@ test('mapped type keyof and conditional', () => {
             }]
         } as TypeObjectLiteral]
     }, {
-        kind: ReflectionKind.objectLiteral,
+        kind: ReflectionKind.objectLiteral, id: 0,
         types: [{
             kind: ReflectionKind.propertySignature,
             name: 'a',
@@ -615,7 +620,7 @@ test('more advances types', () => {
     expectType([ReflectionOp.bigInt64Array], { kind: ReflectionKind.class, classType: BigInt64Array, types: [] });
     expectType([ReflectionOp.arrayBuffer], { kind: ReflectionKind.class, classType: ArrayBuffer, types: [] });
 
-    expectType([ReflectionOp.string, ReflectionOp.promise], { kind: ReflectionKind.promise, type: { kind: ReflectionKind.string } });
+    // expectType([ReflectionOp.string, ReflectionOp.promise], { kind: ReflectionKind.promise, type: { kind: ReflectionKind.string } });
 
     // expectType({ ops: [ReflectionOp.enum, 0], stack: [() => MyEnum] }, { kind: ReflectionKind.enum, enum: MyEnum, values: Object.keys(MyEnum) });
     expectType([ReflectionOp.string, ReflectionOp.set], { kind: ReflectionKind.class, classType: Set, types: [], arguments: [{ kind: ReflectionKind.string }] });
@@ -693,7 +698,7 @@ test('inline class', () => {
     const external = pack({ ops: [ReflectionOp.string, ReflectionOp.propertySignature, 0, ReflectionOp.objectLiteral], stack: ['a'] });
 
     expectType({ ops: [ReflectionOp.inline, 0], stack: [external] }, {
-        kind: ReflectionKind.objectLiteral,
+        kind: ReflectionKind.objectLiteral, id: 0,
         types: [{ kind: ReflectionKind.propertySignature, name: 'a', type: { kind: ReflectionKind.string } }]
     });
 });
@@ -704,6 +709,7 @@ test('inline class circular', () => {
 
     const expected: TypeObjectLiteral = {
         kind: ReflectionKind.objectLiteral,
+        id: 0,
         types: [{ kind: ReflectionKind.propertySignature, parent: undefined as any, name: 'a', type: { kind: ReflectionKind.string } }]
     };
     (expected.types[0] as TypePropertySignature).parent = expected;

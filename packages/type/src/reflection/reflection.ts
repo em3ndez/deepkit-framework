@@ -48,9 +48,20 @@ import {
     TypeParameter,
     TypeProperty,
     TypePropertySignature,
-    TypeTemplateLiteral
+    TypeTemplateLiteral,
 } from './type.js';
-import { AbstractClassType, arrayRemoveItem, ClassType, getClassName, isArray, isClass, stringifyValueWithType } from '@deepkit/core';
+import {
+    AbstractClassType,
+    arrayRemoveItem,
+    ClassType,
+    getClassName,
+    isArray,
+    isClass,
+    isFunction,
+    isGlobalClass,
+    isPrototypeOfBase,
+    stringifyValueWithType,
+} from '@deepkit/core';
 import { Packed, resolvePacked, resolveRuntimeType } from './processor.js';
 import { NoTypeReceived } from '../utils.js';
 import { findCommonLiteral } from '../inheritance.js';
@@ -75,15 +86,51 @@ export type ReceiveType<T> = Packed | Type | ClassType<T>;
 
 export function resolveReceiveType(type?: Packed | Type | ClassType | AbstractClassType | ReflectionClass<any>): Type {
     if (!type) throw new NoTypeReceived();
+    let typeFn: Function | undefined = undefined;
+
+    if (isArray(type)) {
+        if (type.__type) return type.__type;
+        // this is fast path for simple references to a type, e.g. cast<User>(), so that User is directly handled
+        // instead of running the VM to resolve to User first.
+        if (type[type.length - 1] === 'n!' || type[type.length - 1] === 'P7!') {
+            //n! represents a simple inline: [Op.inline, 0]
+            //P7! represents a class reference: [Op.Frame, Op.classReference, 0] (Op.Frame seems unnecessary)
+            typeFn = (type as any)[0] as Function | any;
+            type = (isFunction(typeFn) ? typeFn() : typeFn) as Packed | Type | ClassType | AbstractClassType | ReflectionClass<any> | undefined;
+            if (!type) {
+                throw new Error(`No type resolved for ${String(typeFn)}. Circular import or no runtime type available.`);
+            }
+        }
+    }
+
     if (type instanceof ReflectionClass) return type.type;
     if (isArray(type) && type.__type) return type.__type;
     if (isType(type)) return type as Type;
-    if (isClass(type)) return resolveRuntimeType(type) as Type;
-    return resolvePacked(type);
+    if (isClass(type) || isGlobalClass(type)) {
+        if (!('__type' in type)) {
+            if ((type as any).__cached_type) return (type as any).__cached_type;
+            // disabled reflection for this class, so we return shallow TypeClass
+            return (type as any).__cached_type = {
+                kind: ReflectionKind.class,
+                classType: type as any,
+                types: [],
+            } as any;
+        }
+        return resolveRuntimeType(type) as Type;
+    }
+    return resolvePacked(type, undefined, { reuseCached: true });
 }
 
 export function reflect(o: any, ...args: any[]): Type {
     return resolveRuntimeType(o, args) as Type;
+}
+
+export function reflectOrUndefined(o: any, ...args: any[]): Type | undefined {
+    try {
+        return resolveRuntimeType(o, args) as Type;
+    } catch (error: any) {
+        return undefined;
+    }
 }
 
 export function valuesOf<T>(args: any[] = [], p?: ReceiveType<T>): (string | number | symbol | Type)[] {
@@ -120,19 +167,38 @@ export function propertiesOf<T>(args: any[] = [], p?: ReceiveType<T>): (string |
     return [];
 }
 
+export function getNominalId<T>(args: any[] = [], p?: ReceiveType<T>): number | undefined {
+    const t = typeOf(args, p);
+    if (t.kind === ReflectionKind.class || t.kind === ReflectionKind.objectLiteral) return t.id;
+    return;
+}
+
 export function typeOf<T>(args: any[] = [], p?: ReceiveType<T>): Type {
     if (p) {
-        return resolveRuntimeType(p, args) as Type;
+        return args.length > 0 ? resolveRuntimeType(p, args) : resolveReceiveType(p) as Type;
     }
 
     throw new Error('No type given');
 }
 
-export function removeTypeName<T extends Type>(type: T): Omit<T, 'typeName' | 'typeArguments'> {
+export function removeTypeName<T extends Type>(type: T): T {
     const o = { ...type };
-    if ('typeName' in o) delete o.typeName;
-    if ('typeArguments' in o) delete o.typeArguments;
+    o.id = undefined;
+    o.typeName = undefined;
+    o.typeArguments = undefined;
     return o;
+}
+
+export function removeNominal<T extends Type | undefined | Type[]>(type: T): T {
+    if (!type) return type;
+    if (isArray(type)) {
+        return type.map(v => removeNominal(v)) as T;
+    } else {
+        if (type.kind === ReflectionKind.class || type.kind === ReflectionKind.objectLiteral) {
+            return { ...type, id: undefined };
+        }
+    }
+    return type;
 }
 
 export function getProperty(type: TypeObjectLiteral | TypeClass, memberName: number | string | symbol): TypeProperty | TypePropertySignature | undefined {
@@ -165,9 +231,19 @@ export function hasCircularReference(type: Type) {
 
 let visitStackId: number = 0;
 
-export function visit(type: Type, visitor: (type: Type) => false | void, onCircular?: () => void): void {
-    const stack: { type: Type, depth: number }[] = [];
-    stack.push({ type, depth: 0 });
+function extendPath(path: string, member: Type): string {
+    let name: string | number | symbol | undefined = '';
+    if ('name' in member) {
+        name = member.name;
+    }
+    if (name === '' || name === undefined) return path;
+    if (path) return path + '.' + String(name);
+    return String(name);
+}
+
+export function visit(type: Type, visitor: (type: Type, path: string) => false | void, onCircular?: () => void): void {
+    const stack: { type: Type, depth: number, path: string }[] = [];
+    stack.push({ type, depth: 0, path: '' });
     const stackId: number = visitStackId++;
 
     while (stack.length) {
@@ -181,7 +257,7 @@ export function visit(type: Type, visitor: (type: Type) => false | void, onCircu
             return;
         }
         jit.visitStack = { id: stackId, depth: entry.depth };
-        visitor(type);
+        if (visitor(type, entry.path) === false) return;
 
         switch (type.kind) {
             case ReflectionKind.objectLiteral:
@@ -190,7 +266,11 @@ export function visit(type: Type, visitor: (type: Type) => false | void, onCircu
             case ReflectionKind.class:
             case ReflectionKind.intersection:
             case ReflectionKind.templateLiteral:
-                for (const member of type.types) stack.push({ type: member, depth: entry.depth + 1 });
+                for (const member of type.types) stack.push({
+                    type: member,
+                    depth: entry.depth + 1,
+                    path: extendPath(entry.path, member),
+                });
                 break;
             case ReflectionKind.string:
             case ReflectionKind.number:
@@ -198,13 +278,17 @@ export function visit(type: Type, visitor: (type: Type) => false | void, onCircu
             case ReflectionKind.symbol:
             case ReflectionKind.regexp:
             case ReflectionKind.boolean:
-                if (type.origin) stack.push({ type: type.origin, depth: entry.depth + 1 });
+                if (type.origin) stack.push({ type: type.origin, depth: entry.depth + 1, path: entry.path });
                 break;
             case ReflectionKind.function:
             case ReflectionKind.method:
             case ReflectionKind.methodSignature:
-                stack.push({ type: type.return, depth: entry.depth + 1 });
-                for (const member of type.parameters) stack.push({ type: member, depth: entry.depth + 1 });
+                stack.push({ type: type.return, depth: entry.depth + 1, path: entry.path });
+                for (const member of type.parameters) stack.push({
+                    type: member,
+                    depth: entry.depth + 1,
+                    path: extendPath(entry.path, member),
+                });
                 break;
             case ReflectionKind.propertySignature:
             case ReflectionKind.property:
@@ -213,11 +297,11 @@ export function visit(type: Type, visitor: (type: Type) => false | void, onCircu
             case ReflectionKind.parameter:
             case ReflectionKind.tupleMember:
             case ReflectionKind.rest:
-                stack.push({ type: type.type, depth: entry.depth + 1 });
+                stack.push({ type: type.type, depth: entry.depth + 1, path: entry.path });
                 break;
             case ReflectionKind.indexSignature:
-                stack.push({ type: type.index, depth: entry.depth + 1 });
-                stack.push({ type: type.type, depth: entry.depth + 1 });
+                stack.push({ type: type.index, depth: entry.depth + 1, path: entry.path });
+                stack.push({ type: type.type, depth: entry.depth + 1, path: entry.path });
                 break;
         }
     }
@@ -240,6 +324,9 @@ function hasFunctionExpression(fn: Function): boolean {
     return code.includes('(');
 }
 
+/**
+ * @reflection never
+ */
 export class ReflectionParameter {
     type: Type;
 
@@ -310,10 +397,31 @@ export class ReflectionParameter {
     isPrivate(): boolean {
         return this.parameter.visibility === ReflectionVisibility.private;
     }
+
+    isReadonly(): boolean {
+        return this.parameter.readonly === true;
+    }
+
+    /**
+     * True if the parameter becomes a property in the class.
+     * This is the case for parameters in constructors with visibility or readonly.
+     *
+     * ```typescript
+     * class User {
+     *    constructor(public name: string) {}
+     * }
+     */
+    isProperty(): boolean {
+        return this.parameter.readonly === true || this.parameter.visibility !== undefined;
+    }
 }
 
+/**
+ * @reflection never
+ */
 export class ReflectionFunction {
     parameters: ReflectionParameter[] = [];
+    description: string = '';
 
     constructor(
         public readonly type: TypeMethod | TypeMethodSignature | TypeFunction,
@@ -321,6 +429,7 @@ export class ReflectionFunction {
         for (const p of this.type.parameters) {
             this.parameters.push(new ReflectionParameter(p, this));
         }
+        if (this.type.description) this.description = this.type.description;
     }
 
     static from(fn: Function): ReflectionFunction {
@@ -328,7 +437,12 @@ export class ReflectionFunction {
 
         if (!('__type' in fn)) {
             //functions without any types have no __type attached
-            return new ReflectionFunction({ kind: ReflectionKind.function, function: fn, return: { kind: ReflectionKind.any }, parameters: [] });
+            return new ReflectionFunction({
+                kind: ReflectionKind.function,
+                function: fn,
+                return: { kind: ReflectionKind.any },
+                parameters: [],
+            });
         }
 
         const type = reflect(fn);
@@ -377,11 +491,18 @@ export class ReflectionFunction {
         return this.type.name || 'anonymous';
     }
 
+    getDescription(): string {
+        return this.description;
+    }
+
     get name(): string {
         return memberNameToString(this.getName());
     }
 }
 
+/**
+ * @reflection never
+ */
 export class ReflectionMethod extends ReflectionFunction {
     /**
      * Whether this method acts as validator.
@@ -444,6 +565,9 @@ export function resolveClassType(type: Type): ReflectionClass<any> {
     return ReflectionClass.from(type);
 }
 
+/**
+ * @reflection never
+ */
 export class ReflectionProperty {
     //is this really necessary?
     jsonType?: Type;
@@ -453,9 +577,19 @@ export class ReflectionProperty {
 
     data: { [name: string]: any } = {};
 
+    /**
+     * The type of the property, not the property itself.
+     *
+     * Note: If the property is optional via `property?: T`, this information
+     * is not available here. It's on `property`.
+     * Use `isOptional()` instead, which handles this case plus the case
+     * where optionality is given via union of T and undefined.
+     */
     type: Type;
 
     symbol: symbol;
+
+    protected cachedResolvedReflectionClass?: ReflectionClass<any>;
 
     constructor(
         public property: TypeProperty | TypePropertySignature,
@@ -500,6 +634,14 @@ export class ReflectionProperty {
         return isBackReferenceType(this.getType());
     }
 
+    isDatabaseSkipped(database: string): boolean {
+        return databaseAnnotation.getDatabase(this.getType(), database)?.skip === true;
+    }
+
+    isDatabaseMigrationSkipped(database: string): boolean {
+        return this.isDatabaseSkipped(database) || databaseAnnotation.getDatabase(this.getType(), database)?.skipMigration === true;
+    }
+
     getBackReference(): BackReferenceOptionsResolved {
         return getBackReferenceType(this.getType());
     }
@@ -536,6 +678,10 @@ export class ReflectionProperty {
         return groupAnnotation.getAnnotations(this.getType());
     }
 
+    isInGroup(...group: string[]): boolean {
+        return this.getGroups().some(v => group.includes(v));
+    }
+
     getExcluded(): string[] {
         return excludedAnnotation.getAnnotations(this.getType());
     }
@@ -557,7 +703,7 @@ export class ReflectionProperty {
         if (this.type.kind !== ReflectionKind.class && this.type.kind !== ReflectionKind.objectLiteral) {
             throw new Error(`Could not resolve reflection class since ${this.name} is not a class|object but of type ${stringifyType(this.type)}`);
         }
-        return resolveClassType(this.getType());
+        return this.cachedResolvedReflectionClass ||= resolveClassType(this.getType());
     }
 
     /**
@@ -840,6 +986,7 @@ export class ReflectionClass<T> {
             this.name = parent.name;
             this.collectionName = parent.collectionName;
             this.databaseSchemaName = parent.databaseSchemaName;
+            this.description = parent.description;
 
             for (const member of parent.getProperties()) {
                 this.registerProperty(member.clone(this));
@@ -857,6 +1004,7 @@ export class ReflectionClass<T> {
         if (entityOptions) {
             applyEntityOptions(this, entityOptions);
         }
+        this.description = this.type.description || this.description;
 
         //apply decorators
         if (type.kind === ReflectionKind.class && isWithDeferredDecorators(type.classType)) {
@@ -893,6 +1041,7 @@ export class ReflectionClass<T> {
         reflection.indexes = this.indexes.slice();
         reflection.subClasses = this.subClasses.slice();
         reflection.data = { ...this.data };
+        reflection.description = this.description;
 
         return reflection;
     }
@@ -921,7 +1070,7 @@ export class ReflectionClass<T> {
     }
 
     getClassName(): string {
-        return this.type.kind === ReflectionKind.class ? getClassName(this.getClassType()) : this.type.typeName || 'Object';
+        return this.type.kind === ReflectionKind.class ? this.type.typeName || getClassName(this.getClassType()) : this.type.typeName || 'Object';
     }
 
     createDefaultObject(): object {
@@ -934,6 +1083,10 @@ export class ReflectionClass<T> {
 
     getName(): string {
         return this.name || this.getClassName();
+    }
+
+    getDescription(): string {
+        return this.description;
     }
 
     getCollectionName(): string {
@@ -960,16 +1113,8 @@ export class ReflectionClass<T> {
     }
 
     public isSchemaOf(classType: ClassType): boolean {
-        if (this.getClassType() === classType) return true;
-        let currentProto = Object.getPrototypeOf(this.getClassType().prototype);
-        while (currentProto && currentProto !== Object.prototype) {
-            if (currentProto === classType) return true;
-            currentProto = Object.getPrototypeOf(currentProto);
-        }
-
-        return false;
+        return isPrototypeOfBase(this.getClassType(), classType);
     }
-
 
     hasPrimary(): boolean {
         return this.primaries.length > 0;
@@ -989,7 +1134,6 @@ export class ReflectionClass<T> {
     removeProperty(name: string | number | symbol) {
         const property = this.properties.find(v => v.getName() === name);
         if (!property) throw new Error(`Property ${String(name)} not known in ${this.getClassName()}`);
-        ;
 
         const stringName = memberNameToString(name);
         arrayRemoveItem(this.propertyNames, stringName);
@@ -1051,7 +1195,7 @@ export class ReflectionClass<T> {
         const type = {
             kind: this.type.kind === ReflectionKind.class ? ReflectionKind.property : ReflectionKind.propertySignature,
             parent: this.type,
-            ...prop
+            ...prop,
         } as TypeProperty | TypePropertySignature;
         if (type.kind === ReflectionKind.property) {
             type.visibility = prop.visibility ?? ReflectionVisibility.public;
@@ -1169,7 +1313,7 @@ export class ReflectionClass<T> {
                 if (jit.reflectionClass) return jit.reflectionClass;
                 return jit.reflectionClass = new ReflectionClass<T>(classTypeIn);
             }
-            if (classTypeIn.kind !== ReflectionKind.class) throw new Error(`TypeClass or TypeObjectLiteral expected, not ${classTypeIn.kind}`);
+            if (classTypeIn.kind !== ReflectionKind.class) throw new Error(`TypeClass or TypeObjectLiteral expected, not ${ReflectionKind[classTypeIn.kind]}`);
         }
 
         const classType = isType(classTypeIn) ? (classTypeIn as TypeClass).classType : (classTypeIn as any)['prototype'] ? classTypeIn as ClassType<T> : classTypeIn.constructor as ClassType<T>;
@@ -1185,11 +1329,11 @@ export class ReflectionClass<T> {
         const type = isType(classTypeIn) ? classTypeIn as TypeClass : ('__type' in classType ? resolveRuntimeType(classType, args) : {
             kind: ReflectionKind.class,
             classType,
-            types: []
+            types: [],
         } as TypeClass);
 
         if (type.kind !== ReflectionKind.class) {
-            throw new Error(`Given class is not a class but kind ${type.kind}. classType: ${stringifyValueWithType(classType)}`);
+            throw new Error(`Given class is not a class but kind ${ReflectionKind[type.kind]}. classType: ${stringifyValueWithType(classType)}`);
         }
 
         const parentProto = Object.getPrototypeOf(classType.prototype);
@@ -1214,6 +1358,10 @@ export class ReflectionClass<T> {
 
     getProperties(): ReflectionProperty[] {
         return this.properties;
+    }
+
+    getPropertiesInGroup(...group: string[]): ReflectionProperty[] {
+        return this.properties.filter(v => v.isInGroup(...group));
     }
 
     getMethodNames(): (string | number | symbol)[] {
@@ -1353,6 +1501,7 @@ export class ReflectionClass<T> {
         return primaryKey;
     }
 }
+
 
 // old function to decorate an interface
 // export function decorate<T>(decorate: { [P in keyof T]?: FreeDecoratorFn<any> }, p?: ReceiveType<T>): ReflectionClass<T> {

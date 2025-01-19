@@ -8,29 +8,106 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { Column, ColumnDiff, DatabaseDiff, DatabaseModel, ForeignKey, IndexModel, Table, TableDiff } from '../schema/table';
+import {
+    Column,
+    ColumnDiff,
+    DatabaseDiff,
+    DatabaseModel,
+    ForeignKey,
+    IndexModel,
+    Table,
+    TableDiff,
+} from '../schema/table.js';
 import sqlstring from 'sqlstring';
 import { ClassType, isArray, isObject } from '@deepkit/core';
-import { sqlSerializer } from '../serializer/sql-serializer';
-import { parseType, SchemaParser } from '../reverse/schema-parser';
-import { SQLFilterBuilder } from '../sql-filter-builder';
-import { Sql } from '../sql-builder';
-import { binaryTypes, databaseAnnotation, ReflectionClass, ReflectionKind, ReflectionProperty, Serializer, Type } from '@deepkit/type';
-import { DatabaseEntityRegistry } from '@deepkit/orm';
+import { sqlSerializer } from '../serializer/sql-serializer.js';
+import { parseType, SchemaParser } from '../reverse/schema-parser.js';
+import { SQLFilterBuilder } from '../sql-filter-builder.js';
+import { Sql } from '../sql-builder.js';
+import { binaryTypes, databaseAnnotation, isCustomTypeClass, isDateType, isIntegerType, ReflectionClass, ReflectionKind, ReflectionProperty, Serializer, Type } from '@deepkit/type';
+import { DatabaseEntityRegistry, MigrateOptions } from '@deepkit/orm';
+import { splitDotPath } from '../sql-adapter.js';
+import { PreparedAdapter } from '../prepare.js';
 
 export function isSet(v: any): boolean {
     return v !== '' && v !== undefined && v !== null;
 }
 
+export function isNonUndefined(type: Type): boolean {
+    // null|undefined don't change the column type, but only whether they are nullable or not.
+    return type.kind !== ReflectionKind.undefined && type.kind !== ReflectionKind.null;
+}
+
+export function typeResolvesToString(type: Type): boolean {
+    if (type.kind === ReflectionKind.string) return true;
+    if (type.kind === ReflectionKind.literal && 'string' === typeof type.literal) return true;
+    if (type.kind === ReflectionKind.union) return type.types.filter(isNonUndefined).every(v => typeResolvesToString(v));
+    if (type.kind === ReflectionKind.enum) return typeResolvesToString(type.indexType);
+    return false;
+}
+
+export function typeResolvesToNumber(type: Type): boolean {
+    if (type.kind === ReflectionKind.number) return true;
+    if (type.kind === ReflectionKind.literal && 'number' === typeof type.literal) return true;
+    if (type.kind === ReflectionKind.union) return type.types.filter(isNonUndefined).every(typeResolvesToNumber);
+    if (type.kind === ReflectionKind.enum) return typeResolvesToNumber(type.indexType);
+    return false;
+}
+
+export function typeResolvesToBigInt(type: Type): boolean {
+    if (type.kind === ReflectionKind.bigint) return true;
+    if (type.kind === ReflectionKind.literal && 'bigint' === typeof type.literal) return true;
+    if (type.kind === ReflectionKind.union) return type.types.filter(isNonUndefined).every(typeResolvesToBigInt);
+    if (type.kind === ReflectionKind.enum) return typeResolvesToBigInt(type.indexType);
+    return false;
+}
+
+export function typeResolvesToInteger(type: Type): boolean {
+    if (isIntegerType(type)) return true;
+    if (type.kind === ReflectionKind.literal && 'number' === typeof type.literal && Number.isInteger(type.literal)) {
+        return true;
+    }
+    if (type.kind === ReflectionKind.union) return type.types.filter(isNonUndefined).every(typeResolvesToInteger);
+    if (type.kind === ReflectionKind.enum) return typeResolvesToInteger(type.indexType);
+    return false;
+}
+
+export function typeRequiresJSONCast(type: Type): boolean {
+    if (type.kind === ReflectionKind.any) return true;
+    if (type.kind === ReflectionKind.objectLiteral || isCustomTypeClass(type)) return true;
+    if (type.kind === ReflectionKind.array) return true;
+    if (typeResolvesToBoolean(type) || typeResolvesToNumber(type) || typeResolvesToString(type)) return false;
+    return true;
+}
+
+export function typeResolvesToBoolean(type: Type): boolean {
+    if (type.kind === ReflectionKind.boolean) return true;
+    if (type.kind === ReflectionKind.literal && 'boolean' === typeof type.literal) return true;
+    if (type.kind === ReflectionKind.union) return type.types.filter(isNonUndefined).every(typeResolvesToBoolean);
+    if (type.kind === ReflectionKind.enum) return typeResolvesToBoolean(type.indexType);
+    return false;
+}
+
+export function typeResolvesToDate(type: Type): boolean {
+    if (type.kind === ReflectionKind.union) return type.types.filter(isNonUndefined).every(isDateType);
+    return isDateType(type);
+}
+
+export function noopSqlTypeCaster(placeholder: string): string {
+    return placeholder;
+}
+
 export interface NamingStrategy {
-    getColumnName(property: ReflectionProperty): string;
+    getColumnName(property: ReflectionProperty, databaseAdapterAnnotationId: string): string;
 
     getTableName(reflectionClass: ReflectionClass<any>): string;
 }
 
 export class DefaultNamingStrategy implements NamingStrategy {
-    getColumnName(property: ReflectionProperty): string {
-        return property.getNameAsString();
+    getColumnName(property: ReflectionProperty, databaseAdapterAnnotationId: string): string {
+        const dbOptions = databaseAnnotation.getDatabase(property.type, databaseAdapterAnnotationId) || {};
+
+        return dbOptions?.name || property.getNameAsString();
     }
 
     getTableName(reflectionClass: ReflectionClass<any>): string {
@@ -68,7 +145,8 @@ export abstract class DefaultPlatform {
     /**
      * The ID used in annotation to get database related type information (like `type`, `default`, `defaultExpr`, ...) via databaseAnnotation.getDatabase.
      */
-    protected annotationId = '*';
+    public annotationId = '*';
+
     protected typeMapping = new Map<ReflectionKind | TypeMappingChecker, TypeMapping>();
     protected nativeTypeInformation = new Map<string, Partial<NativeTypeInformation>>();
 
@@ -78,25 +156,13 @@ export abstract class DefaultPlatform {
     public namingStrategy: NamingStrategy = new DefaultNamingStrategy();
     public placeholderStrategy: ClassType<SqlPlaceholderStrategy> = SqlPlaceholderStrategy;
 
-    typeCast(schema: ReflectionClass<any>, name: string): string {
-        let property = schema.getProperty(name);
-        if (property.getType().kind === ReflectionKind.string) return '';
-
-        if (property.isReference()) property = property.getResolvedReflectionClass().getPrimary();
-
-        const type = this.getTypeMapping(property.type);
-        if (!type) return '';
-
-        return '::' + type.sqlType;
-    }
-
     applyLimitAndOffset(sql: Sql, limit?: number, offset?: number): void {
         if (limit !== undefined) sql.append('LIMIT ' + this.quoteValue(limit));
         if (offset) sql.append('OFFSET ' + this.quoteValue(offset));
     }
 
-    createSqlFilterBuilder(reflectionClass: ReflectionClass<any>, tableName: string): SQLFilterBuilder {
-        return new SQLFilterBuilder(reflectionClass, tableName, this.serializer, new this.placeholderStrategy, this.quoteValue.bind(this), this.quoteIdentifier.bind(this));
+    createSqlFilterBuilder(adapter: PreparedAdapter, reflectionClass: ReflectionClass<any>, tableName: string): SQLFilterBuilder {
+        return new SQLFilterBuilder(adapter, reflectionClass, tableName, this.serializer, new this.placeholderStrategy);
     }
 
     getMigrationTableName() {
@@ -109,7 +175,7 @@ export abstract class DefaultPlatform {
     }
 
     getAggregateSelect(tableName: string, property: ReflectionProperty, func: string) {
-        return `${func}(${tableName}.${this.quoteIdentifier(property.getNameAsString())})`;
+        return `${func}(${tableName}.${this.quoteIdentifier(this.namingStrategy.getColumnName(property, this.annotationId))})`;
     }
 
     addBinaryType(sqlType: string, size?: number, scale?: number) {
@@ -118,6 +184,9 @@ export abstract class DefaultPlatform {
         }, sqlType, size, scale);
     }
 
+    /**
+     * Last matching check wins.
+     */
     addType(kind: ReflectionKind | TypeMappingChecker, sqlType: string, size?: number, scale?: number, unsigned?: boolean) {
         this.typeMapping.set(kind, { sqlType, size, scale, unsigned });
     }
@@ -128,6 +197,13 @@ export abstract class DefaultPlatform {
 
     getSchemaDelimiter(): string {
         return '.';
+    }
+
+    /**
+     * If the platform supports the `SELECT FOR UPDATE` or `SELECT FOR SHARE`.
+     */
+    supportsSelectFor(): boolean {
+        return false;
     }
 
     /**
@@ -165,6 +241,11 @@ export abstract class DefaultPlatform {
 
     protected getTypeMapping(type: Type): TypeMapping | undefined {
         let mapping = undefined as TypeMapping | undefined;
+        const annotation = databaseAnnotation.getDatabase(type, this.annotationId);
+        if (annotation && annotation.type) {
+            return { sqlType: annotation.type };
+        }
+
         for (const [checker, m] of this.typeMapping.entries()) {
             if ('number' === typeof checker) {
                 if (checker === type.kind) mapping = m;
@@ -200,20 +281,48 @@ export abstract class DefaultPlatform {
         }
     }
 
-    getModifyDatabaseDDL(databaseDiff: DatabaseDiff): string[] {
+    /**
+     * Whether an accessor to e.g. "shippingAddress"->'$.street' = ?
+     * requires real json at ? or SQL value is enough.
+     * If this returns true, the value for ? is passed through JSON.stringify().
+     */
+    deepColumnAccessorRequiresJsonString(): boolean {
+        return true;
+    }
+
+    getDeepColumnAccessor(table: string, column: string, path: string) {
+        if (!path.startsWith('[')) path = '.' + path;
+        return `${table ? table + '.' : ''}${this.quoteIdentifier(column)}->${this.quoteValue('$' + path)}`;
+    }
+
+    getColumnAccessor(table: string, path: string) {
+        if (path.includes('.')) {
+            const [first, second] = splitDotPath(path);
+            return this.getDeepColumnAccessor(table, first, second);
+        }
+
+        return `${table ? table + '.' : ''}${this.quoteIdentifier(path)}`;
+    }
+
+    getModifyDatabaseDDL(databaseDiff: DatabaseDiff, options: MigrateOptions): string[] {
         const lines: string[] = [];
 
-        for (const table of databaseDiff.removedTables) lines.push(this.getDropTableDDL(table));
+        if (options.isDropSchema()) {
+            for (const table of databaseDiff.removedTables) lines.push(this.getDropTableDDL(table));
+        }
+
         for (const [from, to] of databaseDiff.renamedTables) lines.push(this.getRenameTableDDL(from, to));
 
         for (const table of databaseDiff.addedTables) {
             lines.push(...this.getAddTableDDL(table));
-            lines.push(...this.getAddIndicesDDL(table));
+            if (options.isIndex()) {
+                lines.push(...this.getAddIndicesDDL(table));
+            }
         }
 
-        for (const tableDiff of databaseDiff.modifiedTables) lines.push(...this.getModifyTableDDL(tableDiff));
+        for (const tableDiff of databaseDiff.modifiedTables) lines.push(...this.getModifyTableDDL(tableDiff, options));
 
-        if (!this.supportsInlineForeignKey()) {
+        if (!this.supportsInlineForeignKey() && options.isForeignKey()) {
             for (const table of databaseDiff.addedTables) lines.push(...this.getAddForeignKeysDDL(table));
         }
 
@@ -230,7 +339,7 @@ export abstract class DefaultPlatform {
 
         const refs = new Map<ReflectionClass<any>, ReflectionClass<any>>();
 
-        for (let schema of entityRegistry.entities) {
+        for (let schema of entityRegistry.forMigration()) {
             //a parent of a single-table inheritance might already be added
             if (mergedToSingleTable.has(schema)) continue;
 
@@ -272,8 +381,9 @@ export abstract class DefaultPlatform {
 
             for (const property of this.getEntityFields(schema)) {
                 if (property.isBackReference()) continue;
+                if (property.isDatabaseMigrationSkipped(database.adapterName)) continue;
 
-                const column = table.addColumn(this.namingStrategy.getColumnName(property), property);
+                const column = table.addColumn(this.namingStrategy.getColumnName(property, this.annotationId), property);
                 const dbOptions = databaseAnnotation.getDatabase(property.type, this.annotationId) || {};
 
                 if (!property.isAutoIncrement()) {
@@ -311,7 +421,7 @@ export abstract class DefaultPlatform {
                     throw new Error(`Referenced entity ${foreignSchema.getClassName()} from ${schema.getClassName()}.${property.getNameAsString()} is not available`);
                 }
                 const foreignKey = table.addForeignKey('', foreignTable);
-                foreignKey.localColumns = [table.getColumn(property.getNameAsString())];
+                foreignKey.localColumns = [table.getColumn(this.namingStrategy.getColumnName(property, this.annotationId))];
                 foreignKey.foreignColumns = foreignTable.getPrimaryKeys();
                 if (reference.onDelete) foreignKey.onDelete = reference.onDelete;
                 if (reference.onUpdate) foreignKey.onUpdate = reference.onUpdate;
@@ -365,6 +475,14 @@ export abstract class DefaultPlatform {
 
     quoteIdentifier(id: string): string {
         return `"${id.replace('.', '"."')}"`;
+    }
+
+    isJson(type: Type): boolean {
+        return this.getTypeMapping(type)?.sqlType.includes('json') || false;
+    }
+
+    getSqlTypeCaster(type: Type): (placeholder: string) => string {
+        return noopSqlTypeCaster;
     }
 
     getTableIdentifier(schema: ReflectionClass<any>): string {
@@ -453,25 +571,39 @@ export abstract class DefaultPlatform {
         return `ALTER TABLE ${this.getIdentifier(from)} RENAME TO ${this.getIdentifier(to)}`;
     }
 
-    getModifyTableDDL(diff: TableDiff): string[] {
+    supportsAggregatedAlterTable(): boolean {
+        return true;
+    }
+
+    getModifyTableDDL(diff: TableDiff, options: MigrateOptions): string[] {
         const ddl: string[] = [];
 
         // drop indices, foreign keys
-        for (const foreignKey of diff.removedFKs.values()) ddl.push(this.getDropForeignKeyDDL(foreignKey));
-        for (const [from] of diff.modifiedFKs.values()) ddl.push(this.getDropForeignKeyDDL(from));
-        for (const index of diff.removedIndices.values()) ddl.push(this.getDropIndexDDL(index));
-        for (const [from] of diff.modifiedIndices.values()) ddl.push(this.getDropIndexDDL(from));
+        if (options.isForeignKey()) {
+            for (const foreignKey of diff.removedFKs.values()) ddl.push(this.getDropForeignKeyDDL(foreignKey));
+            for (const [from] of diff.modifiedFKs.values()) ddl.push(this.getDropForeignKeyDDL(from));
+        }
+
+        if (options.isDropIndex()) {
+            for (const index of diff.removedIndices.values()) ddl.push(this.getDropIndexDDL(index));
+        }
+
+        if (options.isIndex()) {
+            for (const [from] of diff.modifiedIndices.values()) ddl.push(this.getDropIndexDDL(from));
+        }
 
         //merge field changes into one command. This is more compatible especially with PK constraints.
         const alterTableLines: string[] = [];
 
-        function add(value: string) {
-            if (value.trim().startsWith('ALTER TABLE')) {
-                alterTableLines.push(value.trim().substr('ALTER TABLE '.length));
+        const prefix = `ALTER TABLE ${this.getIdentifier(diff.to)}`;
+
+        const add = (value: string) => {
+            if (this.supportsAggregatedAlterTable() && value.trim().startsWith(prefix)) {
+                alterTableLines.push(value.trim().substr(prefix.length));
             } else {
                 ddl.push(value);
             }
-        }
+        };
 
         // alter entity structure
         if (diff.hasModifiedPk()) add(this.getDropPrimaryKeyDDL(diff.from));
@@ -483,35 +615,42 @@ export abstract class DefaultPlatform {
         if (diff.hasModifiedPk()) add(this.getAddPrimaryKeyDDL(diff.to));
 
         if (alterTableLines.length) {
-            ddl.push(`ALTER TABLE ${alterTableLines.join(', ')}`);
+            ddl.push(`${prefix} ${alterTableLines.map(v => v.trim()).join(', ')}`);
         }
 
         // create indices, foreign keys
-        for (const [, to] of diff.modifiedIndices.values()) ddl.push(this.getAddIndexDDL(to));
-        for (const index of diff.addedIndices.values()) ddl.push(this.getAddIndexDDL(index));
-        for (const [, to] of diff.modifiedFKs.values()) ddl.push(this.getAddForeignKeyDDL(to));
-        for (const foreignKey of diff.addedFKs.values()) ddl.push(this.getAddForeignKeyDDL(foreignKey));
+        if (options.isIndex()) {
+            for (const [, to] of diff.modifiedIndices.values()) ddl.push(this.getAddIndexDDL(to));
+            for (const index of diff.addedIndices.values()) ddl.push(this.getAddIndexDDL(index));
+        }
+
+        if (options.isForeignKey()) {
+            for (const [, to] of diff.modifiedFKs.values()) ddl.push(this.getAddForeignKeyDDL(to));
+            for (const foreignKey of diff.addedFKs.values()) ddl.push(this.getAddForeignKeyDDL(foreignKey));
+        }
 
         return ddl.filter(isSet);
     }
 
-    getAddTableDDL(table: Table): string[] {
+    getAddTableDDL(table: Table, withForeignKey: boolean = true): string[] {
         const lines: string[] = [];
 
         lines.push(this.getUseSchemaDDL(table));
 
-        lines.push(this.getCreateTableDDL(table));
+        lines.push(this.getCreateTableDDL(table, withForeignKey));
 
         lines.push(this.getResetSchemaDDL(table));
 
         return lines.filter(isSet);
     }
 
-    getCreateTableDDL(table: Table): string {
+    getCreateTableDDL(table: Table, withForeignKey: boolean = true): string {
         const lines: string[] = [];
         for (const column of table.columns) lines.push(this.getColumnDDL(column));
         if (this.supportsInlinePrimaryKey() && table.hasPrimaryKey()) lines.push(this.getPrimaryKeyDDL(table));
-        if (this.supportsInlineForeignKey()) for (const foreignKey of table.foreignKeys) lines.push(this.getForeignKeyDDL(foreignKey));
+        if (withForeignKey) {
+            if (this.supportsInlineForeignKey()) for (const foreignKey of table.foreignKeys) lines.push(this.getForeignKeyDDL(foreignKey));
+        }
 
         return `CREATE TABLE ${this.getIdentifier(table)} (\n    ${lines.join(',\n    ')}\n)`;
     }
@@ -544,7 +683,7 @@ export abstract class DefaultPlatform {
     }
 
     getAddIndexDDL(index: IndexModel): string {
-        const u = index.isUnique ? 'UNIQUE' : '';
+        const u = index.isUnique ? ' UNIQUE' : '';
 
         const columns: string[] = [];
         for (const column of index.columns) {
@@ -562,7 +701,7 @@ export abstract class DefaultPlatform {
             columns.push(`${this.getIdentifier(column)}`);
         }
 
-        return `CREATE ${u} INDEX ${this.getIdentifier(index)} ON ${this.getIdentifier(index.table)} (${columns.join(', ')})`;
+        return `CREATE${u} INDEX ${this.getIdentifier(index)} ON ${this.getIdentifier(index.table)} (${columns.join(', ')})`;
     }
 
     getDropTableDDL(table: Table): string {
@@ -618,11 +757,18 @@ export abstract class DefaultPlatform {
     }
 
     getColumnDefaultValueDDL(column: Column) {
+        if (column.defaultExpression !== undefined || column.defaultValue !== undefined) {
+            return 'DEFAULT ' + this.getDefaultExpression(column);
+        }
+        return '';
+    }
+
+    getDefaultExpression(column: Column): string {
         if (column.defaultExpression !== undefined) {
-            return 'DEFAULT ' + column.defaultExpression;
+            return column.defaultExpression;
         }
         if (column.defaultValue !== undefined) {
-            return 'DEFAULT ' + this.quoteValue(column.defaultValue);
+            return this.quoteValue(column.defaultValue);
         }
         return '';
     }

@@ -1,6 +1,6 @@
 import { arrayRemoveItem, ClassType, sleep } from '@deepkit/core';
-import { ApplicationServer, Broker, BrokerServer, FrameworkModule, NetBroker, NetBrokerServer } from '@deepkit/framework';
-import { App, AppModule } from '@deepkit/app';
+import { ApplicationServer, FrameworkModule } from '@deepkit/framework';
+import { App, AppModule, onAppShutdown } from '@deepkit/app';
 import { Observable } from 'rxjs';
 import { createServer } from 'http';
 import { DeepkitClient, RemoteController } from '@deepkit/rpc';
@@ -45,12 +45,11 @@ export function appModuleForControllers(controllers: ClassType[], entities: Clas
             super(new SQLiteDatabaseAdapter(), entities);
         }
     }
+
     return new AppModule({
         controllers: controllers,
         providers: [
             { provide: Database, useClass: MyDatabase },
-            { provide: Broker, useClass: NetBroker },
-            { provide: BrokerServer, useClass: NetBrokerServer },
         ],
         imports: [
             new FrameworkModule
@@ -60,7 +59,7 @@ export function appModuleForControllers(controllers: ClassType[], entities: Clas
 
 export async function createServerClientPair(
     name: string,
-    AppModule: AppModule<any>
+    appModule: AppModule<any>
 ): Promise<{
     app: App<any>,
     server: ApplicationServer,
@@ -79,14 +78,14 @@ export async function createServerClientPair(
         });
     });
 
-    const app = App.fromModule(
-        AppModule.configure({
-            framework: {
-                server: server,
-                broker: { listen: exchangeSocketPath },
-            }
-        })
-    );
+    appModule.setup((module) => {
+        module.getImportedModuleByClass(FrameworkModule).configure({
+            server: server,
+            broker: { listen: exchangeSocketPath, host: exchangeSocketPath, startOnBootstrap: true },
+        });
+    });
+
+    const app = App.fromModule(appModule);
 
     const appServer = app.get(ApplicationServer);
     await appServer.start();

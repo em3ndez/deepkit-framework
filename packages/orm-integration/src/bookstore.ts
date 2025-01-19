@@ -1,11 +1,11 @@
 import { expect } from '@jest/globals';
-import { assertType, AutoIncrement, cast, entity, PrimaryKey, Reference, ReflectionClass, ReflectionKind, UUID, uuid } from '@deepkit/type';
-import { User, UserGroup } from './bookstore/user';
-import { UserCredentials } from './bookstore/user-credentials';
-import { atomicChange, getInstanceStateFromItem } from '@deepkit/orm';
+import { assertType, AutoIncrement, BackReference, cast, entity, PrimaryKey, Reference, ReflectionClass, ReflectionKind, UUID, uuid } from '@deepkit/type';
+import { User, UserGroup } from './bookstore/user.js';
+import { UserCredentials } from './bookstore/user-credentials.js';
+import { atomicChange, DatabaseSession, getInstanceStateFromItem, Query } from '@deepkit/orm';
 import { isArray } from '@deepkit/core';
-import { Group } from './bookstore/group';
-import { DatabaseFactory } from './test';
+import { Group } from './bookstore/group.js';
+import { DatabaseFactory } from './test.js';
 
 interface BookModeration {
     locked: boolean;
@@ -173,6 +173,16 @@ export const bookstoreTests = {
     async uuid(databaseFactory: DatabaseFactory) {
         const database = await databaseFactory(entities);
 
+        {
+            expect(await database.query(Image).count()).toBe(0);
+            const image = new Image('/foo.jpg');
+            await database.persist(image);
+            expect(await database.query(Image).count()).toBe(1);
+            expect(await database.query(Image).filter({ id: image.id }).count()).toBe(1);
+            await database.remove(image);
+            expect(await database.query(Image).count()).toBe(0);
+        }
+
         const image = new Image('/foo.jpg');
         await database.persist(image);
 
@@ -187,7 +197,7 @@ export const bookstoreTests = {
         {
             const patched = await database.query(Image).returning('path', 'privateToken', 'image').patchMany({ $inc: { downloads: 1 } });
             expect(patched.modified).toBe(1);
-            expect(patched.primaryKeys).toEqual([image.id]);
+            expect(patched.primaryKeys).toMatchObject([{ id: image.id }]);
             expect(patched.returning.downloads).toEqual([1]);
             expect(patched.returning.path).toEqual(['/foo.jpg']);
             expect(patched.returning.privateToken).toEqual([image.privateToken]);
@@ -197,7 +207,7 @@ export const bookstoreTests = {
         {
             const patched = await database.query(Image).returning('path', 'privateToken', 'image').patchOne({ $inc: { downloads: 1 } });
             expect(patched.modified).toBe(1);
-            expect(patched.primaryKeys).toEqual([image.id]);
+            expect(patched.primaryKeys).toMatchObject([{ id: image.id }]);
             expect(patched.returning.downloads).toEqual([2]);
             expect(patched.returning.path).toEqual(['/foo.jpg']);
             expect(patched.returning.privateToken).toEqual([image.privateToken]);
@@ -208,7 +218,7 @@ export const bookstoreTests = {
 
         {
             const deleted = await database.query(Image).deleteMany();
-            expect(deleted.primaryKeys).toEqual([image.id]);
+            expect(deleted.primaryKeys).toMatchObject([{ id: image.id }]);
             expect(deleted.modified).toBe(1);
         }
         database.disconnect();
@@ -252,6 +262,29 @@ export const bookstoreTests = {
 
             const allUsersInB = await database.query(User).useInnerJoin('groups').filter({ name: 'b' }).end().find();
             expect(allUsersInB.length).toBe(2);
+        }
+        database.disconnect();
+    },
+
+    async regexp(databaseFactory: DatabaseFactory) {
+        const database = await databaseFactory(entities);
+        const peter = new User('Peter');
+        const book1 = new Book(peter, 'Super book');
+        const book2 = new Book(peter, 'super!');
+        const book3 = new Book(peter, 'What if');
+        await database.persist(book1, book2, book3);
+
+        {
+            const books = await database.query(Book).filter({ title: /^Super/}).find();
+            expect(books.length).toBe(1);
+            expect(books[0].title).toBe('Super book');
+        }
+
+        {
+            const books = await database.query(Book).filter({ title: /^Super/i}).find();
+            expect(books.length).toBe(2);
+            expect(books[0].title).toBe('Super book');
+            expect(books[1].title).toBe('super!');
         }
         database.disconnect();
     },
@@ -501,7 +534,7 @@ export const bookstoreTests = {
 
         const res = await database.query(UserCredentials).filter({ user: user1 }).patchOne({ user: user2 });
         expect(res.modified).toEqual(1);
-        expect(res.primaryKeys).toMatchObject([{ id: user2.id }]); //we want the new primaryKey, not the old one
+        expect(res.primaryKeys).toMatchObject([{ user: { id: user2.id } }]); //we want the new primaryKey, not the old one
 
         {
             const creds = await database.query(UserCredentials).filter({ user: user2 }).findOne();
@@ -511,7 +544,7 @@ export const bookstoreTests = {
         {
             const res = await database.query(User).filter({ id: user1.id }).patchOne({ id: 125 });
             expect(res.modified).toEqual(1);
-            expect(res.primaryKeys).toEqual([125]); //we want the new primaryKey, not the old one
+            expect(res.primaryKeys).toEqual([{id: 125}]); //we want the new primaryKey, not the old one
         }
         database.disconnect();
     },
@@ -554,6 +587,15 @@ export const bookstoreTests = {
             const userWrongPwButLeftJoin = await session.query(User).filter({ name: 'peter' }).useJoinWith('credentials').filter({ password: 'wrongPassword' }).end().findOne();
             expect(userWrongPwButLeftJoin.id).toBe(1);
             expect(userWrongPwButLeftJoin.credentials).toBeUndefined();
+        }
+
+        {
+            const query = session.query(User)
+                .filter({ name: 'peter' })
+                .innerJoinWith('credentials', join => join.filter({ password: 'wrongPassword' }));
+            expect(query.getJoin('credentials').model.filter).toEqual({ password: 'wrongPassword' });
+            const userWrongPw = await query.findOneOrUndefined();
+            expect(userWrongPw).toBeUndefined();
         }
         database.disconnect();
     },
@@ -612,7 +654,7 @@ export const bookstoreTests = {
 
         {
             const session = database.createSession();
-            const sub1 = database.unitOfWorkEvents.onUpdatePre.subscribe((event) => {
+            database.listen(DatabaseSession.onUpdatePre, event => {
                 if (event.isSchemaOf(User)) {
                     for (const changeSet of event.changeSets) {
                         changeSet.changes.increase('version', 1);
@@ -620,12 +662,12 @@ export const bookstoreTests = {
                 }
             });
 
-            const sub2 = database.queryEvents.onPatchPre.subscribe((event) => {
+            database.listen(Query.onPatchPre, event => {
                 if (event.isSchemaOf(User)) {
                     event.patch.increase('version', 1);
                 }
             });
-            const sub3 = database.queryEvents.onPatchPost.subscribe((event) => {
+            database.listen(Query.onPatchPost, event => {
                 if (event.isSchemaOf(User)) {
                     expect(isArray(event.patchResult.returning['version'])).toBe(true);
                     expect(event.patchResult.returning['version']![0]).toBeGreaterThan(0);
@@ -665,10 +707,6 @@ export const bookstoreTests = {
                 expect(userDB.logins).toBe(10);
                 expect(userDB.version).toBe(4);
             }
-
-            sub1.unsubscribe();
-            sub2.unsubscribe();
-            sub3.unsubscribe();
         }
         database.disconnect();
     },
@@ -736,6 +774,47 @@ export const bookstoreTests = {
         database.disconnect();
     },
 
+    async joinWithoutHydration(databaseFactory: DatabaseFactory) {
+        @entity.name('userJoin')
+        class User {
+            id: UUID & PrimaryKey = uuid();
+            books: Book[] & BackReference = [];
+
+            constructor(public name: string) {
+            }
+        }
+
+        @entity.name('bookJoin')
+        class Book {
+            id: UUID & PrimaryKey = uuid();
+
+            constructor(public owner: User & Reference) {
+            }
+        }
+
+        const database = await databaseFactory([User, Book]);
+
+        const user = new User('user1');
+        const book = new Book(user);
+        await database.persist(book);
+
+        const user2 = new User('user2');
+        {
+            const session = database.createSession();
+            const book2 = await session.query(Book).join('owner').findOne();
+            await session.commit();
+            book2.owner = user2;
+            await session.commit();
+        }
+
+        {
+            const session = database.createSession();
+            const book3 = await session.query(Book).joinWith('owner').findOne();
+            expect(book3.owner.name).toBe('user2');
+        }
+        database.disconnect();
+    },
+
     async atomic(databaseFactory: DatabaseFactory) {
         const database = await databaseFactory(entities);
         {
@@ -757,7 +836,7 @@ export const bookstoreTests = {
 
             const changes = await database.query(User).filter(user).patchOne({ logins: 10 });
             expect(changes.modified).toBe(1);
-            expect(changes.primaryKeys[0]).toBe(user.id);
+            expect(changes.primaryKeys[0]).toMatchObject({id: user.id});
         }
 
         {
@@ -769,7 +848,7 @@ export const bookstoreTests = {
 
             const changes = await database.query(User).filter(user).patchOne({ $inc: { logins: 10 } });
             expect(changes.modified).toBe(1);
-            expect(changes.primaryKeys[0]).toBe(user.id);
+            expect(changes.primaryKeys[0]).toMatchObject({id: user.id});
             expect(changes.returning['logins']![0]).toBe(11);
 
             await database.persist(user);

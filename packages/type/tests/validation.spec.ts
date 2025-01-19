@@ -1,15 +1,16 @@
-import { expect, test } from '@jest/globals';
-import { Email, MaxLength, MinLength, Positive, Validate, validate, ValidatorError } from '../src/validator';
-import { is } from '../src/typeguard';
-import { AutoIncrement, Excluded, Group, integer, PrimaryKey, Type, Unique } from '../src/reflection/type';
-import { t } from '../src/decorator';
-import { ReflectionClass, typeOf } from '../src/reflection/reflection';
+import { expect, jest, test } from '@jest/globals';
+import { Email, MaxLength, MinLength, Positive, Validate, validate, validates, ValidatorError } from '../src/validator.js';
+import { assert, is } from '../src/typeguard.js';
+import { AutoIncrement, Excluded, Group, integer, PrimaryKey, Type, Unique } from '../src/reflection/type.js';
+import { t } from '../src/decorator.js';
+import { ReflectionClass, typeOf } from '../src/reflection/reflection.js';
+import { cast, castFunction, validatedDeserialize } from '../src/serializer-facade.js';
 
 test('primitives', () => {
     expect(validate<string>('Hello')).toEqual([]);
-    expect(validate<string>(123)).toEqual([{code: 'type', message: 'Not a string', path: ''}]);
+    expect(validate<string>(123)).toEqual([{ code: 'type', message: 'Not a string', path: '', value: 123 }]);
 
-    expect(validate<number>('Hello')).toEqual([{code: 'type', message: 'Not a number', path: ''}]);
+    expect(validate<number>('Hello')).toEqual([{ code: 'type', message: 'Not a number', path: '', value: 'Hello' }]);
     expect(validate<number>(123)).toEqual([]);
 });
 
@@ -18,11 +19,12 @@ test('email', () => {
     expect(is<Email>('nope')).toBe(false);
     expect(is<Email>('nope@')).toBe(false);
     expect(is<Email>('@')).toBe(false);
+    expect(is<string & Email>('@')).toBe(false);
 
     expect(validate<Email>('peter@example.com')).toEqual([]);
-    expect(validate<Email>('nope')).toEqual([{ path: '', code: 'pattern', message: `Pattern ^\\S+@\\S+$ does not match` }]);
-    expect(validate<Email>('nope@')).toEqual([{ path: '', code: 'pattern', message: `Pattern ^\\S+@\\S+$ does not match` }]);
-    expect(validate<Email>('@')).toEqual([{ path: '', code: 'pattern', message: `Pattern ^\\S+@\\S+$ does not match` }]);
+    expect(validate<Email>('nope')).toEqual([{ path: '', code: 'pattern', message: `Pattern ^\\S+@\\S+$ does not match`, value: 'nope' }]);
+    expect(validate<Email>('nope@')).toEqual([{ path: '', code: 'pattern', message: `Pattern ^\\S+@\\S+$ does not match`, value: 'nope@' }]);
+    expect(validate<Email>('@')).toEqual([{ path: '', code: 'pattern', message: `Pattern ^\\S+@\\S+$ does not match`, value: '@' }]);
 });
 
 test('minLength', () => {
@@ -32,7 +34,7 @@ test('minLength', () => {
     expect(is<Username>('ab')).toBe(false);
 
     expect(validate<Username>('abc')).toEqual([]);
-    expect(validate<Username>('ab')).toEqual([{ path: '', code: 'minLength', message: `Min length is 3` }]);
+    expect(validate<Username>('ab')).toEqual([{ path: '', code: 'minLength', message: `Min length is 3`, value: 'ab' }]);
 });
 
 test('custom validator pre defined', () => {
@@ -48,7 +50,7 @@ test('custom validator pre defined', () => {
 
     expect(is<MyType>('aah')).toBe(true);
     expect(is<MyType>('nope')).toBe(false);
-    expect(validate<MyType>('nope')).toEqual([{ path: '', code: 'startsWith', message: `Does not start with a` }]);
+    expect(validate<MyType>('nope')).toEqual([{ path: '', code: 'startsWith', message: `Does not start with a`, value: 'nope' }]);
 });
 
 test('custom validator with arguments', () => {
@@ -61,10 +63,24 @@ test('custom validator with arguments', () => {
 
     expect(is<MyType>('aah')).toBe(true);
     expect(is<MyType>('nope')).toBe(false);
-    expect(validate<MyType>('nope')).toEqual([{ path: '', code: 'startsWith', message: `Does not start with a` }]);
+    expect(validate<MyType>('nope')).toEqual([{ path: '', code: 'startsWith', message: `Does not start with a`, value: 'nope' }]);
 
     type InvalidValidatorOption = string & Validate<typeof startsWith>;
     expect(() => is<InvalidValidatorOption>('aah')).toThrow(`Invalid option value given to validator function startsWith, expected letter: string`);
+});
+
+test('multiple custom validators with identical signatures', () => {
+    const validator1: (value: any) => void = jest.fn();
+    const validator2: (value: any) => void = jest.fn();
+
+    type MyType = {
+        a: string & Validate<typeof validator1>;
+        b: string & Validate<typeof validator2>;
+    }
+
+    expect(is<MyType>({ a: 'a', b: 'b' })).toEqual(true);
+    expect(validator1).toHaveBeenCalledTimes(1);
+    expect(validator2).toHaveBeenCalledTimes(1);
 });
 
 test('decorator validator', () => {
@@ -85,7 +101,7 @@ test('decorator validator', () => {
     expect(userType === reflection.type).toBe(true);
 
     expect(validate<User>({ username: 'Peter' })).toEqual([]);
-    expect(validate<User>({ username: 'Pe' })).toEqual([{ path: 'username', code: 'length', message: `Min length of 3` }]);
+    expect(validate<User>({ username: 'Pe' })).toEqual([{ path: 'username', code: 'length', message: `Min length of 3`, value: 'Pe' }]);
 });
 
 test('simple interface', () => {
@@ -94,10 +110,23 @@ test('simple interface', () => {
         username: string;
     }
 
-    expect(validate<User>(undefined)).toEqual([{code: 'type', message: 'Not an object', path: ''}]);
-    expect(validate<User>({})).toEqual([{code: 'type', message: 'Not a number', path: 'id'}])
-    expect(validate<User>({id: 1})).toEqual([{code: 'type', message: 'Not a string', path: 'username'}])
-    expect(validate<User>({id: 1, username: 'Peter'})).toEqual([])
+    expect(validate<User>(undefined)).toEqual([{ code: 'type', message: 'Not an object', path: '' }]);
+    expect(is<User>({})).toEqual(false);
+    expect(validate<User>({})).toEqual([{ code: 'type', message: 'Not a number', path: 'id' }, { code: 'type', message: 'Not a string', path: 'username' }]);
+    expect(validate<User>({ id: 1 })).toEqual([{ code: 'type', message: 'Not a string', path: 'username' }]);
+    expect(validate<User>({ id: 1, username: 'Peter' })).toEqual([]);
+});
+
+test('simple class', () => {
+    class User {
+        id!: number;
+        username!: string;
+    }
+
+    expect(validate<User>(undefined)).toEqual([{ code: 'type', message: 'Not an object', path: '' }]);
+    expect(validate<User>({})).toEqual([{ code: 'type', message: 'Not a number', path: 'id' }, { code: 'type', message: 'Not a string', path: 'username' }]);
+    expect(validate<User>({ id: 1 })).toEqual([{ code: 'type', message: 'Not a string', path: 'username' }]);
+    expect(validate<User>({ id: 1, username: 'Peter' })).toEqual([]);
 });
 
 test('class', () => {
@@ -133,8 +162,13 @@ test('path', () => {
     }
 
     // expect(validate<Container1>({ configs: [{ name: 'a', value: 3 }] })).toEqual([]);
-    expect(validate<Container1>({ configs: {} })).toEqual([{ code: 'type', message: 'Not an array', path: 'configs' }]);
-    expect(validate<Container1>({ configs: [{ name: 'a', value: 123 }, { name: '12' }] })).toEqual([{ code: 'type', message: 'Not a number', path: 'configs.1.value' }]);
+    expect(validate<Container1>({ configs: {} })).toEqual([{ code: 'type', message: 'Not an array', path: 'configs', value: {} }]);
+    expect(validate<Container1>({ configs: [{ name: 'a', value: 123 }, { name: '12' }] })).toEqual([{
+        code: 'type',
+        message: 'Not a number',
+        path: 'configs.1.value',
+        value: undefined,
+    }]);
 
     class Container2 {
         configs: { [name: string]: Config } = {};
@@ -150,12 +184,17 @@ test('class with union literal', () => {
     }
 
     expect(validate<ConnectionOptions>({ readConcernLevel: 'majority' })).toEqual([]);
-    expect(validate<ConnectionOptions>({ readConcernLevel: 'invalid' })).toEqual([{code: 'type', message: 'Invalid type', path: 'readConcernLevel'}]);
+    expect(validate<ConnectionOptions>({ readConcernLevel: 'invalid' })).toEqual([{
+        code: 'type',
+        message: 'No valid union member found. Valid: \'local\' | \'majority\' | \'linearizable\' | \'available\'',
+        path: 'readConcernLevel',
+        value: 'invalid',
+    }]);
 });
 
 test('named tuple', () => {
     expect(validate<[name: string]>(['asd'])).toEqual([]);
-    expect(validate<[name: string]>([23])).toEqual([{code: 'type', message: 'Not a string', path: 'name'}]);
+    expect(validate<[name: string]>([23])).toEqual([{ code: 'type', message: 'Not a string', path: 'name', value: 23 }]);
 });
 
 test('inherited validations', () => {
@@ -167,9 +206,165 @@ test('inherited validations', () => {
         image?: string;
     }
 
-    expect(validate<User>({ username: 'Pe' })).toEqual([{code: 'minLength', message: 'Min length is 3', path: 'username'}]);
+    expect(validate<User>({ username: 'Pe' })).toEqual([{ code: 'minLength', message: 'Min length is 3', path: 'username', value: 'Pe' }]);
     expect(validate<User>({ username: 'Peter' })).toEqual([]);
 
-    expect(validate<AddUserDto>({ username: 'Pe' })).toEqual([{code: 'minLength', message: 'Min length is 3', path: 'username'}]);
+    expect(validate<AddUserDto>({ username: 'Pe' })).toEqual([{ code: 'minLength', message: 'Min length is 3', path: 'username', value: 'Pe' }]);
     expect(validate<AddUserDto>({ username: 'Peter' })).toEqual([]);
+});
+
+test('mapped type', () => {
+    type Api = {
+        inc(x: number): number;
+        dup(x: string): string;
+    };
+    type Request = {
+        [Method in keyof Api]: {
+            method: Method;
+            arguments: Parameters<Api[Method]>;
+        };
+    }[keyof Api];
+
+    type Response = {
+        [Method in keyof Api]: {
+            method: Method;
+            result: ReturnType<Api[Method]>;
+        };
+    }[keyof Api];
+
+    expect(validate<Request>({ method: 'inc', arguments: [4] })).toEqual([]);
+
+    expect(validate<Request>({ method: 'dup', arguments: [''] })).toEqual([]);
+    expect(validate<Request>({ method: 'inc', arguments: [''] })).not.toEqual([]);
+    expect(validate<Request>({ method: 'unc', arguments: [''] })).not.toEqual([]);
+
+    expect(validate<Response>({ method: 'inc', result: 4 })).toEqual([]);
+    expect(validate<Response>({ method: 'dup', result: '' })).toEqual([]);
+
+    expect(validate<Response>({ method: 'inc', result: '' })).not.toEqual([]);
+    expect(validate<Request>({ method: 'enc', result: '' })).not.toEqual([]);
+});
+
+test('assert union', () => {
+    expect(validates<'a' | 'b'>('a')).toBe(true);
+    expect(validates<'a' | 'b'>('b')).toBe(true);
+    expect(validates<'a' | 'b'>('c')).toBe(false);
+
+    expect(() => assert<'a' | 'b'>('a')).not.toThrow();
+    expect(() => assert<'a' | 'b'>('b')).not.toThrow();
+    expect(() => assert<'a' | 'b'>('c')).toThrow('Validation error');
+});
+
+test('inline object', () => {
+    //there was a bug where array checks do not correctly set validation state to true if array is empty, so all subsequent properties
+    //are not checked correctly. this test case makes sure this works as expected.
+    interface Post {
+        tags: string[];
+        collection: {
+            items: string[]
+        };
+    }
+
+    const errors = validate<Post>({
+        tags: [],
+        collection: {}, // This should make the validator throw an error
+    });
+
+    expect(errors).toEqual([{ path: 'collection.items', code: 'type', message: 'Not an array' }]);
+    expect(() => validatedDeserialize<Post>({
+        tags: [],
+        collection: {}, // This should make the validator throw an error
+    })).toThrow('collection.items(type): Not an array');
+});
+
+test('readonly constructor properties', () => {
+    class Pilot {
+        constructor(readonly name: string, readonly age: number) {
+        }
+    }
+
+    expect(validate<Pilot>({ name: 'Peter', age: 32 })).toEqual([]);
+    expect(validate<Pilot>({ name: 'Peter', age: 'sdd' })).toEqual([{ code: 'type', message: 'Not a number', path: 'age', value: 'sdd' }]);
+});
+
+test('class with statics', () => {
+    class PilotId {
+        public static readonly none: PilotId = new PilotId(0);
+
+        constructor(public readonly value: number) {
+        }
+
+        static from(value: number) {
+            return new PilotId(value);
+        }
+    }
+
+    expect(validate<PilotId>({ value: 34 })).toEqual([]);
+    expect(validate<PilotId>({ value: '33' })).toEqual([{ code: 'type', message: 'Not a number', path: 'value', value: '33' }]);
+});
+
+test('date', () => {
+    class Account {
+        public name!: string;
+        public createdAt!: Date;
+    }
+
+    expect(validate<Account>({ name: 'jack', createdAt: 'asd' })).toEqual([{ code: 'type', message: 'Not a Date', path: 'createdAt', value: 'asd' }]);
+});
+
+test('speed', () => {
+    interface User {
+        username: string;
+        logins: number;
+        created: string;
+    }
+
+    let start, end;
+
+    const iterations = 100_000;
+
+    const c = castFunction<User>();
+    start = performance.now();
+    for (let i = 1; i < iterations; i++) {
+        const user = c({
+            username: 'Peter',
+            logins: 23,
+            created: '2020-01-01',
+        });
+    }
+    end = performance.now();
+    const deepkitInlined = end - start;
+    console.log('deepkitInlined', deepkitInlined);
+
+    start = performance.now();
+    for (let i = 1; i < iterations; i++) {
+        const user = cast<User>({
+            username: 'Peter',
+            logins: 23,
+            created: '2020-01-01',
+        });
+    }
+    end = performance.now();
+    const deepkitRef = end - start;
+    console.log('deepkitRef', deepkitRef);
+
+    const ratio = deepkitRef / deepkitInlined;
+    console.log('ratio', ratio);
+    // there is a performance cost involved in passing User to cast,
+    // but inline vs ref must not be slower than 2.5 times.
+    // expect(ratio).toBeLessThan(2.5);
+});
+
+test('array with multiple errors', () => {
+    interface Skill {
+        level: number & Positive;
+    }
+
+    const errors = validate<Array<Skill>>([{level: -1}, {level: -1}]);
+    console.log(errors);
+
+    expect(errors).toEqual([
+        {code: 'positive', message: 'Number needs to be positive', path: '0.level', value: -1},
+        {code: 'positive', message: 'Number needs to be positive', path: '1.level', value: -1}
+    ]);
 });

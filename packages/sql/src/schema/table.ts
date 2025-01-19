@@ -9,7 +9,7 @@
  */
 
 import { arrayRemoveItem } from '@deepkit/core';
-import { cyrb53 } from '../hash';
+import { cyrb53 } from '../hash.js';
 import { genericEqual, ReflectionClass, ReflectionProperty } from '@deepkit/type';
 
 export class DatabaseModel {
@@ -17,13 +17,30 @@ export class DatabaseModel {
 
     public schemaMap = new Map<ReflectionClass<any>, Table>();
 
-    constructor(public tables: Table[] = []) {
+    constructor(
+        public tables: Table[] = [],
+        public adapterName: string = ''
+    ) {
     }
 
     getTableForClass(schema: ReflectionClass<any>): Table {
         const table = this.schemaMap.get(schema);
         if (!table) throw new Error(`No table for entity ${schema.getClassName()}`);
         return table;
+    }
+
+    removeUnknownTables(other: DatabaseModel) {
+        for (const table of this.tables.slice()) {
+            if (!other.hasTable(table.name, table.schemaName)) {
+                arrayRemoveItem(this.tables, table);
+            }
+        }
+    }
+
+    removeTable(name: string, schemaName?: string) {
+        if (!this.hasTable(name, schemaName)) return;
+        const table = this.getTable(name, schemaName);
+        arrayRemoveItem(this.tables, table);
     }
 
     addTable(name: string) {
@@ -650,6 +667,13 @@ export class DatabaseDiff {
     constructor(
         public from: DatabaseModel, public to: DatabaseModel
     ) {
+    }
+
+    removeTable(name: string, schema?: string) {
+        this.removedTables = this.removedTables.filter(v => v.name !== name && v.schemaName !== schema);
+        this.modifiedTables = this.modifiedTables.filter(v => v.to.name !== name && v.to.schemaName !== schema);
+        this.renamedTables = this.renamedTables.filter(([from, to]) => to.name !== name && to.schemaName !== schema);
+        this.addedTables = this.addedTables.filter(v => v.name !== name && v.schemaName !== schema);
     }
 
     forTable(table: Table) {

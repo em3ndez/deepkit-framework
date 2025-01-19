@@ -8,7 +8,7 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { BaseResponse, Command } from './command';
+import { BaseResponse, Command } from './command.js';
 import { ReflectionClass } from '@deepkit/type';
 
 interface RequestSchema {
@@ -17,7 +17,7 @@ interface RequestSchema {
     index: string[];
 }
 
-export class DropIndexesCommand<T extends ReflectionClass<any>> extends Command {
+export class DropIndexesCommand<T extends ReflectionClass<any>> extends Command<BaseResponse> {
     constructor(
         public schema: T,
         public names: string[]
@@ -27,7 +27,7 @@ export class DropIndexesCommand<T extends ReflectionClass<any>> extends Command 
 
     async execute(config, host, transaction): Promise<BaseResponse> {
         const cmd: any = {
-            dropIndexes: this.schema.collectionName || this.schema.name || 'unknown',
+            dropIndexes: this.schema.getCollectionName() || 'unknown',
             $db: this.schema.databaseSchemaName || config.defaultDb || 'admin',
             index: this.names
         };

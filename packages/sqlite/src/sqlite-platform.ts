@@ -8,13 +8,38 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { Column, DefaultPlatform, ForeignKey, isSet, Sql, Table, TableDiff } from '@deepkit/sql';
-import { isDateType, isIntegerType, isMapType, isSetType, isUUIDType, ReflectionClass, ReflectionKind, ReflectionProperty, Serializer, Type } from '@deepkit/type';
-import { SQLiteSchemaParser } from './sqlite-schema-parser';
-import { sqliteSerializer } from './sqlite-serializer';
-import { SQLiteFilterBuilder } from './sql-filter-builder.sqlite';
+import {
+    Column,
+    DefaultPlatform,
+    ForeignKey,
+    isSet,
+    PreparedAdapter,
+    Sql,
+    Table,
+    TableDiff,
+    typeResolvesToBoolean,
+    typeResolvesToDate,
+    typeResolvesToInteger,
+    typeResolvesToNumber,
+    typeResolvesToString,
+} from '@deepkit/sql';
+import {
+    isDateType,
+    isMapType,
+    isSetType,
+    isUUIDType,
+    ReflectionClass,
+    ReflectionKind,
+    ReflectionProperty,
+    Serializer,
+    Type,
+} from '@deepkit/type';
+import { SQLiteSchemaParser } from './sqlite-schema-parser.js';
+import { sqliteSerializer } from './sqlite-serializer.js';
+import { SQLiteFilterBuilder } from './sql-filter-builder.sqlite.js';
 import { isArray, isObject } from '@deepkit/core';
 import sqlstring from 'sqlstring-sqlite';
+import { MigrateOptions } from '@deepkit/orm';
 
 export function isJsonLike(type: Type): boolean {
     if (isSetType(type) || isMapType(type) || isDateType(type)) return false;
@@ -25,7 +50,8 @@ export function isJsonLike(type: Type): boolean {
 
 export class SQLitePlatform extends DefaultPlatform {
     protected override defaultSqlType = 'text';
-    protected override annotationId = 'sqlite';
+    public override annotationId = 'sqlite';
+
     override schemaParserType = SQLiteSchemaParser;
     protected override defaultNowExpression = `(datetime('now'))`;
 
@@ -33,17 +59,16 @@ export class SQLitePlatform extends DefaultPlatform {
 
     constructor() {
         super();
-        this.addType(ReflectionKind.number, 'float');
-        this.addType((type => type.kind === ReflectionKind.class && type.classType === Date), 'text');
-        this.addType(ReflectionKind.boolean, 'integer', 1);
-        this.addType((type => isUUIDType(type)), 'blob');
-        this.addType(isIntegerType, 'integer');
+        // default is text as JSON
+        this.addType(() => true, 'text');
 
-        this.addType(isJsonLike, 'text');
+        this.addType(isUUIDType, 'blob');
+        this.addType(typeResolvesToDate, 'text');
 
-        this.addType(v => v.kind === ReflectionKind.enum && v.indexType.kind === ReflectionKind.number, 'float');
-        this.addType(v => v.kind === ReflectionKind.enum && v.indexType.kind === ReflectionKind.string, 'text');
-        this.addType(v => v.kind === ReflectionKind.enum && v.indexType.kind === ReflectionKind.union, 'text'); //as json
+        this.addType(typeResolvesToString, 'text');
+        this.addType(typeResolvesToInteger, 'integer');
+        this.addType(typeResolvesToNumber, 'float');
+        this.addType(typeResolvesToBoolean, 'integer', 1);
 
         this.addBinaryType('blob');
     }
@@ -61,11 +86,19 @@ export class SQLitePlatform extends DefaultPlatform {
         super.applyLimitAndOffset(sql, limit, offset);
     }
 
-    createSqlFilterBuilder(schema: ReflectionClass<any>, tableName: string): SQLiteFilterBuilder {
-        return new SQLiteFilterBuilder(schema, tableName, this.serializer, new this.placeholderStrategy, this.quoteValue.bind(this), this.quoteIdentifier.bind(this));
+    createSqlFilterBuilder(adapter: PreparedAdapter, schema: ReflectionClass<any>, tableName: string): SQLiteFilterBuilder {
+        return new SQLiteFilterBuilder(adapter, schema, tableName, this.serializer, new this.placeholderStrategy);
     }
 
-    getModifyTableDDL(diff: TableDiff): string[] {
+    getDeepColumnAccessor(table: string, column: string, path: string) {
+        return `${table ? table + '.' : ''}${this.quoteIdentifier(column)}->${this.quoteValue(path)}`;
+    }
+
+    supportsAggregatedAlterTable(): boolean {
+        return false;
+    }
+
+    getModifyTableDDL(diff: TableDiff, options: MigrateOptions): string[] {
         let changeViaMigrationTableNeeded =
             false
             || diff.modifiedFKs.length > 0
@@ -103,13 +136,13 @@ export class SQLitePlatform extends DefaultPlatform {
         }
 
         if (changeViaMigrationTableNeeded) {
-            return this.getMigrationTableDDL(diff);
+            return this.getMigrationTableDDL(diff, options);
         }
 
-        return super.getModifyTableDDL(diff);
+        return super.getModifyTableDDL(diff, options);
     }
 
-    protected getMigrationTableDDL(diff: TableDiff): string[] {
+    protected getMigrationTableDDL(diff: TableDiff, options: MigrateOptions): string[] {
         const lines: string[] = [];
 
         // const tempName = diff.to.getName() + '__temp__' + (Math.floor(Math.random() * 10000));
@@ -119,7 +152,7 @@ export class SQLitePlatform extends DefaultPlatform {
         const tempToName = oldToName + '__temp_new__' + (Math.floor(Math.random() * 10000));
         diff.to.name = tempToName;
         lines.push(this.getDropTableDDL(diff.to));
-        lines.push(...this.getAddTableDDL(diff.to));
+        lines.push(...this.getAddTableDDL(diff.to, options.isForeignKey()));
         diff.to.name = oldToName;
 
         // lines.push(`CREATE TABLE ${this.quoteIdentifier(tempName)} AS SELECT ${select.join(',')} FROM ${this.getIdentifier(diff.to)}`);
@@ -147,7 +180,9 @@ export class SQLitePlatform extends DefaultPlatform {
         lines.push(`DROP TABLE ${this.getIdentifier(diff.from)}`);
         lines.push(`ALTER TABLE ${this.quoteIdentifier(tempToName)} RENAME TO ${this.getIdentifier(diff.to)}`);
 
-        lines.push(...this.getAddIndicesDDL(diff.to));
+        if (options.isIndex()) {
+            lines.push(...this.getAddIndicesDDL(diff.to));
+        }
 
         return lines.filter(isSet);
     }

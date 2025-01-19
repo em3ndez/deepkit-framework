@@ -1,6 +1,7 @@
 import { expect, test } from '@jest/globals';
 import {
     arrayBufferFrom,
+    AutoIncrement,
     BackReference,
     cast,
     entity,
@@ -11,12 +12,14 @@ import {
     ReflectionClass,
     ReflectionKind,
     serialize,
+    Unique,
     UUID,
     uuid,
 } from '@deepkit/type';
-import { getInstanceStateFromItem } from '@deepkit/orm';
-import { SimpleModel, SuperSimple } from './entities';
-import { createDatabase } from './utils';
+import { getInstanceStateFromItem, UniqueConstraintFailure } from '@deepkit/orm';
+import { SimpleModel, SuperSimple } from './entities.js';
+import { createDatabase } from './utils.js';
+import { databaseFactory } from './factory.js';
 
 Error.stackTraceLimit = 100;
 
@@ -524,4 +527,134 @@ test('test identityMap', async () => {
     const dbItem = await session.query(SimpleModel).filter({ name: 'myName1' }).findOne();
     expect(dbItem === item).toBe(true);
     expect(dbItem).toBe(item);
+});
+
+test('aggregation without accumulators', async () => {
+    class File {
+        public _id: MongoId & PrimaryKey = '';
+        created: Date = new Date;
+
+        downloads: number = 0;
+
+        category: string = 'none';
+
+        constructor(public path: string) {
+        }
+    }
+
+    const db = await createDatabase('aggregation');
+
+    await db.persist(cast<File>({ path: 'file1', category: 'images' }),
+        cast<File>({ path: 'file2', category: 'images' }),
+        cast<File>({ path: 'file3', category: 'pdfs' }));
+
+    await db.query(File).filter({ path: 'file1' }).patchOne({ $inc: { downloads: 15 } });
+    await db.query(File).filter({ path: 'file2' }).patchOne({ $inc: { downloads: 5 } });
+
+    const res = await db.query(File)
+        .groupBy('category')
+        .orderBy('category', 'asc')
+        .find();
+    expect(res).toEqual([{ category: 'images' }, { category: 'pdfs' }]);
+
+    const res2 = await db.query(File)
+        .withSum('downloads', 'downloadsSum')
+        .groupBy('category')
+        .orderBy('category', 'asc')
+        .find();
+
+    expect(res2).toEqual([
+        { downloadsSum: 20, category: 'images' },
+        { downloadsSum: 0, category: 'pdfs' },
+    ]);
+});
+
+test('raw', async () => {
+    class Model {
+        public _id: MongoId & PrimaryKey = '';
+
+        constructor(public id: number) {
+        }
+    }
+
+    const db = await createDatabase('raw');
+
+    {
+        const session = db.createSession();
+        for (let i = 0; i < 1000; i++) session.add(new Model(i));
+        await session.commit();
+    }
+
+    const result = await db.raw<Model, { count: number }>([{ $match: { id: { $gt: 500 } } }, { $count: 'count' }]).findOne();
+    expect(result.count).toBe(499);
+
+    const items = await db.raw<Model>([{ $match: { id: { $lt: 500 } } }]).find();
+    expect(items.length).toBe(500);
+    expect(items[0]).toBeInstanceOf(Model);
+});
+
+test('batch', async () => {
+    class Model {
+        public _id: MongoId & PrimaryKey = '';
+
+        constructor(public id: number) {
+        }
+    }
+
+    const db = await createDatabase('batch');
+    {
+        const session = db.createSession();
+        for (let i = 0; i < 1000; i++) session.add(new Model(i));
+        await session.commit();
+    }
+
+    {
+        const items = await db.query(Model).withBatchSize(10).find();
+        expect(items.length).toBe(1000);
+    }
+
+    {
+        const session = db.createSession();
+        session.useTransaction();
+        const items = await session.query(Model).withBatchSize(10).find();
+        expect(items.length).toBe(1000);
+    }
+});
+
+test('unique constraint 1', async () => {
+    class Model {
+        id: number & PrimaryKey & AutoIncrement = 0;
+        constructor(public username: string & Unique = '') {}
+    }
+
+    const database = await databaseFactory([Model]);
+
+    await database.persist(new Model('peter'));
+    await database.persist(new Model('paul'));
+
+    {
+        const m1 = new Model('peter');
+        await expect(database.persist(m1)).rejects.toThrow('username dup key');
+        await expect(database.persist(m1)).rejects.toBeInstanceOf(UniqueConstraintFailure);
+    }
+
+    {
+        const m1 = new Model('marie');
+        const m2 = new Model('marie');
+        await expect(database.persist(m1, m2)).rejects.toThrow('username dup key');
+        await expect(database.persist(m1, m2)).rejects.toBeInstanceOf(UniqueConstraintFailure);
+    }
+
+    {
+        const m = await database.query(Model).filter({username: 'paul'}).findOne();
+        m.username = 'peter';
+        await expect(database.persist(m)).rejects.toThrow('username dup key');
+        await expect(database.persist(m)).rejects.toBeInstanceOf(UniqueConstraintFailure);
+    }
+
+    {
+        const p = database.query(Model).filter({username: 'paul'}).patchOne({username: 'peter'});
+        await expect(p).rejects.toThrow('username dup key');
+        await expect(p).rejects.toBeInstanceOf(UniqueConstraintFailure);
+    }
 });

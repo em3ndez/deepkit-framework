@@ -1,6 +1,6 @@
 import { getClassName } from '@deepkit/core';
 import { expect, test } from '@jest/globals';
-import { ReceiveType, reflect, ReflectionClass, resolveReceiveType, typeOf } from '../src/reflection/reflection';
+import { ReceiveType, reflect, ReflectionClass, resolveReceiveType, typeOf } from '../src/reflection/reflection.js';
 import {
     assertType,
     Entity,
@@ -14,10 +14,10 @@ import {
     Type,
     TypeClass,
     TypeProperty
-} from '../src/reflection/type';
-import { deserializeType, serializeType } from '../src/type-serialization';
-import { entity } from '../src/decorator';
-import { deserialize } from '../src/serializer-facade';
+} from '../src/reflection/type.js';
+import { deserializeType, serializeType } from '../src/type-serialization.js';
+import { entity } from '../src/decorator.js';
+import { deserialize } from '../src/serializer-facade.js';
 
 test('serialize basics', () => {
     expect(serializeType(typeOf<string>())).toEqual([{ kind: ReflectionKind.string }]);
@@ -38,14 +38,16 @@ test('serialize basics', () => {
     expect(serializeType(typeOf<typeof r>())).toEqual([{ kind: ReflectionKind.literal, literal: { type: 'regex', regex: '/abc/g' } }]);
 });
 
-test('serialize type decorators', () => {
+test('serialize type annotations', () => {
     type t = string & PrimaryKey;
     expect(serializeType(typeOf<t>())).toEqual([
         { kind: ReflectionKind.string, typeName: 't', decorators: [1] },
         { kind: ReflectionKind.objectLiteral, typeName: 'PrimaryKey', types: [2] },
         { kind: ReflectionKind.propertySignature, name: '__meta', optional: true, type: 3 },
-        { kind: ReflectionKind.tuple, types: [{ kind: ReflectionKind.tupleMember, type: 4 }] },
-        { kind: ReflectionKind.literal, literal: 'primaryKey' }]);
+        { kind: ReflectionKind.tuple, types: [{ kind: ReflectionKind.tupleMember, type: 4 }, { kind: ReflectionKind.tupleMember, type: 5 }] },
+        { kind: ReflectionKind.literal, literal: 'primaryKey' },
+        { kind: ReflectionKind.never }
+    ]);
 });
 
 test('serialize container', () => {
@@ -82,6 +84,7 @@ test('serialize container', () => {
 
     expect(serializeType(typeOf<MyClass>())).toEqual([{
         kind: ReflectionKind.class,
+        typeName: 'MyClass',
         classType: 'MyClass',
         types: [1, 3]
     }, { kind: ReflectionKind.property, visibility: 0, name: 'a', type: 2, default: true }, { kind: ReflectionKind.number },
@@ -239,7 +242,7 @@ test('roundTrip class generic', () => {
     }
 });
 
-test('type decorators', () => {
+test('type annotations', () => {
     {
         type t = string & PrimaryKey;
         const type = roundTrip<t>();
@@ -317,13 +320,13 @@ test('Type excluded', () => {
         }
     }
 
-    const member = findMember('type', reflect(Validation) as TypeClass) as TypeProperty;
+    const member = findMember('type', (reflect(Validation) as TypeClass).types) as TypeProperty;
     expect(isSameType(type, member.type)).toBe(true);
 
     const json = serializeType(typeOf<Validation>());
     const back = deserializeType(json);
     assertType(back, ReflectionKind.class);
-    const typeMember = findMember('type', back);
+    const typeMember = findMember('type', back.types);
     assertType(typeMember, ReflectionKind.property);
     expect(typeMember.type.kind).toBe(ReflectionKind.any);
 });
@@ -407,7 +410,7 @@ test('class reference with entity options', () => {
     const json = serializeType(typeOf<Book>());
     const back = deserializeType(json, {disableReuse: true});
     assertType(back, ReflectionKind.class);
-    const author = findMember('author', back);
+    const author = findMember('author', back.types);
     assertType(author, ReflectionKind.property);
     const authorReflection = ReflectionClass.from(author.type);
     expect(authorReflection.getName()).toBe('author');

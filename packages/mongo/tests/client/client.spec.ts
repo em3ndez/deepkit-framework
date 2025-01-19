@@ -1,10 +1,16 @@
-import { expect, test } from '@jest/globals';
-import { MongoClient } from '../../src/client/client';
-import { HostType } from '../../src/client/host';
-import { IsMasterCommand } from '../../src/client/command/ismaster';
+import { expect, jest, test } from '@jest/globals';
+import { MongoClient } from '../../src/client/client.js';
+import { HostType } from '../../src/client/host.js';
+import { IsMasterCommand } from '../../src/client/command/ismaster.js';
 import { sleep } from '@deepkit/core';
-import { ConnectionOptions } from '../../src/client/options';
+import { ConnectionOptions } from '../../src/client/options.js';
 import { cast, validatedDeserialize } from '@deepkit/type';
+import { createConnection } from 'net';
+import { fail } from 'assert';
+import { MongoConnectionError } from '../../src/client/error.js';
+import { createCommand } from '../../index.js';
+
+jest.setTimeout(60000);
 
 test('ConnectionOptions', async () => {
     {
@@ -24,14 +30,55 @@ test('connect invalid', async () => {
     client.close();
 });
 
+test('connect invalid 2', async () => {
+    const client = new MongoClient('mongodb://invalid/');
+
+    try {
+        await client.connect();
+        fail('should fail');
+    } catch (error) {
+        expect(error).toBeInstanceOf(MongoConnectionError);
+    }
+
+    client.close();
+});
+
 test('connect valid', async () => {
     const client = new MongoClient('mongodb://localhost/');
 
     expect(client.config.hosts[0].hostname).toEqual('localhost');
 });
 
+test('test localhost', async () => {
+    const socket = createConnection({
+        host: '127.0.0.1',
+        port: 27017
+    });
+
+    await new Promise(async (resolve, reject) => {
+        socket.on('error', (error) => {
+            reject(error);
+        });
+        await sleep(0.1);
+        resolve(undefined);
+    });
+});
+
+test('custom command', async () => {
+    interface Message {
+        isMaster: number;
+        $db: string;
+    }
+
+    const command = createCommand<Message, {ismaster: boolean}>({isMaster: 1, $db: 'deepkit'});
+
+    const client = new MongoClient('mongodb://127.0.0.1/');
+    const res = await client.execute(command);
+    expect(res).toEqual({ ismaster: true, ok: 1 });
+});
+
 test('connect handshake', async () => {
-    const client = new MongoClient('mongodb://localhost/');
+    const client = new MongoClient('mongodb://127.0.0.1/');
     await client.connect();
 
     const type = client.config.hosts[0].getType();
@@ -42,7 +89,7 @@ test('connect handshake', async () => {
 });
 
 test('connect isMaster command', async () => {
-    const client = new MongoClient('mongodb://localhost/');
+    const client = new MongoClient('mongodb://127.0.0.1/');
 
     const response = await client.execute(new IsMasterCommand);
 
@@ -113,10 +160,63 @@ test('connect isMaster command', async () => {
 //
 // });
 
+test('connection pool 1', async () => {
+    const client = new MongoClient('mongodb://127.0.0.1?maxPoolSize=1');
 
+    //spawn 10 promises, each requesting a connection and releasing it a few ms later
+    const promises: Promise<any>[] = [];
 
-test('connection pool', async () => {
-    const client = new MongoClient('mongodb://localhost?maxPoolSize=10');
+    async function test() {
+        const c = await client.connectionPool.getConnection();
+        await sleep(0.1 * Math.random());
+        c.release();
+    }
+
+    for (let i = 0; i < 10; i++) {
+        promises.push(test());
+    }
+
+    await Promise.all(promises);
+
+    expect(client.stats.connectionsCreated).toBe(1);
+    expect(client.stats.connectionsReused).toBe(10);
+    expect(client.stats.connectionsQueued).toBe(9);
+
+    client.close();
+});
+
+test('connection pool stress test', async () => {
+    const client = new MongoClient('mongodb://127.0.0.1?maxPoolSize=2');
+
+    //spawn many promises, each requesting a connection and releasing it a few ms later
+    const promises: Promise<any>[] = [];
+
+    async function test() {
+        const c = await client.connectionPool.getConnection();
+        await sleep(0.001 * Math.random());
+        c.release();
+    }
+
+    const batch = 500;
+    for (let i = 0; i < 5_000; i++) {
+        promises.push(test());
+        if (i % batch === 0) {
+            await Promise.all(promises);
+            promises.length = 0;
+            console.log('batch', i);
+        }
+    }
+
+    await Promise.all(promises);
+
+    expect(client.stats.connectionsCreated).toBe(2);
+    expect(client.stats.connectionsReused).toBe(4999);
+
+    client.close();
+});
+
+test('connection pool 10', async () => {
+    const client = new MongoClient('mongodb://127.0.0.1?maxPoolSize=10');
 
     {
         const c1 = await client.connectionPool.getConnection();
@@ -129,6 +229,7 @@ test('connection pool', async () => {
 
         const c3 = await client.connectionPool.getConnection();
         expect(c3 === c1).toBe(true);
+        c3.release();
     }
 
     {
@@ -146,12 +247,12 @@ test('connection pool', async () => {
         let c11: any;
         client.connectionPool.getConnection().then((c) => {
             c11 = c;
-            expect(c11.id).toBe(1);
+            expect(c11.id).toBe(0);
         });
         let c12: any;
         client.connectionPool.getConnection().then((c) => {
             c12 = c;
-            expect(c12.id).toBe(2);
+            expect(c12.id).toBe(1);
         });
         await sleep(0.01);
         expect(c11).toBe(undefined);
@@ -165,4 +266,6 @@ test('connection pool', async () => {
         await sleep(0.01);
         expect(c12).toBe(c2);
     }
+
+    client.close();
 });

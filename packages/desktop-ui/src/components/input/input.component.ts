@@ -109,6 +109,7 @@ export class InputComponent extends ValueAccessorBase<any> implements AfterViewI
 
     @HostBinding('class.focused')
     get isFocused() {
+        if ('undefined' === typeof document) return false;
         return this.input ? document.activeElement === this.input!.nativeElement : false;
     }
 
@@ -174,6 +175,7 @@ export class InputComponent extends ValueAccessorBase<any> implements AfterViewI
         } else if (this.type === 'number') {
         } else if (dateTimeTypes.includes(this.type)) {
             if (super.innerValue instanceof Date) {
+                if (this.type === 'date') return this.datePipe.transform(super.innerValue, `yyyy-MM-dd`);
                 return this.datePipe.transform(super.innerValue, 'yyyy-MM-ddThh:mm:ss.SSS');
             } else if ('string' === typeof super.innerValue) {
                 return this.datePipe.transform(new Date(super.innerValue), 'yyyy-MM-ddThh:mm:ss.SSS');
@@ -198,7 +200,7 @@ export class InputComponent extends ValueAccessorBase<any> implements AfterViewI
         super.innerValue = value;
     }
 
-    async writeValue(value?: any) {
+    writeValue(value?: any) {
         if (this.type === 'file' && !value && this.input) {
             //we need to manually reset the field, since writing to it via ngModel is not supported.
             this.input!.nativeElement.value = '';

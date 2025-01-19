@@ -13,11 +13,14 @@
     "esModuleInterop": true,
     "outDir": "./dist/cjs",
     "declaration": true,
-    "composite": true
+    "composite": true,
+    "types": []
   },
   "include": [
     "src",
-    "index.ts",
+    "index.ts"
+  ],
+  "exclude": [
     "tests"
   ],
   "references": [

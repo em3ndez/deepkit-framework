@@ -1,4 +1,5 @@
 {
+  "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "forceConsistentCasingInFileNames": true,
     "strict": true,
@@ -14,17 +15,22 @@
     "esModuleInterop": true,
     "outDir": "./dist/cjs",
     "declaration": true,
-    "composite": true
+    "composite": true,
+    "types": [
+      "sqlstring"
+    ]
   },
   "reflection": true,
   "include": [
     "benchmarks",
     "src",
-    "tests",
     "main.ts",
     "browser.ts",
     "commands.ts",
     "index.ts"
+  ],
+  "exclude": [
+    "tests"
   ],
   "references": [
     {

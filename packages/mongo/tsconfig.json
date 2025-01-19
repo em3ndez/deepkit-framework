@@ -1,5 +1,7 @@
 {
+  "extends": "../../tsconfig.base.json",
   "compilerOptions": {
+    "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "strict": true,
     "noImplicitReturns": true,
@@ -14,12 +16,19 @@
     "esModuleInterop": true,
     "outDir": "./dist/cjs",
     "declaration": true,
-    "composite": true
+    "composite": true,
+    "types": [
+      "mongodb",
+      "node"
+    ]
   },
   "reflection": true,
   "include": [
     "src",
     "index.ts"
+  ],
+  "exclude": [
+    "tests"
   ],
   "references": [
     {
@@ -27,9 +36,6 @@
     },
     {
       "path": "../core/tsconfig.json"
-    },
-    {
-      "path": "../crypto/tsconfig.json"
     },
     {
       "path": "../orm/tsconfig.json"

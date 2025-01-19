@@ -8,8 +8,8 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import type { QueryDatabaseDeleteEvent, QueryDatabasePatchEvent, UnitOfWorkEvent, UnitOfWorkUpdateEvent } from './event';
-import type { Database } from './database';
+import type { QueryDatabaseDeleteEvent, QueryDatabasePatchEvent, UnitOfWorkEvent, UnitOfWorkUpdateEvent } from './event.js';
+import type { Database } from './database.js';
 import { ReflectionClass, ReflectionProperty } from '@deepkit/type';
 
 type IncomingReference = { classSchema: ReflectionClass<any>, property: ReflectionProperty };
@@ -29,7 +29,7 @@ export class VirtualForeignKeyConstraint {
 
         const res: IncomingReference[] = [];
 
-        for (const classSchema of this.database.entityRegistry.entities) {
+        for (const classSchema of this.database.entityRegistry.all()) {
             for (const reference of classSchema.getReferences()) {
                 if (!reference.isReference()) continue;
                 if (reference.getReference()!.onDelete === 'NO ACTION') continue;

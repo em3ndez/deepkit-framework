@@ -8,15 +8,15 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { DatabaseSession, DatabaseTransaction } from './database-session';
-import { DatabaseQueryModel, GenericQueryResolver, Query } from './query';
+import { DatabaseSession, DatabaseTransaction } from './database-session.js';
+import { DatabaseQueryModel, GenericQueryResolver, Query } from './query.js';
 import { Changes, getSerializeFunction, ReceiveType, ReflectionClass, resolvePath, serialize, Serializer } from '@deepkit/type';
 import { AbstractClassType, deletePathValue, getPathValue, setPathValue } from '@deepkit/core';
-import { DatabaseAdapter, DatabaseAdapterQueryFactory, DatabaseEntityRegistry, DatabasePersistence, DatabasePersistenceChangeSet } from './database-adapter';
-import { DeleteResult, OrmEntity, PatchResult } from './type';
-import { findQueryList } from './utils';
-import { convertQueryFilter } from './query-filter';
-import { Formatter } from './formatter';
+import { DatabaseAdapter, DatabaseAdapterQueryFactory, DatabaseEntityRegistry, DatabasePersistence, DatabasePersistenceChangeSet, MigrateOptions } from './database-adapter.js';
+import { DeleteResult, OrmEntity, PatchResult } from './type.js';
+import { findQueryList } from './utils.js';
+import { convertQueryFilter } from './query-filter.js';
+import { Formatter } from './formatter.js';
 
 type SimpleStore<T> = { items: Map<any, T>, autoIncrement: number };
 
@@ -68,7 +68,7 @@ function sort(items: any[], field: string, sortFn: typeof sortAsc | typeof sortA
     });
 }
 
-export class MemoryQuery<T> extends Query<T> {
+export class MemoryQuery<T extends OrmEntity> extends Query<T> {
     protected isMemory = true;
 
     isMemoryDb() {
@@ -76,7 +76,7 @@ export class MemoryQuery<T> extends Query<T> {
     }
 }
 
-const find = <T>(adapter: MemoryDatabaseAdapter, classSchema: ReflectionClass<any>, model: DatabaseQueryModel<T>): T[] => {
+const find = <T extends OrmEntity>(adapter: MemoryDatabaseAdapter, classSchema: ReflectionClass<any>, model: DatabaseQueryModel<T>): T[] => {
     const rawItems = [...adapter.getStore(classSchema).items.values()];
     const serializer = getSerializeFunction(classSchema.type, memorySerializer.deserializeRegistry);
     const items = rawItems.map(v => serializer(v));
@@ -98,7 +98,7 @@ const find = <T>(adapter: MemoryDatabaseAdapter, classSchema: ReflectionClass<an
     let filtered = model.filter ? findQueryList<T>(items, model.filter) : items;
 
     if (model.hasJoins()) {
-        throw new Error('MemoryDatabaseAdapter does not support joins. Please use another lightweight adapter like SQLite.');
+        console.log('MemoryDatabaseAdapter does not support joins. Please use another lightweight adapter like SQLite.');
     }
 
     if (model.sort) {
@@ -159,9 +159,8 @@ export class MemoryQueryFactory extends DatabaseAdapterQueryFactory {
                     this.session.logger.logger.log('delete', model.filter);
                 }
                 const items = find(adapter, schema, model);
-                const primaryKey = schema.getPrimary().name as keyof T;
                 for (const item of items) {
-                    deleteResult.primaryKeys.push(item[primaryKey] as any);
+                    deleteResult.primaryKeys.push(item);
                 }
                 remove(adapter, schema, items);
             }
@@ -222,7 +221,7 @@ export class MemoryQueryFactory extends DatabaseAdapterQueryFactory {
                         }
                     }
 
-                    patchResult.primaryKeys.push(item[primaryKey] as any);
+                    patchResult.primaryKeys.push(item);
                     store.items.set(item[primaryKey] as any, serializer(item));
                 }
             }
@@ -244,10 +243,54 @@ export class MemoryDatabaseTransaction extends DatabaseTransaction {
     }
 }
 
+export class MemoryPersistence extends DatabasePersistence {
+    constructor(private adapter: MemoryDatabaseAdapter) {
+        super();
+    }
+
+    async remove<T extends OrmEntity>(classSchema: ReflectionClass<T>, items: T[]): Promise<void> {
+        const store = this.adapter.getStore(classSchema);
+
+        const primaryKey = classSchema.getPrimary().name as keyof T;
+        for (const item of items) {
+            store.items.delete(item[primaryKey] as any);
+        }
+    }
+
+    async insert<T extends OrmEntity>(classSchema: ReflectionClass<T>, items: T[]): Promise<void> {
+        const store = this.adapter.getStore(classSchema);
+        const serializer = getSerializeFunction(classSchema.type, memorySerializer.serializeRegistry);
+        const autoIncrement = classSchema.getAutoIncrement();
+
+        const primaryKey = classSchema.getPrimary().name as keyof T;
+        for (const item of items) {
+            if (autoIncrement) {
+                store.autoIncrement++;
+                item[autoIncrement.name as keyof T & string] = store.autoIncrement as any;
+            }
+            store.items.set(item[primaryKey] as any, serializer(item));
+        }
+    }
+
+    async update<T extends OrmEntity>(classSchema: ReflectionClass<T>, changeSets: DatabasePersistenceChangeSet<T>[]): Promise<void> {
+        const store = this.adapter.getStore(classSchema);
+        const serializer = getSerializeFunction(classSchema.type, memorySerializer.serializeRegistry);
+        const primaryKey = classSchema.getPrimary().name as keyof T;
+
+        for (const changeSet of changeSets) {
+            store.items.set(changeSet.item[primaryKey] as any, serializer(changeSet.item));
+        }
+    }
+
+    async release() {
+
+    }
+}
+
 export class MemoryDatabaseAdapter extends DatabaseAdapter {
     protected store = new Map<ReflectionClass<any>, SimpleStore<any>>();
 
-    async migrate(entityRegistry: DatabaseEntityRegistry) {
+    async migrate(options: MigrateOptions, entityRegistry: DatabaseEntityRegistry) {
     }
 
     isNativeForeignKeyConstraintSupported(): boolean {
@@ -268,49 +311,7 @@ export class MemoryDatabaseAdapter extends DatabaseAdapter {
     }
 
     createPersistence(): DatabasePersistence {
-        const adapter = this;
-
-        class Persistence extends DatabasePersistence {
-            async remove<T extends OrmEntity>(classSchema: ReflectionClass<T>, items: T[]): Promise<void> {
-                const store = adapter.getStore(classSchema);
-
-                const primaryKey = classSchema.getPrimary().name as keyof T;
-                for (const item of items) {
-                    store.items.delete(item[primaryKey] as any);
-                }
-            }
-
-            async insert<T extends OrmEntity>(classSchema: ReflectionClass<T>, items: T[]): Promise<void> {
-                const store = adapter.getStore(classSchema);
-                const serializer = getSerializeFunction(classSchema.type, memorySerializer.serializeRegistry);
-                const autoIncrement = classSchema.getAutoIncrement();
-
-                const primaryKey = classSchema.getPrimary().name as keyof T;
-                for (const item of items) {
-                    if (autoIncrement) {
-                        store.autoIncrement++;
-                        item[autoIncrement.name as keyof T & string] = store.autoIncrement as any;
-                    }
-                    store.items.set(item[primaryKey] as any, serializer(item));
-                }
-            }
-
-            async update<T extends OrmEntity>(classSchema: ReflectionClass<T>, changeSets: DatabasePersistenceChangeSet<T>[]): Promise<void> {
-                const store = adapter.getStore(classSchema);
-                const serializer = getSerializeFunction(classSchema.type, memorySerializer.serializeRegistry);
-                const primaryKey = classSchema.getPrimary().name as keyof T;
-
-                for (const changeSet of changeSets) {
-                    store.items.set(changeSet.item[primaryKey] as any, serializer(changeSet.item));
-                }
-            }
-
-            async release() {
-
-            }
-        }
-
-        return new Persistence;
+        return new MemoryPersistence(this);
     }
 
     disconnect(force?: boolean): void {

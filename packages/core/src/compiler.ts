@@ -9,6 +9,11 @@
  */
 // @ts-ignore
 import { indent } from './indent.js';
+import { hasProperty } from './core.js';
+
+declare var process: any;
+
+const indentCode = ('undefined' !== typeof process && process.env?.DEBUG || '').includes('deepkit');
 
 export class CompilerContext {
     public readonly context = new Map<string, any>();
@@ -45,6 +50,15 @@ export class CompilerContext {
         throw new Error(`Too many context variables (max ${this.maxReservedVariable})`);
     }
 
+    set(values: { [name: string]: any }) {
+        for (const i in values) {
+            if (!hasProperty(values, i)) {
+                continue;
+            }
+            this.context.set(i, values[i]);
+        }
+    }
+
     /**
      * Returns always the same variable name for the same value.
      * The variable name should not be set afterwards.
@@ -74,12 +88,16 @@ export class CompilerContext {
     }
 
     raw(functionCode: string): Function {
-        return new Function(...this.context.keys(), `'use strict';\n` + functionCode)(...this.context.values());
+        try {
+            return new Function(...this.context.keys(), `'use strict';\n` + functionCode)(...this.context.values());
+        } catch (error) {
+            throw new Error('Could not build function: ' + error + functionCode);
+        }
     }
 
     protected format(code: string): string {
-        if (!this.config.indent) return code;
-        return indent.js(code, { tabString: '    ' });
+        if (indentCode || this.config.indent) return indent.js(code, { tabString: '    ' });
+       return code;
     }
 
     build(functionCode: string, ...args: string[]): any {

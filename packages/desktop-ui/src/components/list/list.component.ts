@@ -23,18 +23,19 @@ import {
     Optional,
     Output,
     SimpleChanges,
-    SkipSelf
+    SkipSelf,
 } from '@angular/core';
-import { NavigationEnd, Router, UrlTree } from '@angular/router';
+import { ActivatedRoute, NavigationEnd, Router, UrlTree } from '@angular/router';
 import { ngValueAccessor, ValueAccessorBase } from '../../core/form';
 import { Subscription } from 'rxjs';
 import { arrayRemoveItem } from '@deepkit/core';
+import { isRouteActive } from '../../core/utils';
 
 @Component({
     selector: 'dui-list-title',
     template: `
         <ng-content></ng-content>`,
-    styleUrls: ['./list-title.component.scss']
+    styleUrls: ['./list-title.component.scss'],
 })
 export class ListTitleComponent {
     constructor() {
@@ -53,7 +54,7 @@ export class ListTitleComponent {
         '[class.focusable]': 'focusable',
         '[class.delimiter-line]': 'delimiterLine !== false',
     },
-    providers: [ngValueAccessor(ListComponent)]
+    providers: [ngValueAccessor(ListComponent)],
 })
 @Injectable()
 export class ListComponent extends ValueAccessorBase<any> {
@@ -113,7 +114,7 @@ export class ListComponent extends ValueAccessorBase<any> {
 
         if (event.key === 'ArrowUp') {
             event.preventDefault();
-            const selectedItem = this.getSelectedItem()
+            const selectedItem = this.getSelectedItem();
             if (selectedItem) {
                 const items = this.getSortedList();
                 const position = items.indexOf(selectedItem);
@@ -146,7 +147,7 @@ export class ListComponent extends ValueAccessorBase<any> {
         '[attr.list-id]': 'list.id',
         '[attr.list-item-id]': 'id',
     },
-    styleUrls: ['./list-item.component.scss']
+    styleUrls: ['./list-item.component.scss'],
 })
 export class ListItemComponent implements OnChanges, OnDestroy {
     static ids: number = 0;
@@ -155,6 +156,7 @@ export class ListItemComponent implements OnChanges, OnDestroy {
     @Input() value: any;
     @Input() routerLink?: string | UrlTree | any[];
     @Input() routerLinkExact?: boolean;
+    @Input() queryParams?: { [name: string]: any };
     @Input() active?: boolean;
 
     /**
@@ -172,6 +174,7 @@ export class ListItemComponent implements OnChanges, OnDestroy {
         public element: ElementRef,
         @SkipSelf() public cd: ChangeDetectorRef,
         @Optional() public router?: Router,
+        @Optional() activatedRoute?: ActivatedRoute,
     ) {
         this.element.nativeElement.removeAttribute('tabindex');
         list.register(this);
@@ -203,7 +206,7 @@ export class ListItemComponent implements OnChanges, OnDestroy {
             if ('string' === typeof this.routerLink) {
                 await this.router.navigateByUrl(this.routerLink);
             } else if (Array.isArray(this.routerLink)) {
-                await this.router.navigate(this.routerLink);
+                await this.router.navigate(this.routerLink, { queryParams: this.queryParams });
             } else {
                 await this.router.navigateByUrl(this.router.serializeUrl(this.routerLink!));
             }
@@ -221,13 +224,7 @@ export class ListItemComponent implements OnChanges, OnDestroy {
         }
 
         if (this.routerLink && this.router) {
-            if ('string' === typeof this.routerLink) {
-                return this.router.isActive(this.routerLink, this.routerLinkExact === true);
-            } else if (Array.isArray(this.routerLink)) {
-                return this.router.isActive(this.router.createUrlTree(this.routerLink), this.routerLinkExact === true);
-            } else {
-                return this.router.isActive(this.routerLink!, this.routerLinkExact === true);
-            }
+            return isRouteActive(this);
         }
 
         return false;

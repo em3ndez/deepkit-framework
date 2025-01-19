@@ -1,6 +1,7 @@
 import { expect, test } from '@jest/globals';
-import { AppModule, createModule } from '../src/module';
-import { ServiceContainer } from '../src/service-container';
+import { AppModule, createModule } from '../src/module.js';
+import { ServiceContainer } from '../src/service-container.js';
+import { InjectorContext } from '@deepkit/injector';
 
 test('simple setup with import and overwrite', () => {
     class Connection {
@@ -14,7 +15,8 @@ test('simple setup with import and overwrite', () => {
     class DatabaseModule extends createModule({
         providers: [Connection, HiddenDatabaseService],
         exports: [Connection]
-    }, 'database') {}
+    }, 'database') {
+    }
 
     class MyService {
     }
@@ -182,7 +184,8 @@ test('module with config object', () => {
         exports: [
             ExchangeConfig,
         ]
-    }, 'exchange') {}
+    }, 'exchange') {
+    }
 
     const myBaseModule = new AppModule({
         imports: [new ExchangeModule]
@@ -240,7 +243,8 @@ test('exported module', () => {
         exports: [
             DatabaseConnection
         ]
-    }) {}
+    }) {
+    }
 
     class FSService {
     }
@@ -251,7 +255,7 @@ test('exported module', () => {
             DatabaseModule
         ]
     }) {
-        imports = [new DatabaseModule]
+        imports = [new DatabaseModule];
     }
 
     {
@@ -267,5 +271,37 @@ test('exported module', () => {
         const databaseModuleInjector = serviceContainer.getInjector(DatabaseModule);
         expect(databaseModuleInjector.get(DatabaseConnection)).toBeInstanceOf(DatabaseConnection);
         expect(databaseModuleInjector.get(DatabaseConnection)).toBe(rootInjector.get(DatabaseConnection));
+    }
+});
+
+test('scoped InjectorContext access', () => {
+    class RpcInjectorContext extends InjectorContext {
+    }
+
+    class MyService {
+        constructor(public injectorContext: InjectorContext) {
+        }
+    }
+
+    const myModule = new AppModule({
+        providers: [
+            { provide: MyService },
+            { provide: RpcInjectorContext, scope: 'rpc', useValue: undefined },
+        ]
+    });
+
+    const serviceContainer = new ServiceContainer(myModule);
+    {
+        const injector = serviceContainer.getInjectorContext();
+        const myService = injector.get(MyService);
+        expect(myService.injectorContext).toBeInstanceOf(InjectorContext);
+    }
+
+    {
+        const injector = serviceContainer.getInjectorContext().createChildScope('rpc');
+        injector.set(RpcInjectorContext, injector);
+
+        const myService = injector.get(MyService);
+        expect(myService.injectorContext).toBeInstanceOf(InjectorContext);
     }
 });

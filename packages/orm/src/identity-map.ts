@@ -16,9 +16,10 @@ import {
     getPrimaryKeyHashGenerator,
     getSimplePrimaryKeyHashGenerator,
     JSONPartial,
+    PrimaryKeyFields,
     ReflectionClass
 } from '@deepkit/type';
-import { OrmEntity } from './type';
+import { OrmEntity } from './type.js';
 import { getClassTypeFromInstance, isObject, toFastProperties } from '@deepkit/core';
 
 export function getNormalizedPrimaryKey(schema: ReflectionClass<any>, primaryKey: any) {
@@ -73,6 +74,8 @@ class InstanceState<T extends OrmEntity> {
      * References store only its primary keys.
      */
     snapshot?: JSONPartial<T>;
+
+    hydrator?: (item: T) => Promise<T>
 
     /**
      * Whether the item was originally from the database (and thus PK are known there).
@@ -142,11 +145,11 @@ class InstanceState<T extends OrmEntity> {
 
 const instanceStateSymbol = Symbol('state');
 
-export function getInstanceStateFromItem<T>(item: T): InstanceState<T> {
+export function getInstanceStateFromItem<T extends OrmEntity>(item: T): InstanceState<T> {
     return getInstanceState(getClassState(ReflectionClass.from(getClassTypeFromInstance(item))), item);
 }
 
-export function getInstanceState<T>(classState: ClassState<T>, item: T): InstanceState<T> {
+export function getInstanceState<T extends OrmEntity>(classState: ClassState<T>, item: T): InstanceState<T> {
     //this approach is up to 60-90x faster than a WeakMap
     if (!(item as any)['constructor'].prototype.hasOwnProperty(instanceStateSymbol)) {
         Object.defineProperty((item as any)['constructor'].prototype, instanceStateSymbol, {
@@ -193,7 +196,7 @@ export class IdentityMap {
         }
     }
 
-    deleteManyBySimplePK<T>(classSchema: ReflectionClass<T>, pks: any[]) {
+    deleteManyBySimplePK<T>(classSchema: ReflectionClass<T>, pks: PrimaryKeyFields<any>[]) {
         const store = this.getStore(classSchema);
         const state = getClassState(classSchema);
 
@@ -211,7 +214,7 @@ export class IdentityMap {
         this.registry.clear();
     }
 
-    isKnown<T>(item: T): boolean {
+    isKnown<T extends OrmEntity>(item: T): boolean {
         const classSchema = ReflectionClass.from(getClassTypeFromInstance(item));
         const store = this.getStore(classSchema);
         const state = getClassState(classSchema);

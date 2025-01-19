@@ -8,7 +8,7 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-export enum BrokerType {
+export const enum BrokerType {
     //the first 100 are reserved
     Ack,
     Error,
@@ -21,10 +21,18 @@ export enum BrokerType {
 
     Set,
     Get,
+    ResponseGet,
     Increment,
     ResponseIncrement,
     Delete,
-    ResponseGet,
+
+    InvalidateCache,
+    SetCache,
+    GetCache,
+    ResponseGetCache,
+    GetCacheMeta,
+    ResponseGetCacheMeta,
+    DeleteCache,
 
     Lock, //110
     Unlock, //111
@@ -33,6 +41,15 @@ export enum BrokerType {
     ResponseLock,
     ResponseLockFailed,
     ResponseIsLock,
+
+    EnableInvalidationCacheMessages,
+    ResponseInvalidationCache,
+
+    QueuePublish,
+    QueueSubscribe,
+    QueueUnsubscribe,
+    QueueResponseHandleMessage,
+    QueueMessageHandled,
 
     PublishEntityFields, //internal set of fields will be set. if changed, it will be broadcasted to each connected client
     UnsubscribeEntityFields, //when fields set changes, the new set will be broadcasted to each connected client
@@ -57,28 +74,92 @@ export interface brokerResponseIncrement {
 export interface brokerSet {
     n: string,
     v: Uint8Array,
+    ttl: number,
+}
+
+export interface brokerInvalidateCache {
+    n: string,
+}
+
+export interface brokerSetCache {
+    n: string,
+    v: Uint8Array,
+    ttl: number;
+    tags?: string[];
+}
+
+export interface brokerInvalidateCacheMessage {
+    key: string;
+    ttl: number;
 }
 
 export interface brokerResponseGet {
     v?: Uint8Array,
 }
 
+export interface brokerResponseGetCache {
+    v?: Uint8Array,
+    ttl?: number,
+}
+
+export type brokerResponseGetCacheMeta = {
+    ttl: number,
+} | { missing: true };
+
 export interface brokerGet {
     n: string;
 }
 
-export interface brokerPublish {
+export interface brokerGetCache {
+    n: string;
+}
+
+export interface brokerBusPublish {
     c: string,
     v: Uint8Array,
 }
 
-export interface brokerSubscribe {
+export interface brokerBusSubscribe {
     c: string;
 }
 
-export interface brokerResponseSubscribeMessage {
+export interface brokerBusResponseHandleMessage {
     c: string,
     v: Uint8Array,
+}
+
+export interface BrokerQueuePublish {
+    process: QueueMessageProcessing;
+    deduplicationInterval?: number;
+    hash?: string | number;
+    delay?: number;
+    priority?: number;
+    c: string;
+    v: Uint8Array;
+}
+
+export interface BrokerQueueSubscribe {
+    c: string;
+    maxParallel: number;
+}
+
+export interface BrokerQueueUnsubscribe {
+    c: string;
+}
+
+export interface BrokerQueueResponseHandleMessage {
+    c: string;
+    id: number;
+    v: Uint8Array;
+}
+
+// consumer handled the message and sends back the result
+export interface BrokerQueueMessageHandled {
+    c: string;
+    id: number;
+    success: boolean;
+    error?: string;
+    delay?: number;
 }
 
 export interface brokerLockId {
@@ -98,4 +179,42 @@ export interface brokerResponseIsLock {
 export interface brokerEntityFields {
     name: string,
     fields: string[],
+}
+
+export enum SnapshotEntryType {
+    queue,
+}
+
+export type SnapshotEntry = {
+    type: SnapshotEntryType.queue,
+    currentId: number;
+    name: string;
+    amount: number;
+}
+
+export enum QueueMessageState {
+    pending,
+    inFlight,
+    done,
+    error,
+}
+
+export interface QueueMessage {
+    id: number;
+    state: QueueMessageState;
+    hash?: string | number;
+    process: QueueMessageProcessing;
+    // absolute time
+    ttl?: number;
+    delay: number;
+    priority?: number;
+    lastError?: string;
+    tries: number;
+    v: Uint8Array;
+}
+
+export enum QueueMessageProcessing {
+    exactlyOnce,
+    atLeastOnce,
+    // atMostOnce,
 }

@@ -13,13 +13,25 @@
     "esModuleInterop": true,
     "outDir": "./dist/cjs",
     "declaration": true,
-    "composite": true
+    "composite": true,
+    "lib": [
+      "es2021",
+      "es2022.error",
+      "dom",
+      "dom.iterable"
+    ],
+    "types": [
+      "dot-prop",
+      "fs-extra",
+      "node"
+    ]
   },
   "reflection": true,
   "include": [
     "src",
     "index.ts"
   ],
+  "exclude": ["tests"],
   "references": [
     {
       "path": "../bson/tsconfig.json"
@@ -29,9 +41,6 @@
     },
     {
       "path": "../core-rxjs/tsconfig.json"
-    },
-    {
-      "path": "../crypto/tsconfig.json"
     },
     {
       "path": "../injector/tsconfig.json"

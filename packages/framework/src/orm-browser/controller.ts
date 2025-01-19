@@ -1,5 +1,5 @@
 import { isArray, isObject } from '@deepkit/core';
-import { Database, DatabaseAdapter } from '@deepkit/orm';
+import { Database, DatabaseAdapter, MigrateOptions } from '@deepkit/orm';
 import {
     BrowserControllerInterface,
     DatabaseCommit,
@@ -29,7 +29,7 @@ export class OrmBrowserController implements BrowserControllerInterface {
     }
 
     protected extractDatabaseInfo(db: Database): DatabaseInfo {
-        return new DatabaseInfo(db.name, (db.adapter as DatabaseAdapter).getName(), db.entityRegistry.entities.map(v => v.serializeType()));
+        return new DatabaseInfo(db.name, (db.adapter as DatabaseAdapter).getName(), db.entityRegistry.all().map(v => v.serializeType()));
     }
 
     protected getDb(dbName: string): Database {
@@ -42,7 +42,7 @@ export class OrmBrowserController implements BrowserControllerInterface {
     protected getDbEntity(dbName: string, entityName: string): [Database, ReflectionClass<any>] {
         for (const db of this.databases) {
             if (db.name === dbName) {
-                for (const entity of db.entityRegistry.entities) {
+                for (const entity of db.entityRegistry.all()) {
                     if (entity.name === entityName) return [db, entity];
                 }
             }
@@ -114,7 +114,7 @@ export class OrmBrowserController implements BrowserControllerInterface {
     async getMigrations(name: string): Promise<{ [name: string]: { sql: string[], diff: string } }> {
         const db = this.findDatabase(name);
         if (db.adapter instanceof SQLDatabaseAdapter) {
-            return db.adapter.getMigrations(db.entityRegistry);
+            return db.adapter.getMigrations(new MigrateOptions(), db.entityRegistry);
         }
         return {};
     }
@@ -175,7 +175,7 @@ export class OrmBrowserController implements BrowserControllerInterface {
                     return callback(res);
                 } else if (property.kind === ReflectionKind.class || property.kind === ReflectionKind.objectLiteral) {
                     const schema = ReflectionClass.from(property);
-                    const item = schema.createDefaultObject();
+                    const item: any = schema.createDefaultObject();
                     for (const prop of schema.getProperties()) {
                         if (!propSeed.properties[prop.name]) continue;
 
@@ -197,7 +197,7 @@ export class OrmBrowserController implements BrowserControllerInterface {
             function create(entity: ReflectionClass<any>, properties: { [name: string]: EntityPropertySeed }) {
                 if (!added[entity.getName()]) added[entity.getName()] = [];
 
-                const item = entity.createDefaultObject();
+                const item: any = entity.createDefaultObject();
 
                 for (const [propName, propSeed] of Object.entries(properties)) {
                     const property = entity.getProperty(propName);

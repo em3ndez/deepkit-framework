@@ -27,10 +27,11 @@ import {
     UnpopulatedCheck,
     unpopulatedSymbol
 } from '@deepkit/type';
-import { DatabaseQueryModel } from './query';
+import { DatabaseQueryModel } from './query.js';
 import { capitalize, ClassType } from '@deepkit/core';
-import { ClassState, getClassState, getInstanceState, IdentityMap, PKHash } from './identity-map';
-import { getReference } from './reference';
+import { ClassState, getClassState, getInstanceState, IdentityMap, PKHash } from './identity-map.js';
+import { getReference } from './reference.js';
+import { OrmEntity } from './type.js';
 
 export type HydratorFn = (item: any) => Promise<void>;
 
@@ -45,7 +46,7 @@ type DBRecord = { [name: string]: any };
  * Every query resolving gets its own formatter.
  */
 export class Formatter {
-    //its important to have for each formatter own proxyClasses since we attached to Proxy's prototype the database session
+    //it's important to have for each formatter own proxyClasses since we attached to Proxy's prototype the database session
     protected referenceClasses: Map<ReflectionClass<any>, ClassType> = new Map();
 
     protected instancePools: Map<ClassType, Map<PKHash, any>> = new Map();
@@ -76,11 +77,22 @@ export class Formatter {
         return this.instancePools.get(classType)!;
     }
 
-    public hydrate<T>(model: DatabaseQueryModel<T, any, any>, dbRecord: DBRecord): any {
+    public hydrate<T extends OrmEntity>(model: DatabaseQueryModel<T, any, any>, dbRecord: DBRecord): any {
         return this.hydrateModel(model, this.rootClassSchema, dbRecord);
     }
 
-    protected makeInvalidReference(item: any, classSchema: ReflectionClass<any>, propertySchema: ReflectionProperty) {
+    protected makeInvalidReference(
+        item: any,
+        classSchema: ReflectionClass<any>,
+        propertySchema: ReflectionProperty,
+        reason: 'join' | 'lazy' = 'join'
+    ) {
+        const label = propertySchema.isReference() ? 'Reference' : propertySchema.isBackReference() ? 'BackReference' : 'Property';
+        const reasons: {[p in typeof reason]: string} = {
+            join: 'Use joinWith(), useJoinWith(), etc to populate the reference.',
+            lazy: `Remove lazyLoad('${propertySchema.name}') or call 'await hydrateEntity(item)'`
+        }
+        const description = reason ===
         Object.defineProperty(item, propertySchema.name, {
             enumerable: true,
             configurable: false,
@@ -90,7 +102,7 @@ export class Formatter {
                 }
 
                 if (typeSettings.unpopulatedCheck === UnpopulatedCheck.Throw) {
-                    throw new Error(`Reference ${classSchema.getClassName()}.${propertySchema.name} was not populated. Use joinWith(), useJoinWith(), etc to populate the reference.`);
+                    throw new Error(`${label} ${classSchema.getClassName()}.${propertySchema.name} was not populated. ${reasons[reason]}`);
                 }
 
                 if (typeSettings.unpopulatedCheck === UnpopulatedCheck.ReturnSymbol) {
@@ -203,6 +215,8 @@ export class Formatter {
             //references the identity. We could improve that with a more complex resolution algorithm,
             //that involves changing already populated objects.
             if (found && !isReferenceInstance(found)) {
+                //it could be that the found item was created as joined object, which could mean it was not yet fully populated.
+                this.assignJoins(model, classSchema, dbRecord, found);
                 return found;
             }
         }
@@ -288,7 +302,7 @@ export class Formatter {
                         item[join.propertySchema.name] = dbRecord[refName].map((item: any) => {
                             return this.hydrateModel(join.query.model, resolveForeignReflectionClass(join.propertySchema), item);
                         });
-                    } else {
+                    } else if (!item[join.propertySchema.name]) {
                         item[join.propertySchema.name] = [];
                     }
                 } else if (hasValue) {
@@ -324,6 +338,19 @@ export class Formatter {
 
         if (!partial) {
             if (model.withChangeDetection) getInstanceState(classState, converted).markAsFromDatabase();
+        }
+
+        if (!partial && model.lazyLoad.size) {
+            for (const lazy of model.lazyLoad.values()) {
+                const property = classSchema.getProperty(lazy);
+
+                //relations should be handled in getReferences()
+                if (property.isReference() || property.isBackReference()) continue;
+
+                this.makeInvalidReference(converted, classSchema, property, 'lazy');
+            }
+
+            getInstanceState(getClassState(classSchema), converted).hydrator = this.hydrator;
         }
 
         if (classSchema.getReferences().length > 0) {

@@ -8,26 +8,22 @@
  * You should have received a copy of the MIT License along with this program.
  */
 
-import { BaseResponse, Command } from './command';
-import { ReflectionClass, UUID } from '@deepkit/type';
+import { BaseResponse, Command, ReadPreferenceMessage, TransactionalMessage } from './command.js';
+import { ReflectionClass } from '@deepkit/type';
 
 interface CountResponse extends BaseResponse {
     n: number;
 }
 
-interface CountSchema {
+type CountSchema = {
     count: string;
     $db: string;
     limit?: number;
     query: any;
     skip?: number;
-    lsid?: { id: UUID };
-    txnNumber?: number;
-    startTransaction?: boolean;
-    autocommit?: boolean;
-}
+} & TransactionalMessage & ReadPreferenceMessage;
 
-export class CountCommand<T extends ReflectionClass<any>> extends Command {
+export class CountCommand<T extends ReflectionClass<any>> extends Command<number> {
     constructor(
         public schema: T,
         public query: { [name: string]: any } = {},
@@ -39,7 +35,7 @@ export class CountCommand<T extends ReflectionClass<any>> extends Command {
 
     async execute(config, host, transaction): Promise<number> {
         const cmd: any = {
-            count: this.schema.collectionName || this.schema.name || 'unknown',
+            count: this.schema.getCollectionName() || 'unknown',
             $db: this.schema.databaseSchemaName || config.defaultDb || 'admin',
             query: this.query,
             limit: this.limit,
@@ -47,12 +43,9 @@ export class CountCommand<T extends ReflectionClass<any>> extends Command {
         };
 
         if (transaction) transaction.applyTransaction(cmd);
+        config.applyReadPreference(cmd);
 
         const res = await this.sendAndWait<CountSchema, CountResponse>(cmd);
         return res.n;
-    }
-
-    needsWritableHost(): boolean {
-        return false;
     }
 }
